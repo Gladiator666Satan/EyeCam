@@ -177,7 +177,16 @@ jobs:
           if (-not (Test-Path $iscc)) {
             choco install innosetup --no-progress -y
           }
+          if (-not (Test-Path $iscc)) {
+            $cmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+            if ($cmd) { $iscc = $cmd.Source }
+          }
+          if (-not (Test-Path "build\bin\Release\EyeCamStudio.exe") -and (Test-Path "build\bin\EyeCamStudio.exe")) {
+            New-Item -ItemType Directory -Path "build\bin\Release" -Force | Out-Null
+            Copy-Item "build\bin\*" "build\bin\Release\" -Force
+          }
           & $iscc "installer\EyeCamSetup.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload Windows Installer Artifact
         uses: actions/upload-artifact@v4
