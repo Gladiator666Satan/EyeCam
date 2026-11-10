@@ -144,6 +144,16 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         streamService?.toggleMicrophoneMute()
     }
 
+    fun triggerAutoFocus() {
+        onUserInteraction()
+        streamService?.triggerAutoFocus()
+    }
+
+    fun triggerFocusAtPoint(xNorm: Float, yNorm: Float) {
+        onUserInteraction()
+        streamService?.triggerFocusAtPoint(xNorm, yNorm)
+    }
+
     fun onUserInteraction() {
         if (_uiState.value.isStreaming && !_uiState.value.isDisplayProtectionActive) {
             restartInactivityTimer()

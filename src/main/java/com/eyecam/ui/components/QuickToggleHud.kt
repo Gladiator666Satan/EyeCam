@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CenterFocusStrong
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
@@ -64,6 +65,7 @@ fun QuickToggleHud(
     onToggleMicMute: () -> Unit,
     onSelectZoom: (Float) -> Unit,
     onSelectFrontCamera: () -> Unit,
+    onTriggerAutoFocus: () -> Unit,
     onActivateDisplayProtection: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -105,6 +107,7 @@ fun QuickToggleHud(
                 isMicMuted = uiState.isMicMuted,
                 onToggleStream = onToggleStream,
                 onToggleMicMute = onToggleMicMute,
+                onTriggerAutoFocus = onTriggerAutoFocus,
                 onActivateDisplayProtection = onActivateDisplayProtection
             )
         }
@@ -267,7 +270,7 @@ private fun DynamicZoomSelectorBar(
                 .clip(CircleShape)
                 .background(if (isFrontCamera) StatusCyan else Color.Transparent)
                 .clickable { onSelectFront() },
-                contentAlignment = Alignment.Center
+            contentAlignment = Alignment.Center
         ) {
             Text(
                 text = "SELF",
@@ -335,6 +338,7 @@ private fun FloatingActionControls(
     isMicMuted: Boolean,
     onToggleStream: () -> Unit,
     onToggleMicMute: () -> Unit,
+    onTriggerAutoFocus: () -> Unit,
     onActivateDisplayProtection: () -> Unit
 ) {
     Row(
@@ -342,14 +346,14 @@ private fun FloatingActionControls(
             .clip(RoundedCornerShape(32.dp))
             .background(OledCard)
             .border(1.dp, OledBorder, RoundedCornerShape(32.dp))
-            .padding(horizontal = 20.dp, vertical = 10.dp),
-        horizontalArrangement = Arrangement.spacedBy(24.dp),
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        horizontalArrangement = Arrangement.spacedBy(18.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         IconButton(
             onClick = onToggleMicMute,
             modifier = Modifier
-                .size(48.dp)
+                .size(46.dp)
                 .clip(CircleShape)
                 .background(if (isMicMuted) StatusCrimson.copy(alpha = 0.2f) else OledBorder)
         ) {
@@ -357,13 +361,28 @@ private fun FloatingActionControls(
                 imageVector = if (isMicMuted) Icons.Default.MicOff else Icons.Default.Mic,
                 contentDescription = if (isMicMuted) "Unmute" else "Mute",
                 tint = if (isMicMuted) StatusCrimson else TextPrimary,
+                modifier = Modifier.size(22.dp)
+            )
+        }
+
+        IconButton(
+            onClick = onTriggerAutoFocus,
+            modifier = Modifier
+                .size(46.dp)
+                .clip(CircleShape)
+                .background(OledBorder)
+        ) {
+            Icon(
+                imageVector = Icons.Default.CenterFocusStrong,
+                contentDescription = "Перефокусувати",
+                tint = StatusCyan,
                 modifier = Modifier.size(24.dp)
             )
         }
 
         Box(
             modifier = Modifier
-                .size(64.dp)
+                .size(62.dp)
                 .clip(CircleShape)
                 .background(if (isStreaming) StatusCrimson else StatusEmerald)
                 .clickable { onToggleStream() },
@@ -380,7 +399,7 @@ private fun FloatingActionControls(
         IconButton(
             onClick = onActivateDisplayProtection,
             modifier = Modifier
-                .size(48.dp)
+                .size(46.dp)
                 .clip(CircleShape)
                 .background(OledBorder)
         ) {

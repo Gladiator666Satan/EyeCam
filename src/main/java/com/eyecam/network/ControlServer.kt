@@ -237,7 +237,18 @@ class ControlServer(
                     val w = json.optInt("width", 1920)
                     val h = json.optInt("height", 1080)
                     val fps = json.optInt("fps", 60)
+                    cameraController.setResolution(w, h, fps)
                     onResolutionUpdatedFromPc?.invoke(w, h, fps)
+                }
+
+                "TriggerAutoFocus", "Refocus", "trigger_focus" -> {
+                    cameraController.triggerAutoFocus()
+                }
+
+                "SetFocusPoint" -> {
+                    val x = json.optDouble("x", 0.5).toFloat()
+                    val y = json.optDouble("y", 0.5).toFloat()
+                    cameraController.triggerFocusAtPoint(x, y)
                 }
 
                 "SetISO" -> {

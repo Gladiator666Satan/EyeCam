@@ -105,6 +105,7 @@ class CameraStreamService : Service() {
             onClientConnectionChanged = { connected, viaUsb, remoteIp ->
                 isPcConnected = connected
                 isPcViaUsbAdb = viaUsb
+                // Якщо ПК підключився — автоматично активуємо передачу кадрів
                 if (connected && !_uiState.value.isStreaming && cameraController.hasCameraPermission()) {
                     serviceScope.launch(Dispatchers.Main) {
                         startStreaming()
@@ -122,6 +123,7 @@ class CameraStreamService : Service() {
                 }
             },
             onResolutionUpdatedFromPc = { w, h, fps ->
+                cameraController.setResolution(w, h, fps)
                 _uiState.update { current ->
                     current.copy(
                         telemetry = current.telemetry.copy(
@@ -158,17 +160,30 @@ class CameraStreamService : Service() {
         }
 
         if (hasPerm && currentPreviewSurface != null) {
-            cameraController.openCamera(previewSurface = currentPreviewSurface)
+            cameraController.updatePreviewSurface(currentPreviewSurface)
         }
     }
 
     fun attachPreviewSurface(surface: Surface?) {
         currentPreviewSurface = surface
         if (surface != null && surface.isValid && cameraController.hasCameraPermission()) {
-            cameraController.openCamera(previewSurface = surface)
-        } else if (surface == null && !_uiState.value.isStreaming) {
-            cameraController.closeCamera()
+            cameraController.updatePreviewSurface(surface)
+        } else if (surface == null) {
+            if (_uiState.value.isStreaming) {
+                // Утримуємо трансляцію активною у фоні та при заблокованому екрані
+                cameraController.updatePreviewSurface(null)
+            } else {
+                cameraController.closeCamera()
+            }
         }
+    }
+
+    fun triggerAutoFocus() {
+        cameraController.triggerAutoFocus()
+    }
+
+    fun triggerFocusAtPoint(x: Float, y: Float) {
+        cameraController.triggerFocusAtPoint(x, y)
     }
 
     private fun startConnectionMonitorLoop() {
@@ -291,6 +306,7 @@ class CameraStreamService : Service() {
 
         thermalManager.startMonitoring()
 
+        // Безпечний запуск Foreground Service для Android 14/15/16 (перевірка фактично наданих дозволів)
         val notification = buildNotification()
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {

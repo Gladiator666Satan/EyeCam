@@ -47,6 +47,7 @@ fun EyeCamScreen(
             hasCameraPermission = uiState.hasCameraPermission,
             isDisplayProtectionActive = uiState.isDisplayProtectionActive,
             onSurfaceChanged = { surface -> viewModel.attachPreviewSurface(surface) },
+            onFocusPointTapped = { x, y -> viewModel.triggerFocusAtPoint(x, y) },
             onRequestPermissions = onRequestPermissions
         )
 
@@ -58,6 +59,7 @@ fun EyeCamScreen(
                 onToggleMicMute = { viewModel.toggleMicMute() },
                 onSelectZoom = { zoom -> viewModel.setZoomRatio(zoom) },
                 onSelectFrontCamera = { viewModel.setFrontCamera(true) },
+                onTriggerAutoFocus = { viewModel.triggerAutoFocus() },
                 onActivateDisplayProtection = { viewModel.activateDisplayProtection() }
             )
         }
