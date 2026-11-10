@@ -198,8 +198,12 @@ jobs:
             $cmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
             if ($cmd) { $iscc = $cmd.Source }
           }
-          if (-not (Test-Path "build\bin\Release\EyeCamStudio.exe") -and (Test-Path "build\bin\EyeCamStudio.exe")) {
-            New-Item -ItemType Directory -Path "build\bin\Release" -Force | Out-Null
+          New-Item -ItemType Directory -Path "build\bin\Release" -Force | Out-Null
+          New-Item -ItemType Directory -Path "build\installer" -Force | Out-Null
+          if (Test-Path "build\Release\EyeCamStudio.exe") {
+            Copy-Item "build\Release\*" "build\bin\Release\" -Force
+          }
+          if (Test-Path "build\bin\EyeCamStudio.exe") {
             Copy-Item "build\bin\*" "build\bin\Release\" -Force
           }
           & $iscc "installer\EyeCamSetup.iss"
@@ -218,6 +222,8 @@ jobs:
         with:
           name: eyecam-windows-binaries
           path: |
+            build/installer/*
+            build/Release/*
             build/bin/Release/*
             build/lib/Release/*
             build/bin/*
