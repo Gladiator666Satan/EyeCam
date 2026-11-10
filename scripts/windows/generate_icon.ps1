@@ -1,14 +1,18 @@
-# ==============================================================================
-# EyeCam Studio — Multi-Resolution Windows Icon Generator (.ico)
-# Renders the EyeCam Cyber-Eye with Camera Lens Glare inside a Laptop Bezel Frame
-# ==============================================================================
-param(
-    [string]$OutputPath = "$PSScriptRoot\..\..\src\windows\gui\eyecam_pc.ico"
-)
+$ErrorActionPreference = "Stop"
+
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$projectRoot = Split-Path -Parent (Split-Path -Parent $scriptDir)
+$guiDir = Join-Path $projectRoot "src\windows\gui"
+if (-not (Test-Path $guiDir)) {
+    New-Item -ItemType Directory -Path $guiDir -Force | Out-Null
+}
+
+$icoPath = Join-Path $guiDir "eyecam_pc.ico"
+Write-Host "Creating Windows Studio Laptop+Lens Icon: $icoPath"
 
 Add-Type -AssemblyName System.Drawing
 
-function Draw-EyeCamLaptopIcon([int]$size) {
+function Generate-EyeCamBitmap([int]$size) {
     $bmp = New-Object System.Drawing.Bitmap($size, $size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
@@ -16,175 +20,171 @@ function Draw-EyeCamLaptopIcon([int]$size) {
     $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
     $g.Clear([System.Drawing.Color]::Transparent)
 
-    $s = [float]$size / 256.0
+    $scale = $size / 256.0
 
-    # 1. Outer Dark Studio Badge (Rounded Squircle)
-    $bgBrush = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
-        (New-Object System.Drawing.PointF(0, 0)),
-        (New-Object System.Drawing.PointF($size, $size)),
-        [System.Drawing.Color]::FromArgb(255, 11, 14, 20),
-        [System.Drawing.Color]::FromArgb(255, 19, 26, 38)
+    # 1. Корпус ноутбука (Тонка кришка дисплея)
+    $dispL = 36.0 * $scale
+    $dispT = 44.0 * $scale
+    $dispW = 184.0 * $scale
+    $dispH = 120.0 * $scale
+    $dispRadius = 14.0 * $scale
+
+    $dispBrush = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
+        (New-Object System.Drawing.PointF($dispL, $dispT)),
+        (New-Object System.Drawing.PointF($dispL, $dispT + $dispH)),
+        [System.Drawing.Color]::FromArgb(255, 30, 36, 48),
+        [System.Drawing.Color]::FromArgb(255, 14, 18, 24)
     )
-    $pathBg = New-Object System.Drawing.Drawing2D.GraphicsPath
-    $r = 52.0 * $s
-    $pad = 8.0 * $s
-    $w = $size - 2 * $pad
-    $pathBg.AddArc($pad, $pad, $r, $r, 180, 90)
-    $pathBg.AddArc($pad + $w - $r, $pad, $r, $r, 270, 90)
-    $pathBg.AddArc($pad + $w - $r, $pad + $w - $r, $r, $r, 0, 90)
-    $pathBg.AddArc($pad, $pad + $w - $r, $r, $r, 90, 90)
-    $pathBg.CloseFigure()
-    $g.FillPath($bgBrush, $pathBg)
 
-    $borderPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(190, 0, 229, 255), (3.5 * $s))
-    $g.DrawPath($borderPen, $pathBg)
+    $dispPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 0, 229, 255), [Math]::Max(1.5 * $scale, 1.0))
 
-    # 2. Laptop Screen Bezel Frame (Рамка як від ноутбука)
-    $scrX = 26.0 * $s
-    $scrY = 36.0 * $s
-    $scrW = 204.0 * $s
-    $scrH = 144.0 * $s
-    $bezelBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 24, 33, 48))
-    $bezelPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 0, 229, 255), (4.5 * $s))
-    $g.FillRectangle($bezelBrush, $scrX, $scrY, $scrW, $scrH)
-    $g.DrawRectangle($bezelPen, $scrX, $scrY, $scrW, $scrH)
+    $pathDisp = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $d = $dispRadius * 2
+    $pathDisp.AddArc($dispL, $dispT, $d, $d, 180, 90)
+    $pathDisp.AddArc($dispL + $dispW - $d, $dispT, $d, $d, 270, 90)
+    $pathDisp.AddArc($dispL + $dispW - $d, $dispT + $dispH - $d, $d, $d, 0, 90)
+    $pathDisp.AddArc($dispL, $dispT + $dispH - $d, $d, $d, 90, 90)
+    $pathDisp.CloseFigure()
 
-    # Inner Laptop Display Area
-    $inX = 35.0 * $s
-    $inY = 47.0 * $s
-    $inW = 186.0 * $s
-    $inH = 124.0 * $s
-    $dispBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 8, 11, 18))
-    $g.FillRectangle($dispBrush, $inX, $inY, $inW, $inH)
+    $g.FillPath($dispBrush, $pathDisp)
+    $g.DrawPath($dispPen, $pathDisp)
 
-    # Top Webcam indicator dot on Laptop Bezel
-    $camDotBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 0, 230, 118))
-    $g.FillEllipse($camDotBrush, (128.0 - 3.2) * $s, 39.0 * $s, 6.4 * $s, 6.4 * $s)
+    # 2. Матриця дисплея (Темний глянцевий OLED екран)
+    $scrL = 46.0 * $scale
+    $scrT = 54.0 * $scale
+    $scrW = 164.0 * $scale
+    $scrH = 100.0 * $scale
+    $scrBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 6, 8, 12))
+    $g.FillRectangle($scrBrush, $scrL, $scrT, $scrW, $scrH)
 
-    # Laptop Keyboard Base / Deck at Bottom
-    $basePath = New-Object System.Drawing.Drawing2D.GraphicsPath
-    $basePath.AddPolygon(@(
-        (New-Object System.Drawing.PointF((12.0 * $s), (183.0 * $s))),
-        (New-Object System.Drawing.PointF((244.0 * $s), (183.0 * $s))),
-        (New-Object System.Drawing.PointF((228.0 * $s), (206.0 * $s))),
-        (New-Object System.Drawing.PointF((28.0 * $s), (206.0 * $s)))
-    ))
+    # 3. База / клавіатурний блок ноутбука
+    $baseL = 20.0 * $scale
+    $baseT = 164.0 * $scale
+    $baseW = 216.0 * $scale
+    $baseH = 20.0 * $scale
+    $baseRadius = 8.0 * $scale
+
     $baseBrush = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
-        (New-Object System.Drawing.PointF(0, (180.0 * $s))),
-        (New-Object System.Drawing.PointF(0, (208.0 * $s))),
-        [System.Drawing.Color]::FromArgb(255, 45, 58, 78),
-        [System.Drawing.Color]::FromArgb(255, 22, 30, 44)
+        (New-Object System.Drawing.PointF($baseL, $baseT)),
+        (New-Object System.Drawing.PointF($baseL, $baseT + $baseH)),
+        [System.Drawing.Color]::FromArgb(255, 45, 52, 68),
+        [System.Drawing.Color]::FromArgb(255, 18, 22, 30)
     )
-    $basePen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 0, 229, 255), (3.0 * $s))
-    $g.FillPath($baseBrush, $basePath)
-    $g.DrawPath($basePen, $basePath)
+    $basePen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 70, 80, 100), [Math]::Max(1.0 * $scale, 1.0))
 
-    # Laptop Touchpad Notch Glow
-    $notchPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 0, 230, 118), (4.0 * $s))
-    $g.DrawLine($notchPen, (104.0 * $s), (188.0 * $s), (152.0 * $s), (188.0 * $s))
+    $pathBase = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $bd = $baseRadius * 2
+    $pathBase.AddArc($baseL, $baseT, $bd, $bd, 180, 90)
+    $pathBase.AddArc($baseL + $baseW - $bd, $baseT, $bd, $bd, 270, 90)
+    $pathBase.AddArc($baseL + $baseW - $bd, $baseT + $baseH - $bd, $bd, $bd, 0, 90)
+    $pathBase.AddArc($baseL, $baseT + $baseH - $bd, $bd, $bd, 90, 90)
+    $pathBase.CloseFigure()
+    $g.FillPath($baseBrush, $pathBase)
+    $g.DrawPath($basePen, $pathBase)
 
-    # 3. Eye Contour inside Laptop Screen (Око)
-    $eyePath = New-Object System.Drawing.Drawing2D.GraphicsPath
-    $eyePath.AddBezier(
-        (New-Object System.Drawing.PointF((50.0 * $s), (109.0 * $s))),
-        (New-Object System.Drawing.PointF((88.0 * $s), (53.0 * $s))),
-        (New-Object System.Drawing.PointF((168.0 * $s), (53.0 * $s))),
-        (New-Object System.Drawing.PointF((206.0 * $s), (109.0 * $s)))
+    # Виїмка для відкривання кришки
+    $notchW = 36.0 * $scale
+    $notchH = 4.0 * $scale
+    $notchL = 128.0 * $scale - ($notchW / 2.0)
+    $notchBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 0, 229, 255))
+    $g.FillRectangle($notchBrush, $notchL, $baseT, $notchW, $notchH)
+
+    # 4. Центр: Око-об'єктив камери всередині екрану
+    $eyeCx = 128.0 * $scale
+    $eyeCy = 104.0 * $scale
+
+    # Зовнішній обвід об'єктива (Neon Cyan & Emerald ring)
+    $ringR = 34.0 * $scale
+    $ringPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 0, 229, 255), 3.0 * $scale)
+    $g.DrawEllipse($ringPen, $eyeCx - $ringR, $eyeCy - $ringR, $ringR * 2, $ringR * 2)
+
+    # Градієнтне скло лінзи
+    $lensR = 31.0 * $scale
+    $lensBrush = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
+        (New-Object System.Drawing.PointF($eyeCx - $lensR, $eyeCy - $lensR)),
+        (New-Object System.Drawing.PointF($eyeCx + $lensR, $eyeCy + $lensR)),
+        [System.Drawing.Color]::FromArgb(255, 0, 168, 143),
+        [System.Drawing.Color]::FromArgb(255, 2, 28, 48)
     )
-    $eyePath.AddBezier(
-        (New-Object System.Drawing.PointF((206.0 * $s), (109.0 * $s))),
-        (New-Object System.Drawing.PointF((168.0 * $s), (165.0 * $s))),
-        (New-Object System.Drawing.PointF((88.0 * $s), (165.0 * $s))),
-        (New-Object System.Drawing.PointF((50.0 * $s), (109.0 * $s)))
-    )
-    $eyeFill = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 14, 24, 36))
-    $eyePen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 0, 230, 118), (6.0 * $s))
-    $g.FillPath($eyeFill, $eyePath)
-    $g.DrawPath($eyePen, $eyePath)
+    $g.FillEllipse($lensBrush, $eyeCx - $lensR, $eyeCy - $lensR, $lensR * 2, $lensR * 2)
 
-    # 4. Camera Lens Iris & Aperture Rings
-    $cx = 128.0 * $s
-    $cy = 109.0 * $s
-    $irisR = 39.0 * $s
-    $irisBrush = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
-        (New-Object System.Drawing.PointF(($cx - $irisR), ($cy - $irisR))),
-        (New-Object System.Drawing.PointF(($cx + $irisR), ($cy + $irisR))),
-        [System.Drawing.Color]::FromArgb(255, 0, 168, 218),
-        [System.Drawing.Color]::FromArgb(255, 9, 32, 52)
-    )
-    $irisPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 0, 229, 255), (3.8 * $s))
-    $g.FillEllipse($irisBrush, $cx - $irisR, $cy - $irisR, $irisR * 2, $irisR * 2)
-    $g.DrawEllipse($irisPen, $cx - $irisR, $cy - $irisR, $irisR * 2, $irisR * 2)
+    # Зіниця камери
+    $pupilR = 15.0 * $scale
+    $pupilBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 4, 8, 14))
+    $g.FillEllipse($pupilBrush, $eyeCx - $pupilR, $eyeCy - $pupilR, $pupilR * 2, $pupilR * 2)
 
-    # Inner Emerald Ring
-    $ringR = 28.0 * $s
-    $ringPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(225, 0, 230, 118), (2.4 * $s))
-    $g.DrawEllipse($ringPen, $cx - $ringR, $cy - $ringR, $ringR * 2, $ringR * 2)
+    # Блік лінзи (Studio Optical Lens Glare)
+    $glareR = 6.0 * $scale
+    $glareBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(230, 255, 255, 255))
+    $g.FillEllipse($glareBrush, $eyeCx - 8.0 * $scale, $eyeCy - 9.0 * $scale, $glareR * 2, $glareR * 2)
 
-    # Deep Optical Pupil
-    $pupilR = 18.5 * $s
-    $pupilBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 4, 7, 12))
-    $g.FillEllipse($pupilBrush, $cx - $pupilR, $cy - $pupilR, $pupilR * 2, $pupilR * 2)
+    $microGlareR = 2.5 * $scale
+    $g.FillEllipse($glareBrush, $eyeCx + 5.0 * $scale, $eyeCy + 4.0 * $scale, $microGlareR * 2, $microGlareR * 2)
 
-    # 5. Camera Lens Glare / Reflection (Блік як від об'єктиву)
-    $glareBrush1 = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(250, 255, 255, 255))
-    $g.FillEllipse($glareBrush1, (104.0 * $s), (83.0 * $s), (18.0 * $s), (13.0 * $s))
-
-    $glareBrush2 = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(210, 140, 245, 255))
-    $g.FillEllipse($glareBrush2, (97.0 * $s), (100.0 * $s), (7.5 * $s), (7.5 * $s))
-
-    # Secondary bottom-right cyan/emerald optical reflection
-    $glareBrush3 = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(180, 0, 230, 118))
-    $g.FillEllipse($glareBrush3, (137.0 * $s), (119.0 * $s), (11.0 * $s), (7.5 * $s))
+    # Зелений індикатор активності камери (Top Bezel LED)
+    $ledR = 2.5 * $scale
+    $ledBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 0, 230, 118))
+    $g.FillEllipse($ledBrush, 128.0 * $scale - $ledR, 48.0 * $scale - $ledR, $ledR * 2, $ledR * 2)
 
     $g.Dispose()
     return $bmp
 }
 
-$sizes = @(256, 64, 48, 32, 16)
-$pngStreams = @()
+$sizes = @(16, 32, 48, 64, 128, 256)
+$bitmaps = @()
 foreach ($sz in $sizes) {
-    $bmp = Draw-EyeCamLaptopIcon $sz
+    $bitmaps += Generate-EyeCamBitmap -size $sz
+}
+
+# Запис мультирозмірного .ICO файлу
+$fs = [System.IO.File]::Create($icoPath)
+$bw = New-Object System.IO.BinaryWriter($fs)
+
+# ICONDIR
+$bw.Write([uint16]0) # Reserved
+$bw.Write([uint16]1) # Type 1 = ICO
+$bw.Write([uint16]$sizes.Count) # Image count
+
+$offset = 6 + ($sizes.Count * 16)
+$pngStreams = @()
+
+foreach ($bmp in $bitmaps) {
     $ms = New-Object System.IO.MemoryStream
     $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
-    $pngStreams += ,($ms.ToArray())
-    $ms.Dispose()
+    $bytes = $ms.ToArray()
+    $pngStreams += ,$bytes
+}
+
+for ($i = 0; $i -lt $sizes.Count; $i++) {
+    $sz = $sizes[$i]
+    $dataLen = $pngStreams[$i].Length
+
+    $bW = if ($sz -ge 256) { 0 } else { [byte]$sz }
+    $bH = if ($sz -ge 256) { 0 } else { [byte]$sz }
+
+    # ICONDIRENTRY
+    $bw.Write([byte]$bW)
+    $bw.Write([byte]$bH)
+    $bw.Write([byte]0)   # Color count
+    $bw.Write([byte]0)   # Reserved
+    $bw.Write([uint16]1) # Color planes
+    $bw.Write([uint16]32)# Bit count
+    $bw.Write([uint32]$dataLen)
+    $bw.Write([uint32]$offset)
+
+    $offset += $dataLen
+}
+
+foreach ($bytes in $pngStreams) {
+    $bw.Write($bytes)
+}
+
+$bw.Flush()
+$bw.Close()
+$fs.Close()
+
+foreach ($bmp in $bitmaps) {
     $bmp.Dispose()
 }
 
-$parentDir = Split-Path -Parent $OutputPath
-if (-not (Test-Path $parentDir)) {
-    New-Item -ItemType Directory -Path $parentDir -Force | Out-Null
-}
-
-$fs = [System.IO.File]::Create($OutputPath)
-$bw = New-Object System.IO.BinaryWriter($fs)
-
-# ICONDIR header (6 bytes)
-$bw.Write([uint16]0)
-$bw.Write([uint16]1)
-$bw.Write([uint16]$sizes.Count)
-
-$offset = 6 + (16 * $sizes.Count)
-for ($i = 0; $i -lt $sizes.Count; $i++) {
-    $sz = $sizes[$i]
-    $bytes = $pngStreams[$i]
-    $wByte = if ($sz -ge 256) { [byte]0 } else { [byte]$sz }
-    $bw.Write($wByte)
-    $bw.Write($wByte)
-    $bw.Write([byte]0)
-    $bw.Write([byte]0)
-    $bw.Write([uint16]1)
-    $bw.Write([uint16]32)
-    $bw.Write([uint32]$bytes.Length)
-    $bw.Write([uint32]$offset)
-    $offset += $bytes.Length
-}
-
-for ($i = 0; $i -lt $sizes.Count; $i++) {
-    $bw.Write($pngStreams[$i])
-}
-
-$bw.Close()
-$fs.Close()
-Write-Output "[EyeCam] Generated icon: $OutputPath ($((Get-Item $OutputPath).Length) bytes)"
+Write-Host "EyeCam Studio Multi-res ICO generated successfully: $icoPath"

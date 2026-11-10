@@ -1,4 +1,6 @@
-// ==============================================================================
-// EyeCam Studio — Windows Resource Script (Application Icon & Version Info)
-// ==============================================================================
-101 ICON "eyecam_pc.ico"
+// -----------------------------------------------------------------------------
+// EyeCam Studio Windows Application Resource Script
+// -----------------------------------------------------------------------------
+#define IDI_EYECAM_APP 101
+
+IDI_EYECAM_APP ICON "eyecam_pc.ico"
