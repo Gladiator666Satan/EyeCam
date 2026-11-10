@@ -75,6 +75,26 @@ if (WIN32)
         shlwapi.lib
     )
 
+    # Десктопний GUI додаток у стилі Windows 11 Dark Mode (Direct2D / DirectWrite)
+    add_executable(EyeCamStudio WIN32
+        src/windows/gui/EyeCamStudioWin32.cpp
+    )
+    target_include_directories(EyeCamStudio PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(EyeCamStudio PRIVATE
+        EyeCamWindowsSink
+        d2d1.lib
+        dwrite.lib
+        dwmapi.lib
+        ws2_32.lib
+        shell32.lib
+        ole32.lib
+        advapi32.lib
+        user32.lib
+        gdi32.lib
+    )
+
     # Тестовий додаток стрімінгу для Windows
     add_executable(windows_test
         src/examples/windows_test.cpp
