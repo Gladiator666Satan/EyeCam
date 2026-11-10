@@ -1,68 +1,66 @@
 package com.eyecam.camera
 
-import android.content.Context
 import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraManager
-import android.os.Build
+import android.hardware.camera2.params.RggbChannelVector
 import android.util.Range
-import com.eyecam.model.CameraSensorInfo
+import com.eyecam.model.SensorType
+import kotlin.math.atan
 
 object CameraUtils {
 
-    fun classifySensor(focalLength: Float, minZoom: Float, isFront: Boolean): String {
-        if (isFront) return "Селфі-камера"
-        return when {
-            minZoom < 1.0f || focalLength < 20.0f -> "Ультраширококутна (0.5x)"
-            focalLength in 20.0f..35.0f -> "Основний модуль (1x)"
-            focalLength in 35.0f..85.0f -> "Телеоб'єктив (3x)"
-            else -> "Перископ (5x - 10x)"
+    fun classifySensor(characteristics: CameraCharacteristics): SensorType {
+        val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
+        if (facing == CameraCharacteristics.LENS_FACING_FRONT) {
+            return SensorType.FRONT
         }
-    }
 
-    fun getSupportedZoomPresets(minZoom: Float, maxZoom: Float): List<Float> {
-        val standardPresets = listOf(0.5f, 0.6f, 1.0f, 2.0f, 3.0f, 5.0f, 10.0f)
-        val available = standardPresets.filter { it in minZoom..maxZoom }.toMutableList()
-        if (!available.contains(1.0f) && 1.0f in minZoom..maxZoom) {
-            available.add(1.0f)
-        }
-        return available.sorted()
-    }
+        val focalLengths = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+        val sensorSize = characteristics.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+        val minFocusDistance = characteristics.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0.0f
 
-    fun queryDeviceSensors(context: Context): List<CameraSensorInfo> {
-        val list = mutableListOf<CameraSensorInfo>()
-        val manager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager ?: return list
+        if (focalLengths != null && focalLengths.isNotEmpty() && sensorSize != null) {
+            val focalLength = focalLengths[0]
+            val sensorWidth = sensorSize.width
+            val hFov = Math.toDegrees(2.0 * atan((sensorWidth / (2.0 * focalLength)).toDouble())).toFloat()
 
-        try {
-            for (id in manager.cameraIdList) {
-                val chars = manager.getCameraCharacteristics(id)
-                val facing = chars.get(CameraCharacteristics.LENS_FACING)
-                val isFront = facing == CameraCharacteristics.LENS_FACING_FRONT
-
-                val focalLengths = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
-                val focalLength = focalLengths?.firstOrNull() ?: 24.0f
-
-                val zoomRange: Range<Float>? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
-                } else null
-
-                val minZoom = zoomRange?.lower ?: 1.0f
-                val maxZoom = zoomRange?.upper ?: (chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 10.0f)
-
-                val name = classifySensor(focalLength, minZoom, isFront)
-
-                list.add(
-                    CameraSensorInfo(
-                        id = id,
-                        name = name,
-                        focalLengthMm = focalLength,
-                        minZoomRatio = minZoom,
-                        maxZoomRatio = maxZoom,
-                        isFront = isFront
-                    )
-                )
+            // Будь-який сенсор з фокусною відстанню < 2.8 мм або FOV >= 85° є ULTRA_WIDE
+            // (на Samsung Galaxy Ultra надширококутний сенсор також має макро-автофокус з minFocusDistance >= 10.0f)
+            return when {
+                hFov >= 85.0f || focalLength < 2.8f -> SensorType.ULTRA_WIDE
+                minFocusDistance >= 10.0f && focalLength in 2.8f..4.0f -> SensorType.MACRO
+                hFov in 60.0f..84.9f || focalLength in 2.8f..5.5f -> SensorType.WIDE
+                hFov < 60.0f || focalLength > 5.5f -> SensorType.TELEPHOTO
+                else -> SensorType.WIDE
             }
-        } catch (_: Exception) {}
+        }
 
-        return list
+        if (minFocusDistance >= 10.0f) {
+            return SensorType.MACRO
+        }
+        return SensorType.WIDE
     }
+
+    fun kelvinToRggbChannelVector(kelvin: Int): RggbChannelVector {
+        val k = kelvin.coerceIn(2000, 10000).toFloat()
+        // Природний баланс білого без зеленого спотворення для сенсорів Bayer:
+        // Нейтральне денне світло (5500K): R ≈ 2.0f, G = 1.0f, B ≈ 1.9f
+        // Тепліше світло (2000K, лампа розжарювання): R ≈ 1.25f, B ≈ 3.2f
+        // Холодніше світло (10000K, тінь): R ≈ 2.85f, B ≈ 1.2f
+        val rGain = if (k <= 5500f) {
+            1.25f + (k - 2000f) / 3500f * 0.75f
+        } else {
+            2.0f + (k - 5500f) / 4500f * 0.85f
+        }
+        val bGain = if (k <= 5500f) {
+            3.2f - (k - 2000f) / 3500f * 1.3f
+        } else {
+            1.9f - (k - 5500f) / 4500f * 0.7f
+        }
+
+        return RggbChannelVector(rGain.coerceIn(1.0f, 4.0f), 1.0f, 1.0f, bGain.coerceIn(1.0f, 4.0f))
+    }
+
+    fun clampIso(iso: Int, isoRange: Range<Int>?): Int = isoRange?.clamp(iso) ?: iso
+    fun clampExposureTime(exposureTimeNs: Long, rangeNs: Range<Long>?): Long = rangeNs?.clamp(exposureTimeNs) ?: exposureTimeNs
+    fun clampFocusDistance(distance: Float, minDistance: Float): Float = distance.coerceIn(0.0f, minDistance)
 }

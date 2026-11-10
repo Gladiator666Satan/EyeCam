@@ -4,7 +4,21 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
+
+    <!-- Deep OLED / Win11 Dark Studio Background -->
     <path
-        android:fillColor="#1E1E1E"
+        android:fillColor="#0B0E14"
         android:pathData="M0,0h108v108h-108z" />
+
+    <!-- Subtle Dark Studio Inner Glow Circle -->
+    <path
+        android:fillColor="#131924"
+        android:pathData="M54,54m-42,0a42,42 0,1 1,84 0a42,42 0,1 1,-84 0" />
+
+    <!-- Subtle Outer Tech Ring -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#1E293B"
+        android:strokeWidth="1.5"
+        android:pathData="M54,54m-38,0a38,38 0,1 1,76 0a38,38 0,1 1,-76 0" />
 </vector>
