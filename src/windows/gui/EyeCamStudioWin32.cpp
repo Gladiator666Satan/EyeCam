@@ -144,6 +144,7 @@ struct StudioState {
     std::atomic<uint32_t> measuredFps{0};
     std::atomic<uint64_t> rxBytes{0};
     std::atomic<uint64_t> rxFrames{0};
+    uint64_t shmFramesWritten = 0;
 };
 
 std::wstring Utf8ToWide(const std::string& str) {
@@ -854,7 +855,6 @@ private:
                                         std::lock_guard<std::mutex> lock(m_frameMutex);
                                         m_previewPixels = std::move(localPreview);
                                         m_hasLiveFrame = true;
-                                        m_frameTick++;
                                     }
                                 }
                                 pPreviewConverter->Release();
@@ -870,88 +870,90 @@ private:
         pStream->Release();
     }
 
-    void PushFrameToDirectShow(const uint8_t* bgra, uint32_t inW, uint32_t inH) {
-        if (!m_sink.IsOpen()) return;
+    void PushFrameToDirectShow(const uint8_t* srcBgra, uint32_t inW, uint32_t inH) {
+        if (!srcBgra || inW == 0 || inH == 0) return;
 
-        // Швидка конвертація BGRA в YUY2 для DirectShow драйвера
-        size_t yuy2Size = inW * inH * 2;
-        if (m_yuy2Buffer.size() != yuy2Size) {
-            m_yuy2Buffer.resize(yuy2Size);
+        const uint32_t outW = m_state.width;
+        const uint32_t outH = m_state.height;
+        size_t expectedYuy2 = EyeCam::CalculateFrameSize(outW, outH, EyeCam::PixelFormat::YUY2);
+        if (m_yuy2Buffer.size() != expectedYuy2) {
+            m_yuy2Buffer.resize(expectedYuy2);
         }
 
-        uint8_t* dst = m_yuy2Buffer.data();
-        for (uint32_t y = 0; y < inH; ++y) {
-            const uint8_t* srcRow = bgra + y * inW * 4;
-            uint8_t* dstRow = dst + y * inW * 2;
-            for (uint32_t x = 0; x < inW; x += 2) {
-                uint8_t b1 = srcRow[x * 4 + 0];
-                uint8_t g1 = srcRow[x * 4 + 1];
-                uint8_t r1 = srcRow[x * 4 + 2];
+        for (uint32_t y = 0; y < outH; ++y) {
+            uint32_t srcY = (y * inH) / outH;
+            const uint8_t* srcRow = srcBgra + (srcY * inW * 4);
+            uint8_t* dstRow = m_yuy2Buffer.data() + (y * outW * 2);
 
-                uint8_t b2 = srcRow[(x + 1) * 4 + 0];
-                uint8_t g2 = srcRow[(x + 1) * 4 + 1];
-                uint8_t r2 = srcRow[(x + 1) * 4 + 2];
+            for (uint32_t x = 0; x < outW; x += 2) {
+                uint32_t srcX = (x * inW) / outW;
+                const uint8_t* p = srcRow + (srcX * 4);
+                uint8_t b = p[0];
+                uint8_t g = p[1];
+                uint8_t r = p[2];
 
-                int y1 = ( ( 66 * r1 + 129 * g1 +  25 * b1 + 128) >> 8) + 16;
-                int y2 = ( ( 66 * r2 + 129 * g2 +  25 * b2 + 128) >> 8) + 16;
-                int u  = ( ( -38 * r1 -  74 * g1 + 112 * b1 + 128) >> 8) + 128;
-                int v  = ( ( 112 * r1 -  94 * g1 -  18 * b1 + 128) >> 8) + 128;
+                uint8_t yVal = static_cast<uint8_t>(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
+                uint8_t uVal = static_cast<uint8_t>(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
+                uint8_t vVal = static_cast<uint8_t>(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
 
-                dstRow[x * 2 + 0] = static_cast<uint8_t>(std::clamp(y1, 16, 235));
-                dstRow[x * 2 + 1] = static_cast<uint8_t>(std::clamp(u, 16, 240));
-                dstRow[x * 2 + 2] = static_cast<uint8_t>(std::clamp(y2, 16, 235));
-                dstRow[x * 2 + 3] = static_cast<uint8_t>(std::clamp(v, 16, 240));
+                size_t dIdx = x * 2;
+                dstRow[dIdx + 0] = yVal;
+                dstRow[dIdx + 1] = uVal;
+                dstRow[dIdx + 2] = yVal;
+                dstRow[dIdx + 3] = vVal;
             }
         }
-        m_sink.PushFrame(m_yuy2Buffer.data(), m_yuy2Buffer.size());
-    }
 
-    HRESULT EnsureDirect2DResources() {
-        if (m_pRenderTarget) return S_OK;
-
-        RECT rc{};
-        GetClientRect(m_hwnd, &rc);
-        D2D1_SIZE_U size = D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top);
-
-        HRESULT hr = m_pD2DFactory->CreateHwndRenderTarget(
-            D2D1::RenderTargetProperties(
-                D2D1_RENDER_TARGET_TYPE_DEFAULT,
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED)
-            ),
-            D2D1::HwndRenderTargetProperties(m_hwnd, size),
-            &m_pRenderTarget
-        );
-        if (SUCCEEDED(hr)) {
-            hr = m_pRenderTarget->CreateSolidColorBrush(COL_TEXT_PRIMARY, &m_pBrush);
+        if (m_sink.IsOpen()) {
+            if (m_sink.WriteFrame(m_yuy2Buffer.data(), m_yuy2Buffer.size())) {
+                m_state.shmFramesWritten++;
+            }
         }
-        return hr;
     }
 
-    void DrawRoundedCard(const UiRect& r, D2D1_COLOR_F fill, D2D1_COLOR_F border, float radius = 8.0f) {
+    void EnsureRenderTarget() {
+        if (!m_pRenderTarget) {
+            RECT rc{};
+            GetClientRect(m_hwnd, &rc);
+            D2D1_SIZE_U size = D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top);
+
+            m_pD2DFactory->CreateHwndRenderTarget(
+                D2D1::RenderTargetProperties(),
+                D2D1::HwndRenderTargetProperties(m_hwnd, size),
+                &m_pRenderTarget
+            );
+
+            if (m_pRenderTarget) {
+                m_pRenderTarget->CreateSolidColorBrush(COL_TEXT_PRIMARY, &m_pBrush);
+
+                D2D1_BITMAP_PROPERTIES bmpProps = D2D1::BitmapProperties(
+                    D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE)
+                );
+                m_pRenderTarget->CreateBitmap(D2D1::SizeU(640, 360), bmpProps, &m_pPreviewBitmap);
+            }
+        }
+    }
+
+    void DrawRoundedCard(const UiRect& r, const D2D1_COLOR_F& fill, const D2D1_COLOR_F& border, float radius = 10.0f) {
         D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(r.ToD2D(), radius, radius);
         m_pBrush->SetColor(fill);
         m_pRenderTarget->FillRoundedRectangle(rr, m_pBrush);
-        if (border.a > 0.01f) {
-            m_pBrush->SetColor(border);
-            m_pRenderTarget->DrawRoundedRectangle(rr, m_pBrush, 1.0f);
-        }
+        m_pBrush->SetColor(border);
+        m_pRenderTarget->DrawRoundedRectangle(rr, m_pBrush, 1.0f);
     }
 
-    void DrawTextStr(
-        const std::wstring& str,
-        const UiRect& r,
-        IDWriteTextFormat* font,
-        D2D1_COLOR_F color,
-        DWRITE_TEXT_ALIGNMENT align = DWRITE_TEXT_ALIGNMENT_LEADING
-    ) {
-        font->SetTextAlignment(align);
-        font->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    void DrawTextStr(const std::wstring& text, const UiRect& r, IDWriteTextFormat* fmt, const D2D1_COLOR_F& color,
+                     DWRITE_TEXT_ALIGNMENT align = DWRITE_TEXT_ALIGNMENT_LEADING) {
+        if (!fmt) return;
+        fmt->SetTextAlignment(align);
+        fmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         m_pBrush->SetColor(color);
-        m_pRenderTarget->DrawText(str.c_str(), static_cast<UINT32>(str.size()), font, r.ToD2D(), m_pBrush);
+        m_pRenderTarget->DrawText(text.c_str(), static_cast<UINT32>(text.length()), fmt, r.ToD2D(), m_pBrush);
     }
 
     void OnPaint() {
-        if (FAILED(EnsureDirect2DResources())) return;
+        EnsureRenderTarget();
+        if (!m_pRenderTarget) return;
 
         m_pRenderTarget->BeginDraw();
         m_pRenderTarget->Clear(COL_BG_MAIN);
