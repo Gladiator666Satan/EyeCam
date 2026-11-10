@@ -155,9 +155,7 @@ jobs:
           powershell -ExecutionPolicy Bypass -File scripts/windows/generate_icon.ps1
 
       - name: Configure CMake (MSVC x64)
-        run: |
-          cmake -B build -A x64 \
-            -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B build -A x64 -DCMAKE_BUILD_TYPE=Release
 
       - name: Build Windows Client Engine, Studio GUI & DirectShow Filter
         run: |
