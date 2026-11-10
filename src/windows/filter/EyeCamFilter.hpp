@@ -3,8 +3,6 @@
 #if defined(_WIN32)
 #include <windows.h>
 #include <dshow.h>
-#include <ks.h>
-#include <ksmedia.h>
 #include <atomic>
 #include <thread>
 #include <mutex>

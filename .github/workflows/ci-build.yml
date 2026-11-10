@@ -87,3 +87,40 @@ jobs:
       - name: Build Linux Client Engine
         run: |
           cmake --build build --config Release --verbose
+
+      - name: Upload Linux Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: eyecam-linux-binaries
+          path: |
+            build/bin/*
+            build/lib/*
+          if-no-files-found: warn
+
+  build-desktop-windows:
+    name: Build Desktop Windows Engine
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Configure CMake (MSVC x64)
+        run: |
+          cmake -B build -A x64 `
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Windows Client Engine & DirectShow Filter
+        run: |
+          cmake --build build --config Release --verbose
+
+      - name: Upload Windows Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: eyecam-windows-binaries
+          path: |
+            build/bin/Release/*
+            build/lib/Release/*
+            build/bin/*
+            build/lib/*
+            scripts/windows/*
+          if-no-files-found: warn

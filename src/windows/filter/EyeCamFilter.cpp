@@ -1,9 +1,15 @@
 #include "EyeCamFilter.hpp"
 
 #if defined(_WIN32)
-#include <initguid.h>
 #include <uuids.h>
 #include <iostream>
+
+#ifndef AMPROPERTY_PIN_CATEGORY
+#define AMPROPERTY_PIN_CATEGORY 0
+#endif
+#ifndef KSPROPERTY_SUPPORT_GET
+#define KSPROPERTY_SUPPORT_GET 1
+#endif
 
 namespace EyeCam {
 
@@ -155,6 +161,7 @@ public:
 
 private:
     std::atomic<ULONG> m_refCount{1};
+    EyeCamOutputPin* pPin = nullptr;
     EyeCamOutputPin* m_pPin = nullptr;
     ULONG m_index = 0;
 };
@@ -337,7 +344,7 @@ STDMETHODIMP EyeCamOutputPin::Set(REFGUID guidPropSet, DWORD dwPropID, LPVOID pI
 STDMETHODIMP EyeCamOutputPin::Get(REFGUID guidPropSet, DWORD dwPropID, LPVOID pInstanceData, 
                                   DWORD cbInstanceData, LPVOID pPropData, DWORD cbPropData, DWORD* pcbReturned) {
     (void)pInstanceData; (void)cbInstanceData;
-    if (guidPropSet == AMPROPSETID_Pin && dwPropID == AMPMS_PIN_CATEGORY) {
+    if (guidPropSet == AMPROPSETID_Pin && dwPropID == AMPROPERTY_PIN_CATEGORY) {
         if (!pPropData) return E_POINTER;
         if (cbPropData < sizeof(GUID)) return E_FAIL;
 
@@ -351,7 +358,7 @@ STDMETHODIMP EyeCamOutputPin::Get(REFGUID guidPropSet, DWORD dwPropID, LPVOID pI
 
 STDMETHODIMP EyeCamOutputPin::QuerySupported(REFGUID guidPropSet, DWORD dwPropID, DWORD* pTypeSupport) {
     if (!pTypeSupport) return E_POINTER;
-    if (guidPropSet == AMPROPSETID_Pin && dwPropID == AMPMS_PIN_CATEGORY) {
+    if (guidPropSet == AMPROPSETID_Pin && dwPropID == AMPROPERTY_PIN_CATEGORY) {
         *pTypeSupport = KSPROPERTY_SUPPORT_GET;
         return S_OK;
     }
