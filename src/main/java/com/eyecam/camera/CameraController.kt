@@ -696,7 +696,8 @@ class CameraController(private val context: Context) {
         val cropH = (activeArray.height() / effZoom).toInt()
         val left = (activeArray.width() - cropW) / 2
         val top = (activeArray.height() - cropH) / 2
-        builder.set(CaptureRequest.SCALER_CROP_REGION, Rect(left, top, left + cropW, top + cropH))\n    }
+        builder.set(CaptureRequest.SCALER_CROP_REGION, Rect(left, top, left + cropW, top + cropH))
+    }
 
     fun switchCameraModule(targetCameraId: String, targetZoom: Float) {
         // Запобігаємо виклику openCamera для фізичних суб-камер, які заборонено відкривати напряму
@@ -858,23 +859,47 @@ class CameraController(private val context: Context) {
                 } else if (mode.iso > 0) {
                     builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
                     builder.set(CaptureRequest.SENSOR_SENSITIVITY, CameraUtils.clampIso(mode.iso, isoRange))
+                    val defaultExp = 20_000_000L
+                    builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, CameraUtils.clampExposureTime(defaultExp, expRange))
                 } else if (mode.exposureTimeNs > 0L) {
                     builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
                     builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, CameraUtils.clampExposureTime(mode.exposureTimeNs, expRange))
+                    val defaultIso = 100
+                    builder.set(CaptureRequest.SENSOR_SENSITIVITY, CameraUtils.clampIso(defaultIso, isoRange))
                 } else {
                     builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
                 }
 
                 if (mode.whiteBalanceKelvin > 0) {
+                    val rggbVector: RggbChannelVector = CameraUtils.kelvinToRggbChannelVector(mode.whiteBalanceKelvin)
                     builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
-                    builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
-                    val rggb = CameraUtils.kelvinToRggbChannelVector(mode.whiteBalanceKelvin)
-                    builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, rggb)
+                    builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_FAST)
+                    builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, rggbVector)
                 } else {
                     builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
                 }
             }
         }
+    }
+
+    @Synchronized
+    fun closeCamera() {
+        isSessionActive.set(false)
+        try { captureSession?.close() } catch (_: Exception) {}
+        try { cameraDevice?.close() } catch (_: Exception) {}
+        try { imageReader?.close() } catch (_: Exception) {}
+        captureSession = null
+        cameraDevice = null
+        imageReader = null
+        previewRequestBuilder = null
+        // Важливо: НЕ зупиняємо backgroundThread тут, щоб не ламати асинхронні виклики openCamera при перемиканні сенсорів
+    }
+
+    @Synchronized
+    fun release() {
+        closeCamera()
+        stopBackgroundThread()
+        encodeExecutor.shutdown()
     }
 
     private fun startBackgroundThread() {
@@ -888,41 +913,7 @@ class CameraController(private val context: Context) {
 
     private fun stopBackgroundThread() {
         cameraThread?.quitSafely()
-        try {
-            cameraThread?.join(500)
-            cameraThread = null
-            cameraHandler = null
-        } catch (e: InterruptedException) {
-            Log.e(TAG, "Error stopping background thread", e)
-        }
-    }
-
-    fun closeCamera() {
-        try {
-            captureSession?.stopRepeating()
-        } catch (_: Exception) {}
-        try {
-            captureSession?.close()
-        } catch (_: Exception) {}
-        captureSession = null
-
-        try {
-            cameraDevice?.close()
-        } catch (_: Exception) {}
-        cameraDevice = null
-
-        try {
-            imageReader?.close()
-        } catch (_: Exception) {}
-        imageReader = null
-
-        isSessionActive.set(false)
-        // thread не зупиняємо тут для миттєвого перезапуску без лагів
-    }
-
-    fun release() {
-        closeCamera()
-        stopBackgroundThread()
-        encodeExecutor.shutdown()
+        cameraThread = null
+        cameraHandler = null
     }
 }
