@@ -75,7 +75,7 @@ jobs:
           git push origin main || true
 
       - name: Build Debug APK
-        run: ./gradlew assembleDebug --no-daemon --stacktrace
+        run: ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee /tmp/gradle_build.log
 
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
@@ -95,7 +95,11 @@ jobs:
             gh pr comment 1 --body "📱 **Android Build SUCCESS**: Debug APK built successfully with permanent keystore!" || true
           else
             gh api "repos/${{ github.repository }}/statuses/${{ github.sha }}" -f state=failure -f description="Android Build encountered an error." -f context="EyeCam Android Build" || true
-            gh pr comment 1 --body "❌ **Android Build FAILED**: check workflow logs." || true
+            ERR_SNIP=$(grep -E -A 5 -B 2 -i "(e:|error:|failed|exception)" /tmp/gradle_build.log | tail -n 35 || true)
+            gh pr comment 1 --body "❌ **Android Build FAILED**:
+\`\`\`
+$ERR_SNIP
+\`\`\`" || true
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -107,28 +111,19 @@ jobs:
       - name: Checkout Source Code
         uses: actions/checkout@v4
 
-      - name: Install Linux Build Dependencies
+      - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cmake \
-            ninja-build \
-            build-essential \
-            libv4l-dev \
-            libavcodec-dev \
-            libavformat-dev \
-            libswscale-dev \
-            libavutil-dev \
-            pkg-config
+          sudo apt-get install -y cmake build-essential ninja-build libv4l-dev v4l2loopback-dkms v4l-utils
 
       - name: Configure CMake
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build Linux Client Engine
+      - name: Build Linux Virtual Camera & Examples
         run: |
-          cmake --build build --config Release --verbose
+          cmake --build build --config Release
 
       - name: Upload Linux Build Artifacts
         uses: actions/upload-artifact@v4
@@ -138,6 +133,19 @@ jobs:
             build/bin/*
             build/lib/*
           if-no-files-found: warn
+
+      - name: Report Linux Build Result
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            gh api "repos/${{ github.repository }}/statuses/${{ github.sha }}" -f state=success -f description="Linux Virtual Camera built successfully!" -f context="EyeCam Linux Build" || true
+            gh pr comment 1 --body "🐧 **Linux Build SUCCESS**: V4L2 Virtual Camera module built successfully!" || true
+          else
+            gh api "repos/${{ github.repository }}/statuses/${{ github.sha }}" -f state=failure -f description="Linux Build encountered an error." -f context="EyeCam Linux Build" || true
+            gh pr comment 1 --body "❌ **Linux Build FAILED**: check workflow logs." || true
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-desktop-windows:
     name: Build Desktop Windows Engine
