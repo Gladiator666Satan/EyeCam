@@ -88,10 +88,11 @@ if (WIN32)
         dwrite.lib
         dwmapi.lib
         windowscodecs.lib
-        shlwapi.lib
         ws2_32.lib
         shell32.lib
         ole32.lib
+        oleaut32.lib
+        uuid.lib
         advapi32.lib
         user32.lib
         gdi32.lib

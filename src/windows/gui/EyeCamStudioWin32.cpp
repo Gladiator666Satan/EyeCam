@@ -1,20 +1,15 @@
 #if defined(_WIN32)
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <windowsx.h>
-#include <objbase.h>
-#include <wincodec.h>
-#include <shlwapi.h>
+#include <ole2.h>
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <d2d1.h>
 #include <dwrite.h>
+#include <wincodec.h>
 
 #include <algorithm>
 #include <atomic>
@@ -35,11 +30,12 @@
 #pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "windowscodecs.lib")
-#pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "uuid.lib")
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
@@ -762,11 +758,21 @@ private:
     void DecodeIncomingJpegFrame(IWICImagingFactory* pWicFactory, const uint8_t* jpegData, size_t jpegLen) {
         if (!pWicFactory || !jpegData || jpegLen == 0) return;
 
-        IStream* pStream = SHCreateMemStream(jpegData, static_cast<UINT>(jpegLen));
-        if (!pStream) return;
+        IWICStream* pStream = nullptr;
+        HRESULT hr = pWicFactory->CreateStream(&pStream);
+        if (FAILED(hr) || !pStream) return;
+
+        hr = pStream->InitializeFromMemory(
+            const_cast<BYTE*>(reinterpret_cast<const BYTE*>(jpegData)),
+            static_cast<DWORD>(jpegLen)
+        );
+        if (FAILED(hr)) {
+            pStream->Release();
+            return;
+        }
 
         IWICBitmapDecoder* pDecoder = nullptr;
-        HRESULT hr = pWicFactory->CreateDecoderFromStream(
+        hr = pWicFactory->CreateDecoderFromStream(
             pStream, nullptr, WICDecodeMetadataCacheOnDemand, &pDecoder
         );
         if (SUCCEEDED(hr) && pDecoder) {
@@ -917,6 +923,9 @@ private:
         fmt->SetTextAlignment(align);
         fmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         m_pBrush->SetColor(color);
+#ifdef DrawText
+#undef DrawText
+#endif
         m_pRenderTarget->DrawText(
             text.c_str(),
             static_cast<UINT32>(text.size()),

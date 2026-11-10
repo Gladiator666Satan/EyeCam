@@ -115,7 +115,15 @@ jobs:
 
       - name: Build Windows Client Engine, Studio GUI & DirectShow Filter
         run: |
-          cmake --build build --config Release --verbose
+          $buildOut = cmake --build build --config Release --verbose 2>&1
+          $exitCode = $LASTEXITCODE
+          foreach ($line in $buildOut) {
+            Write-Host $line
+            if ($line -match "error C\d+|error LNK\d+|fatal error") {
+              Write-Host "::error::$line"
+            }
+          }
+          if ($exitCode -ne 0) { exit $exitCode }
 
       - name: Bundle ADB USB Bridge for Installer
         run: |
