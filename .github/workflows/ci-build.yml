@@ -75,7 +75,7 @@ jobs:
           git push origin main || true
 
       - name: Build Debug APK
-        run: ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee /tmp/gradle_build.log
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
@@ -95,11 +95,7 @@ jobs:
             gh pr comment 1 --body "📱 **Android Build SUCCESS**: Debug APK built successfully with permanent keystore!" || true
           else
             gh api "repos/${{ github.repository }}/statuses/${{ github.sha }}" -f state=failure -f description="Android Build encountered an error." -f context="EyeCam Android Build" || true
-            ERR_SNIP=$(grep -E -A 5 -B 2 -i "(e:|error:|failed|exception)" /tmp/gradle_build.log | tail -n 35 || true)
-            gh pr comment 1 --body "❌ **Android Build FAILED**:
-\`\`\`
-$ERR_SNIP
-\`\`\`" || true
+            gh pr comment 1 --body "❌ **Android Build FAILED**: check workflow logs." || true
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -111,12 +107,12 @@ $ERR_SNIP
       - name: Checkout Source Code
         uses: actions/checkout@v4
 
-      - name: Install Dependencies
+      - name: Install Linux Build Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake build-essential ninja-build libv4l-dev v4l2loopback-dkms v4l-utils
 
-      - name: Configure CMake
+      - name: Configure CMake (Linux x64)
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release
@@ -160,7 +156,7 @@ $ERR_SNIP
 
       - name: Configure CMake (MSVC x64)
         run: |
-          cmake -B build -A x64 `
+          cmake -B build -A x64 \
             -DCMAKE_BUILD_TYPE=Release
 
       - name: Build Windows Client Engine, Studio GUI & DirectShow Filter
