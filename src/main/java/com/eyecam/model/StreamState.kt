@@ -37,6 +37,8 @@ data class StreamTelemetry(
     val thermalState: ThermalState = ThermalState.NORMAL,
     val connectionType: ConnectionType = ConnectionType.NONE,
     val connectionDetails: String = "Очікування підключення...",
+    val isPcConnected: Boolean = false,
+    val localIpAddress: String = "",
     val droppedFramesCount: Long = 0L
 )
 
@@ -45,10 +47,17 @@ data class StreamTelemetry(
  */
 data class StreamUiState(
     val isStreaming: Boolean = false,
+    val hasCameraPermission: Boolean = false,
     val isMicMuted: Boolean = false,
     val isTorchOn: Boolean = false,
     val activeSensor: CameraSensorInfo? = null,
     val availableSensors: List<CameraSensorInfo> = emptyList(),
+    val minZoomRatio: Float = 0.5f,
+    val maxZoomRatio: Float = 10.0f,
+    val currentZoomRatio: Float = 1.0f,
+    val supportedZoomPresets: List<Float> = listOf(0.5f, 1.0f, 2.0f, 3.0f, 5.0f, 10.0f),
+    val isFrontCamera: Boolean = false,
+    val deviceModelName: String = "",
     val isDisplayProtectionActive: Boolean = false,
     val telemetry: StreamTelemetry = StreamTelemetry()
 )

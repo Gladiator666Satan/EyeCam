@@ -28,9 +28,9 @@
 
     <application
         android:allowBackup="true"
-        android:icon="@android:drawable/ic_menu_camera"
+        android:icon="@mipmap/ic_launcher"
         android:label="EyeCam"
-        android:roundIcon="@android:drawable/ic_menu_camera"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.NoActionBar">
 
@@ -46,11 +46,11 @@
             </intent-filter>
         </activity>
 
-        <!-- Оголошення Foreground сервісу з типами camera|microphone|connectedDevice -->
+        <!-- Оголошення Foreground сервісу з типами camera|microphone -->
         <service
             android:name=".service.CameraStreamService"
             android:exported="false"
-            android:foregroundServiceType="camera|microphone|connectedDevice" />
+            android:foregroundServiceType="camera|microphone" />
 
     </application>
 
