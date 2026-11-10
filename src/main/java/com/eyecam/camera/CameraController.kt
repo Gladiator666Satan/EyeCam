@@ -9,6 +9,7 @@ import android.graphics.Rect
 import android.graphics.YuvImage
 import android.hardware.camera2.*
 import android.hardware.camera2.params.ColorSpaceTransform
+import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.RggbChannelVector
 import android.hardware.camera2.params.SessionConfiguration
@@ -69,8 +70,19 @@ class CameraController(private val context: Context) {
     var supportedZoomPresets: List<Float> = listOf(0.5f, 1.0f, 2.0f, 3.0f, 5.0f, 10.0f)
         private set
 
-    private var backCameraId: String = "0"
-    private var frontCameraId: String? = null
+    var backCameraId: String = "0"
+        private set
+    var frontCameraId: String? = null
+        private set
+    var ultraWideCameraId: String? = null
+        private set
+    var mainWideCameraId: String = "0"
+        private set
+    var telephotoCameraId: String? = null
+        private set
+    var periscopeCameraId: String? = null
+        private set
+
     var isFrontCameraActive: Boolean = false
         private set
 
@@ -78,8 +90,12 @@ class CameraController(private val context: Context) {
     val availableSensors: List<CameraSensorInfo> get() = _availableSensors
 
     private var lastFrameSentTimeMs: Long = 0L
-    private var streamWidth: Int = 1280
-    private var streamHeight: Int = 720
+    var streamWidth: Int = 1920
+        private set
+    var streamHeight: Int = 1080
+        private set
+    var streamFps: Int = 60
+        private set
 
     init {
         discoverAvailableSensors()
@@ -105,15 +121,36 @@ class CameraController(private val context: Context) {
                 val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
                 val isLogical = caps.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA)
                 val facing = chars.get(CameraCharacteristics.LENS_FACING) ?: CameraCharacteristics.LENS_FACING_BACK
+                val focalLengths = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS) ?: floatArrayOf(0f)
+                val minFocusDist = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0.0f
+                val isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE) ?: Range(100, 3200)
+                val expRange = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE) ?: Range(100_000L, 1_000_000_000L)
+                val sType = CameraUtils.classifySensor(chars)
 
-                if (facing == CameraCharacteristics.LENS_FACING_BACK && backCameraId == "0") {
-                    backCameraId = id
-                } else if (facing == CameraCharacteristics.LENS_FACING_FRONT && frontCameraId == null) {
-                    frontCameraId = id
-                }
+                if (facing == CameraCharacteristics.LENS_FACING_FRONT) {
+                    if (frontCameraId == null) frontCameraId = id
+                } else if (facing == CameraCharacteristics.LENS_FACING_BACK) {
+                    if (backCameraId == "0") backCameraId = id
+                    when (sType) {
+                        SensorType.ULTRA_WIDE -> {
+                            if (ultraWideCameraId == null) ultraWideCameraId = id
+                            foundUltraWide = true
+                        }
+                        SensorType.WIDE -> {
+                            if (mainWideCameraId == "0" || mainWideCameraId.isEmpty()) mainWideCameraId = id
+                        }
+                        SensorType.TELEPHOTO -> {
+                            foundTelephoto = true
+                            val maxFocal = focalLengths.maxOrNull() ?: 0f
+                            if (maxFocal > 12.0f) {
+                                periscopeCameraId = id
+                            } else {
+                                if (telephotoCameraId == null) telephotoCameraId = id
+                            }
+                        }
+                        else -> {}
+                    }
 
-                // Визначення реального діапазону зуму телефону (наприклад, Samsung Galaxy S26 Ultra підтримує 0.5x..100x)
-                if (facing == CameraCharacteristics.LENS_FACING_BACK) {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                         val zoomRange = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
                         if (zoomRange != null) {
@@ -124,7 +161,6 @@ class CameraController(private val context: Context) {
                     val maxDigZoom = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1.0f
                     if (maxDigZoom > detectedMaxZoom) detectedMaxZoom = maxDigZoom
 
-                    // Перевірка підтримки 4K (3840x2160)
                     val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
                     val sizes = map?.getOutputSizes(Surface::class.java)
                     if (sizes != null && sizes.any { it.width >= 3840 && it.height >= 2160 }) {
@@ -135,15 +171,6 @@ class CameraController(private val context: Context) {
                 val physicalIds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && isLogical) {
                     chars.physicalCameraIds
                 } else emptySet()
-
-                val focalLengths = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS) ?: floatArrayOf(0f)
-                val minFocusDist = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0.0f
-                val isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE) ?: Range(100, 3200)
-                val expRange = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE) ?: Range(100_000L, 1_000_000_000L)
-
-                val sType = CameraUtils.classifySensor(chars)
-                if (sType == SensorType.ULTRA_WIDE) foundUltraWide = true
-                if (sType == SensorType.TELEPHOTO) foundTelephoto = true
 
                 _availableSensors.add(
                     CameraSensorInfo(
@@ -168,8 +195,18 @@ class CameraController(private val context: Context) {
                             val physIso = physChars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE) ?: Range(100, 3200)
                             val physExp = physChars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE) ?: Range(100_000L, 1_000_000_000L)
                             val physType = CameraUtils.classifySensor(physChars)
-                            if (physType == SensorType.ULTRA_WIDE) foundUltraWide = true
-                            if (physType == SensorType.TELEPHOTO) foundTelephoto = true
+                            if (physType == SensorType.ULTRA_WIDE) {
+                                if (ultraWideCameraId == null) ultraWideCameraId = physId
+                                foundUltraWide = true
+                            } else if (physType == SensorType.TELEPHOTO) {
+                                foundTelephoto = true
+                                val maxFocal = physFocal.maxOrNull() ?: 0f
+                                if (maxFocal > 12.0f && periscopeCameraId == null) {
+                                    periscopeCameraId = physId
+                                } else if (telephotoCameraId == null) {
+                                    telephotoCameraId = physId
+                                }
+                            }
 
                             _availableSensors.add(
                                 CameraSensorInfo(
@@ -192,10 +229,14 @@ class CameraController(private val context: Context) {
             Log.e(TAG, "Error discovering sensors", e)
         }
 
-        if (foundUltraWide && detectedMinZoom >= 1.0f) {
+        if (periscopeCameraId == null && telephotoCameraId != null) {
+            periscopeCameraId = telephotoCameraId
+        }
+
+        if ((foundUltraWide || ultraWideCameraId != null) && detectedMinZoom >= 1.0f) {
             detectedMinZoom = 0.5f
         }
-        if (foundTelephoto && detectedMaxZoom < 10.0f) {
+        if ((foundTelephoto || telephotoCameraId != null) && detectedMaxZoom < 10.0f) {
             detectedMaxZoom = 10.0f
         }
 
@@ -207,6 +248,7 @@ class CameraController(private val context: Context) {
             (preset < 1.0f && minZoomRatio < 1.0f) || (preset >= 1.0f && preset <= maxZoomRatio + 0.05f)
         }.ifEmpty { listOf(1.0f) }
 
+        Log.i(TAG, "Modules: ultraWide=$ultraWideCameraId, main=$mainWideCameraId, tele=$telephotoCameraId, peri=$periscopeCameraId, front=$frontCameraId")
         Log.i(TAG, "Detected Zoom Range: ${minZoomRatio}x .. ${maxZoomRatio}x, Presets: $supportedZoomPresets")
         return _availableSensors
     }
@@ -237,7 +279,18 @@ class CameraController(private val context: Context) {
         try {
             this.currentSensorCharacteristics = cameraManager.getCameraCharacteristics(logicalCameraId)
 
-            imageReader = ImageReader.newInstance(streamWidth, streamHeight, ImageFormat.YUV_420_888, 2).apply {
+            val map = currentSensorCharacteristics?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val sizes = map?.getOutputSizes(ImageFormat.YUV_420_888)
+            val bestSize = sizes?.minByOrNull {
+                val dw = kotlin.math.abs(it.width - streamWidth)
+                val dh = kotlin.math.abs(it.height - streamHeight)
+                dw * dw + dh * dh
+            }
+            val actualW = bestSize?.width ?: streamWidth
+            val actualH = bestSize?.height ?: streamHeight
+
+            // Створюємо ImageReader для передачі живих кадрів на ПК через USB ADB / Wi-Fi
+            imageReader = ImageReader.newInstance(actualW, actualH, ImageFormat.YUV_420_888, 2).apply {
                 setOnImageAvailableListener({ reader ->
                     val image = try { reader.acquireLatestImage() } catch (_: Exception) { null }
                     if (image != null) {
@@ -266,12 +319,126 @@ class CameraController(private val context: Context) {
         }
     }
 
+    fun setResolution(width: Int, height: Int, fps: Int = 60) {
+        if (streamWidth == width && streamHeight == height && streamFps == fps) return
+        Log.i(TAG, "Updating stream resolution: ${width}x${height} @ ${fps}fps (from ${streamWidth}x${streamHeight})")
+        streamWidth = width
+        streamHeight = height
+        streamFps = fps
+
+        if (cameraDevice != null) {
+            recreateCaptureSession()
+        }
+    }
+
+    fun updatePreviewSurface(newSurface: Surface?) {
+        this.previewSurface = newSurface
+        if (cameraDevice != null) {
+            recreateCaptureSession()
+        } else if (isNetworkStreamActive && hasCameraPermission()) {
+            openCamera(
+                logicalCameraId = activeLogicalCameraId,
+                previewSurface = newSurface,
+                encoderSurface = encoderSurface
+            )
+        }
+    }
+
+    fun recreateCaptureSession() {
+        val handler = cameraHandler ?: return
+        try {
+            try { captureSession?.stopRepeating() } catch (_: Exception) {}
+            try { captureSession?.close() } catch (_: Exception) {}
+            captureSession = null
+
+            try { imageReader?.close() } catch (_: Exception) {}
+
+            val map = currentSensorCharacteristics?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val sizes = map?.getOutputSizes(ImageFormat.YUV_420_888)
+            val bestSize = sizes?.minByOrNull {
+                val dw = kotlin.math.abs(it.width - streamWidth)
+                val dh = kotlin.math.abs(it.height - streamHeight)
+                dw * dw + dh * dh
+            }
+            val actualW = bestSize?.width ?: streamWidth
+            val actualH = bestSize?.height ?: streamHeight
+
+            imageReader = ImageReader.newInstance(actualW, actualH, ImageFormat.YUV_420_888, 2).apply {
+                setOnImageAvailableListener({ reader ->
+                    val image = try { reader.acquireLatestImage() } catch (_: Exception) { null }
+                    if (image != null) {
+                        try {
+                            processImageForNetwork(image)
+                        } finally {
+                            image.close()
+                        }
+                    }
+                }, handler)
+            }
+
+            createCaptureSessionInternal()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error recreating capture session", e)
+        }
+    }
+
+    fun triggerAutoFocus() {
+        val session = captureSession ?: return
+        val builder = previewRequestBuilder ?: return
+        val handler = cameraHandler ?: return
+        try {
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+            session.capture(builder.build(), null, handler)
+
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+            session.setRepeatingRequest(builder.build(), null, handler)
+            Log.i(TAG, "Refocus triggered successfully")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error triggering auto-focus", e)
+        }
+    }
+
+    fun triggerFocusAtPoint(xNorm: Float, yNorm: Float) {
+        val chars = currentSensorCharacteristics ?: return
+        val session = captureSession ?: return
+        val builder = previewRequestBuilder ?: return
+        val handler = cameraHandler ?: return
+        val activeArray = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
+
+        try {
+            val focusAreaSize = 150
+            val centerX = (xNorm * activeArray.width()).toInt().coerceIn(0, activeArray.width() - 1)
+            val centerY = (yNorm * activeArray.height()).toInt().coerceIn(0, activeArray.height() - 1)
+
+            val left = (centerX - focusAreaSize).coerceAtLeast(0)
+            val top = (centerY - focusAreaSize).coerceAtLeast(0)
+            val right = (centerX + focusAreaSize).coerceAtMost(activeArray.width() - 1)
+            val bottom = (centerY + focusAreaSize).coerceAtMost(activeArray.height() - 1)
+
+            val meteringRect = MeteringRectangle(Rect(left, top, right, bottom), MeteringRectangle.METERING_WEIGHT_MAX)
+            builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(meteringRect))
+            builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(meteringRect))
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+            session.capture(builder.build(), null, handler)
+
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+            session.setRepeatingRequest(builder.build(), null, handler)
+            Log.i(TAG, "Focus triggered at point: ($xNorm, $yNorm)")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in tap-to-focus", e)
+        }
+    }
+
     private fun processImageForNetwork(image: Image) {
         val callback = onJpegFrameAvailable ?: return
         if (!isNetworkStreamActive) return
 
         val now = System.currentTimeMillis()
-        if (now - lastFrameSentTimeMs < 28) return
+        if (now - lastFrameSentTimeMs < 28) return // ~35 FPS стабільний потік без перевантаження TCP буфера
         lastFrameSentTimeMs = now
 
         try {
@@ -390,12 +557,29 @@ class CameraController(private val context: Context) {
         val clamped = zoomRatio.coerceIn(minZoomRatio, maxZoomRatio)
         currentZoomRatio = clamped
 
-        if (isFrontCameraActive) {
-            openCamera(
-                logicalCameraId = backCameraId,
-                previewSurface = previewSurface,
-                encoderSurface = encoderSurface
-            )
+        // Автоматичне перемикання фізичних модулів (0.5x Ultra-Wide, 1x Wide, 3x Tele, 5x/10x Periscope)
+        if (!isFrontCameraActive) {
+            val targetModuleId = when {
+                clamped < 1.0f && ultraWideCameraId != null -> ultraWideCameraId
+                clamped in 1.0f..2.99f -> mainWideCameraId
+                clamped in 3.0f..4.99f && telephotoCameraId != null -> telephotoCameraId
+                clamped >= 5.0f && periscopeCameraId != null -> periscopeCameraId
+                else -> mainWideCameraId
+            }
+
+            if (targetModuleId != null && targetModuleId != activeLogicalCameraId) {
+                val baseZoom = when (targetModuleId) {
+                    ultraWideCameraId -> 1.0f
+                    mainWideCameraId -> clamped
+                    telephotoCameraId -> (clamped / 3.0f).coerceAtLeast(1.0f)
+                    periscopeCameraId -> (clamped / 5.0f).coerceAtLeast(1.0f)
+                    else -> clamped
+                }
+                switchCameraModule(targetModuleId, baseZoom)
+                return
+            }
+        } else if (clamped > 1.0f) {
+            switchFrontBack(false)
             return
         }
 
@@ -406,20 +590,15 @@ class CameraController(private val context: Context) {
         try {
             applyZoomToBuilder(builder, clamped)
             session.setRepeatingRequest(builder.build(), null, handler)
-            Log.i(TAG, "Applied zoom ratio: ${clamped}x")
+            Log.i(TAG, "Applied zoom ratio: ${clamped}x on camera $activeLogicalCameraId")
         } catch (e: Exception) {
             Log.e(TAG, "Error setting zoom ratio", e)
         }
     }
 
     fun switchFrontBack(useFront: Boolean) {
-        val targetId = if (useFront) (frontCameraId ?: backCameraId) else backCameraId
-        if (targetId == activeLogicalCameraId && isSessionActive.get()) return
-        openCamera(
-            logicalCameraId = targetId,
-            previewSurface = previewSurface,
-            encoderSurface = encoderSurface
-        )
+        val targetId = if (useFront) (frontCameraId ?: "1") else mainWideCameraId
+        switchCameraModule(targetId, 1.0f)
     }
 
     private fun applyZoomToBuilder(builder: CaptureRequest.Builder, zoom: Float) {
@@ -431,6 +610,7 @@ class CameraController(private val context: Context) {
                 return
             }
         }
+        // Fallback через SCALER_CROP_REGION для старіших API
         val activeArray = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
         val effZoom = zoom.coerceAtLeast(1.0f)
         val cropW = (activeArray.width() / effZoom).toInt()
@@ -440,15 +620,58 @@ class CameraController(private val context: Context) {
         builder.set(CaptureRequest.SCALER_CROP_REGION, Rect(left, top, left + cropW, top + cropH))
     }
 
+    fun switchCameraModule(targetCameraId: String, targetZoom: Float) {
+        this.isFrontCameraActive = (targetCameraId == frontCameraId)
+        this.currentZoomRatio = targetZoom
+
+        if (activeLogicalCameraId != targetCameraId || cameraDevice == null) {
+            Log.i(TAG, "Switching physical camera module: from $activeLogicalCameraId to $targetCameraId (zoom ${targetZoom}x)")
+            openCamera(
+                logicalCameraId = targetCameraId,
+                previewSurface = previewSurface,
+                encoderSurface = encoderSurface
+            )
+        } else {
+            val session = captureSession ?: return
+            val builder = previewRequestBuilder ?: return
+            val handler = cameraHandler ?: return
+            try {
+                applyZoomToBuilder(builder, targetZoom)
+                session.setRepeatingRequest(builder.build(), null, handler)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error adjusting zoom on module $targetCameraId", e)
+            }
+        }
+    }
+
     fun switchToSensor(moduleOrId: String) {
         when (moduleOrId.lowercase()) {
             "front", "self", "3_front" -> switchFrontBack(true)
-            "0.5x", "0" -> setZoomRatio(minZoomRatio)
-            "1.0x", "1x", "1" -> setZoomRatio(1.0f)
-            "2.0x", "2x" -> setZoomRatio(2.0f)
-            "3.0x", "3x", "2" -> setZoomRatio(3.0f)
-            "5.0x", "5x" -> setZoomRatio(5.0f)
-            "10.0x", "10x" -> setZoomRatio(10.0f)
+            "0.5x", "0" -> {
+                val targetId = ultraWideCameraId ?: backCameraId
+                switchCameraModule(targetId, if (targetId == ultraWideCameraId) 1.0f else minZoomRatio)
+            }
+            "1.0x", "1x", "1" -> {
+                switchCameraModule(mainWideCameraId, 1.0f)
+            }
+            "2.0x", "2x" -> {
+                switchCameraModule(mainWideCameraId, 2.0f)
+            }
+            "3.0x", "3x", "2" -> {
+                val targetId = telephotoCameraId ?: mainWideCameraId
+                val targetZoom = if (targetId == telephotoCameraId) 1.0f else 3.0f
+                switchCameraModule(targetId, targetZoom)
+            }
+            "5.0x", "5x" -> {
+                val targetId = periscopeCameraId ?: telephotoCameraId ?: mainWideCameraId
+                val targetZoom = if (targetId == periscopeCameraId) 1.0f else if (targetId == telephotoCameraId) 1.67f else 5.0f
+                switchCameraModule(targetId, targetZoom)
+            }
+            "10.0x", "10x" -> {
+                val targetId = periscopeCameraId ?: telephotoCameraId ?: mainWideCameraId
+                val targetZoom = if (targetId == periscopeCameraId) 2.0f else if (targetId == telephotoCameraId) 3.33f else 10.0f
+                switchCameraModule(targetId, targetZoom)
+            }
             else -> {
                 val parsedZoom = moduleOrId.removeSuffix("x").toFloatOrNull()
                 if (parsedZoom != null) {
@@ -467,10 +690,13 @@ class CameraController(private val context: Context) {
             return
         }
         when (targetSensor?.sensorType) {
-            SensorType.ULTRA_WIDE -> setZoomRatio(minZoomRatio)
-            SensorType.WIDE -> setZoomRatio(1.0f)
-            SensorType.TELEPHOTO -> setZoomRatio(3.0f)
-            else -> setZoomRatio(1.0f)
+            SensorType.ULTRA_WIDE -> switchToSensor("0.5x")
+            SensorType.WIDE -> switchToSensor("1.0x")
+            SensorType.TELEPHOTO -> {
+                val focal = targetSensor.focalLengths.maxOrNull() ?: 0f
+                if (focal > 12.0f) switchToSensor("5.0x") else switchToSensor("3.0x")
+            }
+            else -> switchCameraModule(physicalId, 1.0f)
         }
     }
 
