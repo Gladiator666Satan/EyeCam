@@ -8,8 +8,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <windowsx.h>
-#include <objidl.h>
-#include <gdiplus.h>
+#include <ole2.h>
 #include <shlwapi.h>
 #include <dwmapi.h>
 #include <shellapi.h>
@@ -27,6 +26,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+using std::min;
+using std::max;
+#include <gdiplus.h>
 
 #include "WindowsDirectShowSink.hpp"
 #include "SharedMemoryProtocol.hpp"
@@ -332,7 +335,7 @@ bool RegisterDirectShowDriver(HWND hwnd) {
     if (GetFileAttributesW(dllPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
         MessageBoxW(hwnd,
             L"Файл EyeCamFilter.dll не знайдено у директорії програми.\n"
-            L"Переконася, що EyeCamFilter.dll знаходиться поруч із EyeCamStudio.exe.",
+            L"Переконайтеся, що EyeCamFilter.dll знаходиться поруч із EyeCamStudio.exe.",
             L"EyeCam Studio — Помилка драйвера",
             MB_ICONWARNING | MB_OK);
         return false;
@@ -692,8 +695,8 @@ private:
                 auto now = std::chrono::steady_clock::now();
                 auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastStatTime).count();
                 if (elapsedMs >= 1000) {
-                    m_state.measuredBitrateKbps = static_cast<uint32_t>((bytesWindow * 8) / elapsedMs);
-                    m_state.measuredFps = static_cast<uint32_t>((framesWindow * 1000) / elapsedMs);
+                    m_state.measuredBitrateKbps = static_cast<uint32_t>((bytesWindow * 8) / static_cast<uint64_t>(elapsedMs));
+                    m_state.measuredFps = static_cast<uint32_t>((static_cast<uint64_t>(framesWindow) * 1000) / static_cast<uint64_t>(elapsedMs));
                     bytesWindow = 0;
                     framesWindow = 0;
                     lastStatTime = now;
@@ -733,7 +736,7 @@ private:
             const uint32_t pw = 640;
             const uint32_t ph = 360;
 
-            Gdiplus::Bitmap scaled(pw, ph, PixelFormat32bppARGB);
+            Gdiplus::Bitmap scaled(static_cast<INT>(pw), static_cast<INT>(ph), PixelFormat32bppARGB);
             {
                 Gdiplus::Graphics g(&scaled);
                 g.SetInterpolationMode(Gdiplus::InterpolationModeBilinear);
@@ -745,7 +748,8 @@ private:
             if (scaled.LockBits(&lockRect, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bmpData) == Gdiplus::Ok) {
                 std::vector<uint8_t> localPreview(pw * ph * 4);
                 for (uint32_t y = 0; y < ph; ++y) {
-                    const uint8_t* srcLine = static_cast<const uint8_t*>(bmpData.Scan0) + y * bmpData.Stride;
+                    const uint8_t* srcLine = static_cast<const uint8_t*>(bmpData.Scan0) +
+                                             static_cast<intptr_t>(y) * static_cast<intptr_t>(bmpData.Stride);
                     uint8_t* dstLine = localPreview.data() + y * pw * 4;
                     if (!m_state.mirrorHorizontal) {
                         std::memcpy(dstLine, srcLine, pw * 4);
