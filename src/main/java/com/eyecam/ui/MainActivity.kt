@@ -1,123 +1,123 @@
 package com.eyecam.ui
 
 import android.Manifest
-import android.content.ComponentName
-import android.content.Context
-import android.content.Intent
-import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.os.IBinder
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
-import com.eyecam.service.CameraStreamService
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import com.eyecam.ui.theme.EyeCamTheme
+import com.eyecam.ui.theme.OledPureBlack
 import com.eyecam.viewmodel.StreamViewModel
 
+/**
+ * Головна Activity додатку EyeCam.
+ * Відповідає за:
+ * - Запит дозволів CAMERA, RECORD_AUDIO та POST_NOTIFICATIONS при запуску.
+ * - Повноекранний Immersive режим.
+ * - Утримання екрана активним під час стрімінгу (FLAG_KEEP_SCREEN_ON) та показ при заблокованому екрані.
+ * - Природна орієнтація екрана через android:screenOrientation="fullSensor" без штучного спотворення пропорцій.
+ */
 class MainActivity : ComponentActivity() {
 
     private val viewModel: StreamViewModel by viewModels()
-    private var streamService: CameraStreamService? = null
-    private var isBound = false
 
-    private val serviceConnection = object : ServiceConnection {
-        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-            val binder = service as CameraStreamService.LocalBinder
-            streamService = binder.getService()
-            isBound = true
-            viewModel.bindService(binder.getService())
-        }
-
-        override fun onServiceDisconnected(name: ComponentName?) {
-            streamService = null
-            isBound = false
-            viewModel.unbindService()
-        }
-    }
-
-    private val requestPermissionLauncher = registerForActivityResult(
+    private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { permissions ->
-        val cameraGranted = permissions[Manifest.permission.CAMERA] ?: false
-        val audioGranted = permissions[Manifest.permission.RECORD_AUDIO] ?: false
-
+    ) { results ->
+        val cameraGranted = results[Manifest.permission.CAMERA] == true ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
         if (cameraGranted) {
-            viewModel.onCameraPermissionGranted()
-            startCameraStreamService()
+            viewModel.onPermissionsGranted()
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
 
-        // Keep screen on while streaming
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
-        checkAndRequestPermissions()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        } else {
+            @Suppress("DEPRECATION")
+            window.addFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+            )
+        }
+        configureImmersiveMode()
+        requestRequiredPermissionsIfNeeded()
 
         setContent {
-            MaterialTheme {
+            EyeCamTheme {
+                val uiState by viewModel.uiState.collectAsState()
+
+                LaunchedEffect(uiState.isDisplayProtectionActive) {
+                    applyDisplayBrightness(uiState.isDisplayProtectionActive)
+                }
+
                 Surface(
-                    modifier = Modifier.fillMaxSize()
+                    modifier = Modifier.fillMaxSize(),
+                    color = OledPureBlack
                 ) {
-                    val uiState by viewModel.uiState.collectAsState()
                     EyeCamScreen(
-                        uiState = uiState,
                         viewModel = viewModel,
-                        modifier = Modifier.fillMaxSize()
+                        onRequestPermissions = { requestRequiredPermissionsIfNeeded() }
                     )
                 }
             }
         }
     }
 
-    private fun checkAndRequestPermissions() {
-        val permissionsToRequest = mutableListOf(
+    private fun requestRequiredPermissionsIfNeeded() {
+        val perms = mutableListOf(
             Manifest.permission.CAMERA,
             Manifest.permission.RECORD_AUDIO
         )
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            permissionsToRequest.add(Manifest.permission.POST_NOTIFICATIONS)
+            perms.add(Manifest.permission.POST_NOTIFICATIONS)
         }
 
-        val notGranted = permissionsToRequest.filter {
+        val missing = perms.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
-
-        if (notGranted.isEmpty()) {
-            viewModel.onCameraPermissionGranted()
-            startCameraStreamService()
+        if (missing.isNotEmpty()) {
+            permissionLauncher.launch(missing.toTypedArray())
         } else {
-            requestPermissionLauncher.launch(notGranted.toTypedArray())
+            viewModel.onPermissionsGranted()
         }
     }
 
-    private fun startCameraStreamService() {
-        val intent = Intent(this, CameraStreamService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
-        }
-        bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+    private fun configureImmersiveMode() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        val controller = WindowCompat.getInsetsController(window, window.decorView)
+        controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller.hide(WindowInsetsCompat.Type.systemBars())
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        if (isBound) {
-            unbindService(serviceConnection)
-            isBound = false
+    private fun applyDisplayBrightness(isDisplayProtectionActive: Boolean) {
+        val layoutParams = window.attributes
+        layoutParams.screenBrightness = if (isDisplayProtectionActive) {
+            0.01f
+        } else {
+            WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
         }
+        window.attributes = layoutParams
     }
 }

@@ -1,45 +1,77 @@
 package com.eyecam.ui
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
-import androidx.compose.ui.Alignment
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import com.eyecam.model.StreamUiState
+import androidx.compose.ui.input.pointer.pointerInput
 import com.eyecam.ui.components.CameraPreview
+import com.eyecam.ui.components.DisplayProtectionOverlay
 import com.eyecam.ui.components.QuickToggleHud
+import com.eyecam.ui.theme.OledPureBlack
 import com.eyecam.viewmodel.StreamViewModel
 
+/**
+ * Головний екран програми EyeCam, що поєднує живий попередній перегляд камери,
+ * плаваючий HUD з перемикачами зуму (до 10x) та оверлей захисту OLED екрана.
+ */
 @Composable
 fun EyeCamScreen(
-    uiState: StreamUiState,
     viewModel: StreamViewModel,
+    onRequestPermissions: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
+    val uiState by viewModel.uiState.collectAsState()
+
     Box(
         modifier = modifier
             .fillMaxSize()
-            .background(Color.Black)
+            .background(OledPureBlack)
+            .pointerInput(uiState.isDisplayProtectionActive) {
+                if (!uiState.isDisplayProtectionActive) {
+                    detectTapGestures(
+                        onPress = {
+                            viewModel.onUserInteraction()
+                        }
+                    )
+                }
+            }
     ) {
-        // Camera Preview taking the full screen / aspect
+        // Шар 1: Живе прев'ю камери з підключенням SurfaceHolder до CameraController
         CameraPreview(
-            viewModel = viewModel,
-            uiState = uiState,
-            modifier = Modifier.fillMaxSize()
+            isStreaming = uiState.isStreaming,
+            hasCameraPermission = uiState.hasCameraPermission,
+            isDisplayProtectionActive = uiState.isDisplayProtectionActive,
+            streamWidth = uiState.telemetry.resolutionWidth,
+            streamHeight = uiState.telemetry.resolutionHeight,
+            onSurfaceChanged = { surface -> viewModel.attachPreviewSurface(surface) },
+            onFocusPointTapped = { x, y -> viewModel.triggerFocusAtPoint(x, y) },
+            onRequestPermissions = onRequestPermissions
         )
 
-        // Overlay Quick Toggle HUD on top of preview
-        QuickToggleHud(
-            uiState = uiState,
-            onToggleStream = { viewModel.toggleStreaming() },
-            onToggleTorch = { viewModel.toggleTorch() },
-            onToggleMic = { viewModel.toggleMicrophoneMute() },
-            onSwitchCamera = { viewModel.switchCamera() },
-            onSelectZoom = { zoom -> viewModel.setZoomRatio(zoom) },
-            onRefocus = { viewModel.triggerAutoFocus() },
-            onToggleOledProtection = { viewModel.toggleDisplayProtection() },
-            modifier = Modifier.align(Alignment.BottomCenter)
+        // Шар 2: Швидкі перемикачі HUD (видимі, коли захист екрану вимкнено)
+        if (!uiState.isDisplayProtectionActive) {
+            QuickToggleHud(
+                uiState = uiState,
+                onToggleStream = { viewModel.toggleStreaming(onPermissionMissing = onRequestPermissions) },
+                onToggleMicMute = { viewModel.toggleMicMute() },
+                onSelectZoom = { zoom ->
+                    viewModel.setZoomRatio(zoom)
+                },
+                onSelectFrontCamera = { viewModel.setFrontCamera(true) },
+                onTriggerAutoFocus = { viewModel.triggerAutoFocus() },
+                onActivateDisplayProtection = { viewModel.activateDisplayProtection() }
+            )
+        }
+
+        // Шар 3: Display Protection Mode оверлей (OLED Blackout з Pixel Shifting)
+        DisplayProtectionOverlay(
+            isActive = uiState.isDisplayProtectionActive,
+            onDismiss = { viewModel.deactivateDisplayProtection() }
         )
     }
 }
