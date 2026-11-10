@@ -155,6 +155,5 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         orientationListener?.disable()
-        orientationListener = null
     }
 }
