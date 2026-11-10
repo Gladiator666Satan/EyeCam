@@ -43,6 +43,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.eyecam.ui.theme.OledBorder
+import com.eyecam.ui.theme.OledCardBackground
 import com.eyecam.ui.theme.OledPillBackground
 import com.eyecam.ui.theme.OledPureBlack
 import com.eyecam.ui.theme.StatusCyan
@@ -51,22 +52,22 @@ import com.eyecam.ui.theme.TextDimmed
 import kotlinx.coroutines.delay
 
 /**
- * Професійний в'юпорт попереднього перегляду камери (Camera2 SurfaceView):
- * - Суворе дотримання пропорцій сенсора без розтягування зображення.
- * - Утримання SurfaceView активним у дереві Compose для безперервної фонової роботи та захисту від сну.
- * - Сенсорний фокус (Tap-to-Focus) з візуальною міткою наведення різкості.
- * - Рамка візирного кадру та бейдж поточної орієнтації (16:9 / 9:16).
+ * Повноекранний компонент живого попереднього перегляду камери (Camera2 Preview).
+ * Відповідає за:
+ * - Відображення SurfaceView з бездоганним збереженням реальних пропорцій сенсора (Aspect Fit).
+ * - Відсутність розтягування (distortion) як у вертикальному, так і в горизонтальному положенні.
+ * - Інтерактивний тап по екрану для перефокусування (Tap-to-Focus) з анімованою міткою фокусу.
+ * - Утримання життєвого циклу поверхні навіть при блокуванні або захисному затемненні екрана.
  */
 @Composable
 fun CameraPreview(
-    isStreaming: Boolean,
-    hasCameraPermission: Boolean = true,
-    isDisplayProtectionActive: Boolean = false,
-    streamWidth: Int = 1920,
-    streamHeight: Int = 1080,
-    onSurfaceChanged: (Surface?) -> Unit = {},
+    onSurfaceChanged: (Surface?) -> Unit,
+    hasCameraPermission: Boolean,
+    onRequestPermissions: () -> Unit,
+    streamWidth: Int,
+    streamHeight: Int,
+    isDisplayProtectionActive: Boolean,
     onFocusPointTapped: ((Float, Float) -> Unit)? = null,
-    onRequestPermissions: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var tapFocusPoint by remember { mutableStateOf<Offset?>(null) }
@@ -188,52 +189,71 @@ fun CameraPreview(
                                 imageVector = Icons.Default.CenterFocusStrong,
                                 contentDescription = "Focusing",
                                 tint = StatusCyan,
-                                modifier = Modifier.size(20.dp)
+                                modifier = Modifier.size(28.dp)
                             )
                         }
                     }
                 }
             }
         } else {
-            // Екран запиту дозволів до камери
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(32.dp),
-                verticalArrangement = Arrangement.Center,
-                horizontalAlignment = Alignment.CenterHorizontally
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
             ) {
-                Icon(
-                    imageVector = Icons.Default.CenterFocusStrong,
-                    contentDescription = "Camera Permission",
-                    tint = StatusEmerald,
-                    modifier = Modifier.size(64.dp)
-                )
-                Text(
-                    text = "Потрібен доступ до камери",
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White,
-                    modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
-                )
-                Text(
-                    text = "Додатку потрібен дозвіл для захоплення відеопотоку та трансляції на ПК",
-                    fontSize = 13.sp,
-                    color = TextDimmed,
-                    modifier = Modifier.padding(bottom = 24.dp)
-                )
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(24.dp))
-                        .background(StatusEmerald)
-                        .clickable { onRequestPermissions() }
-                        .padding(horizontal = 24.dp, vertical = 12.dp)
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Text(
-                        text = "Надати дозвіл",
-                        fontSize = 14.sp,
+                        text = "Потрібен доступ до камери",
+                        fontSize = 16.sp,
                         fontWeight = FontWeight.Bold,
-                        color = Color.Black
+                        color = Color.White
+                    )
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(20.dp))
+                            .background(StatusEmerald)
+                            .clickable { onRequestPermissions() }
+                            .padding(horizontal = 20.dp, vertical = 10.dp)
+                    ) {
+                        Text(
+                            text = "Надати дозвіл",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.Black
+                        )
+                    }
+                }
+            }
+        }
+
+        // Захисний OLED екран (чорна заставка при блокуванні або тапі по замку)
+        AnimatedVisibility(
+            visible = isDisplayProtectionActive,
+            enter = fadeIn(),
+            exit = fadeOut()
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "🔒 ЗАХИСТ OLED ДИСПЛЕЯ АКТИВНИЙ",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = TextDimmed
+                    )
+                    Text(
+                        text = "Камера транслює у фоновому режимі (60 FPS)",
+                        fontSize = 11.sp,
+                        color = TextDimmed.copy(alpha = 0.7f)
                     )
                 }
             }
