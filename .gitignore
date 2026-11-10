@@ -1,0 +1,104 @@
+# ==============================================================================
+# EyeCam Comprehensive Multi-Platform .gitignore
+# C++ (CMake, MSVC, GCC/Clang), Android (Gradle, NDK), Desktop (Qt, Windows, Linux)
+# ==============================================================================
+
+# --- Android & Gradle Build Artifacts ---
+.gradle/
+build/
+*/build/
+bin/
+out/
+*.apk
+*.ap_
+*.aab
+*.dex
+*.class
+local.properties
+.cxx/
+captures/
+*.keystore
+*.jks
+*.hprof
+lint/
+generated/
+
+# --- C++ / CMake Artifacts & Binaries ---
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+.ninja_deps
+.ninja_log
+*.ninja
+*.o
+*.obj
+*.so
+*.so.*
+*.dll
+*.dylib
+*.a
+*.lib
+*.exp
+*.ilk
+*.pdb
+*.idb
+*.d
+*.gcno
+*.gcda
+*.gcov
+
+# --- Visual Studio / MSVC ---
+.vs/
+*.sln.docstates
+*.suo
+*.user
+*.userosv
+*.userprefs
+*.vcproj
+*.vcxproj.user
+
+# --- IDEs & Editors ---
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+.directory
+
+# --- Operating System Files ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+[Dd]esktop.ini
+
+# --- Python Tools & Cache ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+
+# --- Logs & Crash Dumps ---
+*.log
+*.dmp
+*.crash
+/core
+/core.[0-9]*

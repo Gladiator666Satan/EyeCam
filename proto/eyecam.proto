@@ -1,0 +1,140 @@
+syntax = "proto3";
+
+package eyecam;
+
+// Тип сенсора камери
+enum CameraModule {
+  CAMERA_MODULE_UNSPECIFIED = 0;
+  CAMERA_MODULE_BACK_MAIN = 1;      // Основна задня камера (Wide)
+  CAMERA_MODULE_BACK_ULTRAWIDE = 2; // Ультраширококутна
+  CAMERA_MODULE_BACK_TELEPHOTO = 3; // Телевік
+  CAMERA_MODULE_FRONT = 4;          // Фронтальна камера
+}
+
+// Режими фокусування
+enum FocusMode {
+  FOCUS_MODE_CONTINUOUS_VIDEO = 0;  // Неперервний автофокус для відео
+  FOCUS_MODE_AUTO = 1;              // Одноразовий автофокус
+  FOCUS_MODE_MANUAL = 2;            // Ручне фокусування
+  FOCUS_MODE_INFINITY = 3;          // Фокус на нескінченність
+}
+
+// Режими балансу білого
+enum WhiteBalanceMode {
+  WB_MODE_AUTO = 0;
+  WB_MODE_MANUAL_KELVIN = 1;        // Ручний вибір температури (в Кельвінах)
+  WB_MODE_DAYLIGHT = 2;
+  WB_MODE_CLOUDY = 3;
+  WB_MODE_FLUORESCENT = 4;
+  WB_MODE_INCANDESCENT = 5;
+}
+
+// Відеокодеки
+enum VideoCodec {
+  CODEC_UNSPECIFIED = 0;
+  CODEC_H264 = 1;
+  CODEC_HEVC = 2; // H.265
+  CODEC_AV1 = 3;
+}
+
+// Конфігурація відеопотоку
+message StreamConfig {
+  uint32 width = 1;
+  uint32 height = 2;
+  uint32 target_fps = 3;
+  uint32 bitrate_kbps = 4;
+  VideoCodec codec = 5;
+  uint32 media_port = 6;            // UDP порт для трансляції відео
+}
+
+// Ручне або автоматичне налаштування ISO
+message SetISOMessage {
+  bool auto_iso = 1;
+  uint32 sensitivity = 2;           // Наприклад: 100, 200, 400, 800, 1600, 3200
+}
+
+// Налаштування витримки (Shutter Speed)
+message SetShutterMessage {
+  bool auto_exposure = 1;
+  uint64 exposure_time_ns = 2;      // Час експозиції в наносекундах (напр. 1/50 с = 20000000 нс)
+}
+
+// Налаштування фокусу
+message SetFocusMessage {
+  FocusMode mode = 1;
+  float focus_distance_diopters = 2;// 0.0f = нескінченність, 10.0f = макро (10 см)
+}
+
+// Налаштування балансу білого
+message SetWhiteBalanceMessage {
+  WhiteBalanceMode mode = 1;
+  uint32 color_temperature_k = 2;   // Колірна температура у Кельвінах (2000 - 10000K)
+}
+
+// Перемикання сенсора
+message SetCameraModuleMessage {
+  CameraModule module = 1;
+}
+
+// Запит миттєвого ключового кадру (IDR / Intra-frame / PLI)
+message KeyframeRequestMessage {
+  uint32 last_received_frame_id = 1;
+  string reason = 2;                 // Наприклад: "packet_loss", "decoder_start"
+}
+
+// NTP-подібний Ping/Pong для розрахунку RTT та синхронізації часу
+message FramePingMessage {
+  uint64 client_tx_timestamp_us = 1; // Час відправки клієнтом (t1)
+  uint64 server_rx_timestamp_us = 2; // Час прийому сервером (t2)
+  uint64 server_tx_timestamp_us = 3; // Час відповіді сервером (t3)
+}
+
+message FramePongMessage {
+  uint64 client_tx_timestamp_us = 1; // t1
+  uint64 server_rx_timestamp_us = 2; // t2
+  uint64 server_tx_timestamp_us = 3; // t3
+  uint64 client_rx_timestamp_us = 4; // t4 (заповнюється клієнтом після отримання)
+}
+
+// Базовий контейнер команд та телеметрії (Union / Envelope)
+message ControlEnvelope {
+  uint32 sequence = 1;
+  uint64 timestamp_us = 2;
+
+  oneof payload {
+    // Керування
+    StreamConfig stream_config = 10;
+    SetCameraModuleMessage set_camera_module = 11;
+    SetISOMessage set_iso = 12;
+    SetShutterMessage set_shutter = 13;
+    SetFocusMessage set_focus = 14;
+    SetWhiteBalanceMessage set_white_balance = 15;
+    KeyframeRequestMessage request_keyframe = 16;
+
+    // Синхронізація та Keep-Alive
+    FramePingMessage ping = 20;
+    FramePongMessage pong = 21;
+
+    // Статус та підтвердження
+    AckMessage ack = 30;
+    DeviceStateMessage state = 31;
+  }
+}
+
+message AckMessage {
+  uint32 acked_sequence = 1;
+  bool success = 2;
+  string error_message = 3;
+}
+
+message DeviceStateMessage {
+  CameraModule active_module = 1;
+  uint32 current_iso = 2;
+  uint64 current_exposure_ns = 3;
+  float current_focus_diopters = 4;
+  uint32 current_wb_kelvin = 5;
+  float battery_level = 6;
+  float thermal_temperature_c = 7;
+  uint32 fps_measured = 8;
+  uint32 bitrate_measured_kbps = 9;
+}
