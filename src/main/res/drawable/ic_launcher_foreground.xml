@@ -1,61 +1,25 @@
-<?xml version="1.0" encoding="utf-8"?>
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-
-    <!-- Зовнішній контур ока (Cyber Eye Contour) у смарагдово-блакитній гамі -->
+    <!-- Camera Body / Outer Circle -->
     <path
-        android:fillColor="#0E1722"
-        android:strokeColor="#00E676"
-        android:strokeWidth="3.2"
-        android:strokeLineJoin="round"
-        android:pathData="M22,54 C34,33 74,33 86,54 C74,75 34,75 22,54 Z" />
-
-    <!-- Внутрішня підсвітка повіки (Cyan Accent) -->
+        android:fillColor="#0078D4"
+        android:pathData="M54,18 C34.1,18 18,34.1 18,54 C18,73.9 34.1,90 54,90 C73.9,90 90,73.9 90,54 C90,34.1 73.9,18 54,18 Z" />
+    <!-- Aperture / Iris -->
     <path
-        android:fillColor="#00000000"
-        android:strokeColor="#00E5FF"
-        android:strokeWidth="1.3"
-        android:strokeAlpha="0.65"
-        android:pathData="M26,54 C37,37 71,37 82,54 C71,71 37,71 26,54 Z" />
-
-    <!-- Зовнішнє кільце об'єктива / райдужки (Camera Lens Iris Outer) -->
+        android:fillColor="#202020"
+        android:pathData="M54,30 C40.7,30 30,40.7 30,54 C30,67.3 40.7,78 54,78 C67.3,78 78,67.3 78,54 C78,40.7 67.3,30 54,30 Z" />
+    <!-- Center Pupil -->
     <path
-        android:fillColor="#0D283A"
-        android:strokeColor="#00E5FF"
-        android:strokeWidth="2.4"
-        android:pathData="M54,54m-16,0a16,16 0,1 1,32 0a16,16 0,1 1,-32 0" />
-
-    <!-- Внутрішнє смарагдове кільце діафрагми (Aperture Ring) -->
-    <path
-        android:fillColor="#091D2C"
-        android:strokeColor="#00E676"
-        android:strokeWidth="1.5"
-        android:strokeAlpha="0.9"
-        android:pathData="M54,54m-11.5,0a11.5,11.5 0,1 1,23 0a11.5,11.5 0,1 1,-23 0" />
-
-    <!-- Глибока чорна зіниця об'єктива (Optical Pupil) -->
-    <path
-        android:fillColor="#04070B"
-        android:pathData="M54,54m-7.5,0a7.5,7.5 0,1 1,15 0a7.5,7.5 0,1 1,-15 0" />
-
-    <!-- Головний блік лінзи об'єктива (Bright Camera Lens Glare Highlight) -->
+        android:fillColor="#00B7C3"
+        android:pathData="M54,42 C47.4,42 42,47.4 42,54 C42,60.6 47.4,66 54,66 C60.6,66 66,60.6 66,54 C66,47.4 60.6,42 54,42 Z" />
+    <!-- Optical Lens Glare / Reflection Highlight -->
     <path
         android:fillColor="#FFFFFF"
-        android:fillAlpha="0.95"
-        android:pathData="M45.5,46.5 C46.8,44.2 50.2,43.5 52.0,44.8 C53.2,45.7 52.6,47.8 50.5,49.0 C48.4,50.2 44.3,48.6 45.5,46.5 Z" />
-
-    <!-- Додатковий точковий блік лінзи (Secondary Specular Dot) -->
+        android:pathData="M46,46 A4,4 0 1,1 38,46 A4,4 0 1,1 46,46" />
     <path
-        android:fillColor="#90F4FF"
-        android:fillAlpha="0.9"
-        android:pathData="M44.2,51.8m-2.0,0a2.0,2.0 0,1 1,4.0 0a2.0,2.0 0,1 1,-4.0 0" />
-
-    <!-- Нижній правий оптичний рефлекс просвітлення лінзи (Cyan/Emerald Coating Flare) -->
-    <path
-        android:fillColor="#00E676"
-        android:fillAlpha="0.75"
-        android:pathData="M57.5,59.5 C59.2,58.5 61.5,58.8 62.0,60.0 C62.5,61.2 60.5,62.6 58.3,62.2 C56.6,61.9 56.2,60.3 57.5,59.5 Z" />
+        android:fillColor="#80FFFFFF"
+        android:pathData="M60,60 A2,2 0 1,1 56,60 A2,2 0 1,1 60,60" />
 </vector>

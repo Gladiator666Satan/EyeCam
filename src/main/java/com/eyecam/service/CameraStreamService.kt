@@ -1,243 +1,123 @@
 package com.eyecam.service
 
-import android.Manifest
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
-import android.app.Service
+import android.app.*
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
-import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
-import android.graphics.Color
-import android.os.BatteryManager
+import android.graphics.ImageFormat
+import android.graphics.Rect
+import android.graphics.YuvImage
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.util.Log
 import android.view.Surface
 import androidx.core.app.NotificationCompat
-import androidx.core.content.ContextCompat
-import com.eyecam.R
 import com.eyecam.camera.CameraController
+import com.eyecam.camera.CameraUtils
+import com.eyecam.model.CameraMode
 import com.eyecam.model.CameraSensorInfo
 import com.eyecam.model.ConnectionType
+import com.eyecam.model.StreamState
+import com.eyecam.model.StreamTelemetry
 import com.eyecam.model.StreamUiState
 import com.eyecam.model.ThermalState
 import com.eyecam.network.ControlServer
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
-import java.net.Inet4Address
+import java.io.ByteArrayOutputStream
+import java.io.OutputStream
+import java.net.InetAddress
 import java.net.NetworkInterface
+import java.net.ServerSocket
+import java.net.Socket
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
-/**
- * Ongoing Foreground Service, що підтримує життєвий цикл захоплення Camera2,
- * TCP/ADB сервера керування і трансляції (:8554) та моніторингу USB / Wi-Fi підключення.
- */
 class CameraStreamService : Service() {
-
-    private val serviceJob = SupervisorJob()
-    private val serviceScope = CoroutineScope(Dispatchers.Default + serviceJob)
-
-    private val binder = LocalBinder()
-
-    private lateinit var powerLockManager: PowerLockManager
-    private lateinit var thermalManager: ThermalManager
-    lateinit var cameraController: CameraController
-        private set
-    private lateinit var controlServer: ControlServer
-
-    private var currentPreviewSurface: Surface? = null
-    private var isPcConnected = false
-    private var isPcViaUsbAdb = false
-
-    private val _uiState = MutableStateFlow(StreamUiState())
-    val uiState: StateFlow<StreamUiState> = _uiState.asStateFlow()
 
     companion object {
         private const val TAG = "CameraStreamService"
-        private const val NOTIFICATION_CHANNEL_ID = "eyecam_stream_channel"
-        private const val NOTIFICATION_CHANNEL_NAME = "EyeCam Streaming Service"
         private const val NOTIFICATION_ID = 1001
+        private const val CHANNEL_ID = "eyecam_stream_channel"
 
         const val ACTION_START_STREAM = "com.eyecam.action.START_STREAM"
         const val ACTION_STOP_STREAM = "com.eyecam.action.STOP_STREAM"
-        const val ACTION_TOGGLE_MUTE = "com.eyecam.action.TOGGLE_MUTE"
-        const val ACTION_SWITCH_SENSOR = "com.eyecam.action.SWITCH_SENSOR"
-        const val EXTRA_SENSOR_ID = "extra_sensor_id"
     }
 
     inner class LocalBinder : Binder() {
         fun getService(): CameraStreamService = this@CameraStreamService
     }
 
+    private val binder = LocalBinder()
+    private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+
+    private var cameraController: CameraController? = null
+    private var controlServer: ControlServer? = null
+
+    private var videoServerSocket: ServerSocket? = null
+    private var isVideoServerRunning = false
+    private val videoClients = mutableListOf<Socket>()
+
+    private var wakeLock: PowerManager.WakeLock? = null
+
+    private val _uiState = MutableStateFlow(StreamUiState())
+    val uiState: StateFlow<StreamUiState> = _uiState.asStateFlow()
+
+    private var frameCount = 0
+    private var lastFpsTimestamp = System.currentTimeMillis()
+    private var currentFps = 0
+
+    private var streamWidth = 1920
+    private var streamHeight = 1080
+    private var streamFps = 60
+
     override fun onCreate() {
         super.onCreate()
-        Log.i(TAG, "Ініціалізація CameraStreamService...")
-
-        powerLockManager = PowerLockManager(this)
-        thermalManager = ThermalManager(this) { thermalState, adjustedFps, adjustedBitrateKbps, reason ->
-            onDesktopThermalThrottlingTriggered(thermalState, adjustedFps, adjustedBitrateKbps, reason)
-        }
-
-        cameraController = CameraController(this)
-        cameraController.onJpegFrameAvailable = { jpegBytes, _, _ ->
-            if (_uiState.value.isStreaming) {
-                controlServer.sendVideoFrame(jpegBytes)
-            }
-        }
-
-        controlServer = ControlServer(
-            port = 8554,
-            cameraController = cameraController,
-            onKeyframeRequested = {
-                cameraController.triggerAutoFocus()
-            },
-            onClientConnectionChanged = { connected, isUsb, clientIp ->
-                onDesktopClientConnectionChanged(connected, isUsb, clientIp)
-            },
-            onZoomUpdatedFromPc = { zoomRatio, isFront ->
-                _uiState.update { state ->
-                    state.copy(
-                        currentZoomRatio = zoomRatio,
-                        isFrontCamera = isFront
-                    )
-                }
-            },
-            onResolutionUpdatedFromPc = { w, h, fps ->
-                _uiState.update { state ->
-                    state.copy(
-                        streamWidth = w,
-                        streamHeight = h,
-                        streamFps = fps
-                    )
-                }
-            }
-        )
-        controlServer.start()
-
         createNotificationChannel()
-        startConnectionMonitoring()
-        startTelemetryLoop()
 
-        // Початкова синхронізація сенсорів
-        val sensors = cameraController.availableSensors
-        _uiState.update { state ->
-            state.copy(
-                availableSensors = sensors,
-                minZoomRatio = cameraController.minZoomRatio,
-                maxZoomRatio = cameraController.maxZoomRatio,
-                supports4K = cameraController.supports4K,
-                supportedZoomPresets = cameraController.supportedZoomPresets,
-                streamWidth = cameraController.streamWidth,
-                streamHeight = cameraController.streamHeight,
-                streamFps = cameraController.streamFps
-            )
-        }
-    }
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "EyeCam::StreamWakeLock")
 
-    private fun startConnectionMonitoring() {
-        serviceScope.launch {
-            while (isActive) {
-                refreshConnectionStatus()
-                delay(1500)
-            }
-        }
-    }
-
-    private fun refreshConnectionStatus() {
-        var ip = "Очікування мережі..."
-        var isWifi = false
-        try {
-            val interfaces = NetworkInterface.getNetworkInterfaces()
-            for (iface in interfaces) {
-                if (iface.isUp && !iface.isLoopback) {
-                    val addrs = iface.inetAddresses
-                    for (addr in addrs) {
-                        if (!addr.isLoopbackAddress && addr is Inet4Address) {
-                            val host = addr.hostAddress ?: ""
-                            if (host.isNotEmpty() && !host.startsWith("127.")) {
-                                ip = host
-                                if (iface.name.contains("wlan") || iface.name.contains("ap")) {
-                                    isWifi = true
-                                }
-                                break
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Помилка визначення локального IP: ${e.message}")
+        cameraController = CameraController(applicationContext) { jpegBytes, width, height, timestampNs ->
+            onCameraFrame(jpegBytes, width, height, timestampNs)
         }
 
-        // Перевірка стану USB з'єднання через IntentFilter
-        val batteryIntent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-        val plugged = batteryIntent?.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1) ?: -1
-        val isUsbPlugged = (plugged == BatteryManager.BATTERY_PLUGGED_USB)
-        val level = batteryIntent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
-        val scale = batteryIntent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
-        val batteryPct = if (level >= 0 && scale > 0) level / scale.toFloat() else 1.0f
+        controlServer = ControlServer(8554, this)
+        controlServer?.start()
 
-        val activeConnType = when {
-            isPcConnected && isPcViaUsbAdb -> ConnectionType.USB
-            isPcConnected -> ConnectionType.WIFI
-            isUsbPlugged -> ConnectionType.USB
-            isWifi -> ConnectionType.WIFI
-            else -> ConnectionType.NONE
-        }
+        startVideoServer(8555)
 
+        val localIp = getLocalIpAddress()
         _uiState.update { state ->
             state.copy(
                 telemetry = state.telemetry.copy(
-                    connectionType = activeConnType,
-                    localIpAddress = ip,
-                    batteryLevel = batteryPct,
-                    isCharging = isUsbPlugged || plugged == BatteryManager.BATTERY_PLUGGED_AC
+                    localIpAddress = localIp,
+                    connectionDetails = "IP: $localIp:8554"
                 )
             )
         }
+
+        refreshHardwareCapabilities()
     }
 
-    private fun onDesktopClientConnectionChanged(connected: Boolean, isUsb: Boolean, clientIp: String) {
-        this.isPcConnected = connected
-        this.isPcViaUsbAdb = isUsb
+    fun refreshHardwareCapabilities() {
+        val sensors = cameraController?.availableSensors?.value ?: CameraUtils.queryDeviceSensors(applicationContext)
+        val active = cameraController?.activeSensor?.value ?: sensors.firstOrNull { !it.isFront } ?: sensors.firstOrNull()
 
-        Log.i(TAG, "Зміна статусу клієнта ПК: connected=$connected, isUsb=$isUsb, ip=$clientIp")
-
-        refreshConnectionStatus()
-
-        if (connected && !_uiState.value.isStreaming) {
-            startStreaming()
-        }
-    }
-
-    private fun startTelemetryLoop() {
-        serviceScope.launch {
-            while (isActive) {
-                delay(1000)
-                if (_uiState.value.isStreaming) {
-                    _uiState.update { state ->
-                        state.copy(
-                            telemetry = state.telemetry.copy(
-                                fps = cameraController.streamFps,
-                                bitrateKbps = 18000
-                            )
-                        )
-                    }
-                }
-            }
+        _uiState.update { state ->
+            state.copy(
+                availableSensors = sensors,
+                activeSensor = active,
+                minZoomRatio = active?.minZoomRatio ?: 0.5f,
+                maxZoomRatio = active?.maxZoomRatio ?: 10.0f,
+                supportedZoomPresets = CameraUtils.getSupportedZoomPresets(active?.minZoomRatio ?: 0.5f, active?.maxZoomRatio ?: 10.0f),
+                deviceModelName = "${Build.MANUFACTURER} ${Build.MODEL}"
+            )
         }
     }
 
@@ -245,13 +125,6 @@ class CameraStreamService : Service() {
         when (intent?.action) {
             ACTION_START_STREAM -> startStreaming()
             ACTION_STOP_STREAM -> stopStreaming()
-            ACTION_TOGGLE_MUTE -> toggleMicrophone()
-            ACTION_SWITCH_SENSOR -> {
-                val sensorId = intent.getStringExtra(EXTRA_SENSOR_ID)
-                if (sensorId != null) {
-                    switchSensor(sensorId)
-                }
-            }
         }
         return START_STICKY
     }
@@ -261,180 +134,241 @@ class CameraStreamService : Service() {
     fun startStreaming() {
         if (_uiState.value.isStreaming) return
 
-        val hasCamPerm = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
-        if (!hasCamPerm) {
-            Log.w(TAG, "Неможливо запустити трансляцію: відсутній дозвіл CAMERA")
-            return
+        wakeLock?.acquire(24 * 60 * 60 * 1000L) // 24h max
+
+        val notification = buildForegroundNotification("Трансляція активна...")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
         }
 
-        Log.i(TAG, "Запуск потоку трансляції та підняття Foreground Service...")
-
-        powerLockManager.acquireWakeLock()
-        if (_uiState.value.telemetry.connectionType == ConnectionType.WIFI) {
-            powerLockManager.acquireWifiLock()
-        }
-
-        thermalManager.startMonitoring()
-
-        // Безпечний запуск Foreground Service для Android 14/15/16 (перевірка фактично наданих дозволів)
-        val notification = buildNotification()
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                var foregroundTypes = ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
-                val hasMicPerm = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-                if (hasMicPerm) {
-                    foregroundTypes = foregroundTypes or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-                }
-                startForeground(NOTIFICATION_ID, notification, foregroundTypes)
-            } else {
-                startForeground(NOTIFICATION_ID, notification)
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Помилка startForeground: ${e.message}", e)
-        }
-
-        cameraController.isNetworkStreamActive = true
-        cameraController.openCamera(
-            logicalCameraId = if (_uiState.value.isFrontCamera) (cameraController.frontCameraId ?: "1") else cameraController.backCameraId,
-            previewSurface = currentPreviewSurface
-        )
+        val activeSensorId = _uiState.value.activeSensor?.id ?: "0"
+        cameraController?.startCamera(streamWidth, streamHeight, streamFps, activeSensorId)
 
         _uiState.update { it.copy(isStreaming = true) }
-        updateNotification()
     }
 
     fun stopStreaming() {
         if (!_uiState.value.isStreaming) return
-        Log.i(TAG, "Зупинка трансляції...")
 
-        cameraController.isNetworkStreamActive = false
-        cameraController.closeCamera()
-        thermalManager.stopMonitoring()
-        powerLockManager.releaseAll()
+        cameraController?.stopCamera()
+
+        if (wakeLock?.isHeld == true) {
+            wakeLock?.release()
+        }
 
         stopForeground(STOP_FOREGROUND_REMOVE)
         _uiState.update { it.copy(isStreaming = false) }
     }
 
-    fun setPreviewSurface(surface: Surface?) {
-        this.currentPreviewSurface = surface
-        cameraController.updatePreviewSurface(surface)
+    private fun startVideoServer(port: Int) {
+        isVideoServerRunning = true
+        serviceScope.launch(Dispatchers.IO) {
+            try {
+                videoServerSocket = ServerSocket(port).apply {
+                    reuseAddress = true
+                }
+                while (isVideoServerRunning) {
+                    try {
+                        val client = videoServerSocket?.accept() ?: break
+                        client.tcpNoDelay = true
+                        client.sendBufferSize = 4 * 1024 * 1024
+                        synchronized(videoClients) {
+                            videoClients.add(client)
+                        }
+                    } catch (e: Exception) {
+                        if (isVideoServerRunning) Log.e(TAG, "Video server accept error", e)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Video server socket error", e)
+            }
+        }
     }
 
-    fun setZoom(zoom: Float) {
-        cameraController.setZoomRatio(zoom)
-        _uiState.update { it.copy(currentZoomRatio = zoom) }
+    private fun onCameraFrame(jpegBytes: ByteArray, width: Int, height: Int, timestampNs: Long) {
+        frameCount++
+        val now = System.currentTimeMillis()
+        if (now - lastFpsTimestamp >= 1000) {
+            currentFps = frameCount
+            frameCount = 0
+            lastFpsTimestamp = now
+
+            val bitRate = (jpegBytes.size * currentFps * 8) / 1000
+            _uiState.update { state ->
+                state.copy(
+                    telemetry = state.telemetry.copy(
+                        fps = currentFps,
+                        bitrateKbps = bitRate,
+                        resolutionWidth = width,
+                        resolutionHeight = height
+                    )
+                )
+            }
+        }
+
+        // Broadcast JPEG frame to connected clients (PC Studio)
+        // Format: [4 bytes payload size][payload bytes]
+        synchronized(videoClients) {
+            if (videoClients.isEmpty()) return
+
+            val sizeBuffer = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(jpegBytes.size).array()
+            val iterator = videoClients.iterator()
+            while (iterator.hasNext()) {
+                val client = iterator.next()
+                try {
+                    val out = client.getOutputStream()
+                    out.write(sizeBuffer)
+                    out.write(jpegBytes)
+                    out.flush()
+                } catch (e: Exception) {
+                    try { client.close() } catch (_: Exception) {}
+                    iterator.remove()
+                }
+            }
+        }
     }
 
-    fun switchSensor(sensorModuleOrId: String) {
-        cameraController.switchToSensor(sensorModuleOrId)
-        val isFront = sensorModuleOrId.equals("front", ignoreCase = true) || sensorModuleOrId.equals("self", ignoreCase = true)
-        val zoom = sensorModuleOrId.removeSuffix("x").toFloatOrNull() ?: 1.0f
-        _uiState.update {
-            it.copy(
-                currentZoomRatio = zoom,
-                isFrontCamera = isFront
+    fun attachPreviewSurface(surface: Surface?) {
+        cameraController?.setPreviewSurface(surface)
+    }
+
+    fun setZoomRatio(ratio: Float) {
+        cameraController?.setZoom(ratio)
+        _uiState.update { it.copy(currentZoomRatio = ratio) }
+    }
+
+    fun toggleTorch(enabled: Boolean) {
+        cameraController?.setTorch(enabled)
+        _uiState.update { it.copy(isTorchOn = enabled) }
+    }
+
+    fun setFrontCamera(isFront: Boolean) {
+        val target = _uiState.value.availableSensors.firstOrNull { it.isFront == isFront }
+        if (target != null) {
+            switchSensor(target)
+        }
+    }
+
+    fun switchSensor(sensor: CameraSensorInfo) {
+        switchSensor(sensor.id)
+    }
+
+    fun switchSensor(sensorId: String) {
+        cameraController?.switchSensor(sensorId)
+        val selected = _uiState.value.availableSensors.firstOrNull { it.id == sensorId }
+        _uiState.update { state ->
+            state.copy(
+                activeSensor = selected,
+                isFrontCamera = selected?.isFront ?: false,
+                minZoomRatio = selected?.minZoomRatio ?: 0.5f,
+                maxZoomRatio = selected?.maxZoomRatio ?: 10.0f,
+                supportedZoomPresets = CameraUtils.getSupportedZoomPresets(selected?.minZoomRatio ?: 0.5f, selected?.maxZoomRatio ?: 10.0f)
             )
         }
     }
 
-    fun switchFrontBack() {
-        val targetFront = !_uiState.value.isFrontCamera
-        cameraController.switchFrontBack(targetFront)
-        _uiState.update {
-            it.copy(
-                isFrontCamera = targetFront,
-                currentZoomRatio = 1.0f
-            )
-        }
-    }
+    fun updateStreamResolution(width: Int, height: Int, fps: Int) {
+        this.streamWidth = width
+        this.streamHeight = height
+        this.streamFps = fps
 
-    fun toggleMicrophone() {
-        _uiState.update { it.copy(isMicMuted = !it.isMicMuted) }
-        updateNotification()
-    }
-
-    fun setDisplayProtection(active: Boolean) {
-        _uiState.update { it.copy(isDisplayProtectionActive = active) }
-    }
-
-    private fun onDesktopThermalThrottlingTriggered(
-        thermalState: ThermalState,
-        adjustedFps: Int,
-        adjustedBitrateKbps: Int,
-        reason: String
-    ) {
-        Log.w(TAG, "Тротлінг [$thermalState] -> FPS: $adjustedFps, Бітрейт: ${adjustedBitrateKbps}Kbps ($reason)")
-    }
-
-    private fun buildNotification(): Notification {
-        val stopIntent = Intent(this, CameraStreamService::class.java).apply {
-            action = ACTION_STOP_STREAM
-        }
-        val stopPendingIntent = PendingIntent.getService(
-            this, 1, stopIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val muteIntent = Intent(this, CameraStreamService::class.java).apply {
-            action = ACTION_TOGGLE_MUTE
-        }
-        val mutePendingIntent = PendingIntent.getService(
-            this, 2, muteIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val micStatus = if (_uiState.value.isMicMuted) "Мікрофон: ВИМКНЕНО" else "Мікрофон: АКТИВНИЙ"
-        val zoomLabel = if (_uiState.value.isFrontCamera) "FRONT" else "${_uiState.value.currentZoomRatio}x"
-        val thermalName = _uiState.value.telemetry.thermalState.descriptionUa
-
-        return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
-            .setContentTitle("EyeCam: Трансляція активна")
-            .setContentText("Зум: $zoomLabel | $micStatus | $thermalName")
-            .setSmallIcon(R.drawable.ic_eyecam_logo)
-            .setOngoing(true)
-            .setOnlyAlertOnce(true)
-            .setColor(Color.BLACK)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Зупинити", stopPendingIntent)
-            .addAction(
-                if (_uiState.value.isMicMuted) android.R.drawable.stat_notify_call_mute else android.R.drawable.presence_audio_online,
-                if (_uiState.value.isMicMuted) "Увімкнути звук" else "Вимкнути звук",
-                mutePendingIntent
-            )
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .build()
-    }
-
-    private fun updateNotification() {
         if (_uiState.value.isStreaming) {
-            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            notificationManager.notify(NOTIFICATION_ID, buildNotification())
+            cameraController?.startCamera(width, height, fps, _uiState.value.activeSensor?.id)
         }
+    }
+
+    fun setManualMode(mode: CameraMode) {
+        cameraController?.setCameraMode(mode)
+    }
+
+    fun triggerAutoFocus() {
+        cameraController?.triggerAutoFocus()
+    }
+
+    fun triggerFocusAtPoint(x: Float, y: Float) {
+        cameraController?.triggerFocusAtPoint(x, y)
+    }
+
+    fun toggleMicrophoneMute(isMuted: Boolean) {
+        _uiState.update { it.copy(isMicMuted = isMuted) }
+    }
+
+    fun setClientConnected(connected: Boolean) {
+        _uiState.update { state ->
+            state.copy(
+                telemetry = state.telemetry.copy(
+                    isPcConnected = connected,
+                    connectionType = if (connected) ConnectionType.WIFI else ConnectionType.NONE
+                )
+            )
+        }
+    }
+
+    fun getAvailableSensors(): List<CameraSensorInfo> = _uiState.value.availableSensors
+    fun getActiveSensor(): CameraSensorInfo? = _uiState.value.activeSensor
+    fun getCurrentZoomRatio(): Float = _uiState.value.currentZoomRatio
+    fun isTorchOn(): Boolean = _uiState.value.isTorchOn
+
+    private fun getLocalIpAddress(): String {
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces()
+            while (interfaces.hasMoreElements()) {
+                val iface = interfaces.nextElement()
+                val addresses = iface.inetAddresses
+                while (addresses.hasMoreElements()) {
+                    val addr = addresses.nextElement()
+                    if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
+                        return addr.hostAddress ?: "127.0.0.1"
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+        return "127.0.0.1"
     }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
-                NOTIFICATION_CHANNEL_ID,
-                NOTIFICATION_CHANNEL_NAME,
+                CHANNEL_ID,
+                "EyeCam Stream Service",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Постійне сповіщення активної відеотрансляції EyeCam"
-                enableLights(false)
-                enableVibration(false)
-                setShowBadge(false)
+                description = "Фоновий потік відео для EyeCam"
             }
             val manager = getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(channel)
         }
     }
 
+    private fun buildForegroundNotification(statusText: String): Notification {
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("EyeCam Відеострім")
+            .setContentText(statusText)
+            .setSmallIcon(android.R.drawable.ic_menu_camera)
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
-        Log.i(TAG, "Знищення CameraStreamService та звільнення ресурсів")
-        serviceJob.cancel()
-        controlServer.stop()
-        cameraController.release()
-        thermalManager.stopMonitoring()
-        powerLockManager.releaseAll()
+        stopStreaming()
+
+        isVideoServerRunning = false
+        try { videoServerSocket?.close() } catch (_: Exception) {}
+        synchronized(videoClients) {
+            videoClients.forEach { try { it.close() } catch (_: Exception) {} }
+            videoClients.clear()
+        }
+
+        controlServer?.stop()
+        cameraController?.release()
+        serviceScope.cancel()
     }
 }
