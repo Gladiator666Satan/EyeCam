@@ -53,9 +53,9 @@ class UdpMediaSender(
         const val CODEC_AV1: Byte = 3
 
         // Flags
-        const val FLAG_KEYFRAME: Byte = 1 shl 0      // 0x01
-        const val FLAG_START_OF_FRAME: Byte = 1 shl 1 // 0x02
-        const val FLAG_END_OF_FRAME: Byte = 1 shl 2   // 0x04
+        const val FLAG_KEYFRAME: Byte = 0x01       // 1 shl 0
+        const val FLAG_START_OF_FRAME: Byte = 0x02 // 1 shl 1
+        const val FLAG_END_OF_FRAME: Byte = 0x04   // 1 shl 2
     }
 
     private var socket: DatagramSocket? = null
