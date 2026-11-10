@@ -2,6 +2,8 @@ name: CI Build
 
 permissions:
   contents: write
+  pull-requests: write
+  statuses: write
 
 on:
   push:
@@ -84,6 +86,19 @@ jobs:
             build/outputs/apk/debug/*.apk
             **/build/outputs/apk/debug/*.apk
           if-no-files-found: warn
+
+      - name: Report Android Build Result
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            gh api "repos/${{ github.repository }}/statuses/${{ github.sha }}" -f state=success -f description="Android APK built successfully!" -f context="EyeCam Android Build" || true
+            gh pr comment 1 --body "📱 **Android Build SUCCESS**: Debug APK built successfully with permanent keystore!" || true
+          else
+            gh api "repos/${{ github.repository }}/statuses/${{ github.sha }}" -f state=failure -f description="Android Build encountered an error." -f context="EyeCam Android Build" || true
+            gh pr comment 1 --body "❌ **Android Build FAILED**: check workflow logs." || true
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-desktop-linux:
     name: Build Desktop Linux Engine
@@ -207,3 +222,17 @@ jobs:
             build/lib/*
             scripts/windows/*
           if-no-files-found: warn
+
+      - name: Report Windows Build Result
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            gh api "repos/${{ github.repository }}/statuses/${{ github.sha }}" -f state=success -f description="Windows Studio GUI, Filter and Installer built successfully!" -f context="EyeCam Windows Build" || true
+            gh pr comment 1 --body "🚀 **Windows Build SUCCESS**: EyeCam Studio GUI, DirectShow Filter and EyeCam-Setup-x64.exe installer built successfully!" || true
+          else
+            gh api "repos/${{ github.repository }}/statuses/${{ github.sha }}" -f state=failure -f description="Windows Build encountered an error." -f context="EyeCam Windows Build" || true
+            gh pr comment 1 --body "❌ **Windows Build FAILED**: check workflow logs." || true
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
