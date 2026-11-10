@@ -104,6 +104,10 @@ jobs:
       - name: Checkout Source Code
         uses: actions/checkout@v4
 
+      - name: Generate Windows PC Icon (.ico)
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts/windows/generate_icon.ps1
+
       - name: Configure CMake (MSVC x64)
         run: |
           cmake -B build -A x64 `
@@ -112,6 +116,25 @@ jobs:
       - name: Build Windows Client Engine, Studio GUI & DirectShow Filter
         run: |
           cmake --build build --config Release --verbose
+
+      - name: Bundle ADB USB Bridge for Installer
+        run: |
+          New-Item -ItemType Directory -Path "build\adb" -Force | Out-Null
+          $ptDir = "$env:ANDROID_HOME\platform-tools"
+          if (-not (Test-Path "$ptDir\adb.exe")) {
+            $ptDir = "C:\Android\android-sdk\platform-tools"
+          }
+          if (Test-Path "$ptDir\adb.exe") {
+            Copy-Item "$ptDir\adb.exe" "build\adb\" -Force
+            Copy-Item "$ptDir\AdbWinApi.dll" "build\adb\" -Force
+            Copy-Item "$ptDir\AdbWinUsbApi.dll" "build\adb\" -Force
+          } else {
+            Invoke-WebRequest -Uri "https://dl.google.com/android/repository/platform-tools-latest-windows.zip" -OutFile "build\pt.zip"
+            Expand-Archive -Path "build\pt.zip" -DestinationPath "build\pt_extracted" -Force
+            Copy-Item "build\pt_extracted\platform-tools\adb.exe" "build\adb\" -Force
+            Copy-Item "build\pt_extracted\platform-tools\AdbWinApi.dll" "build\adb\" -Force
+            Copy-Item "build\pt_extracted\platform-tools\AdbWinUsbApi.dll" "build\adb\" -Force
+          }
 
       - name: Build Windows Installer (Inno Setup 6)
         run: |
