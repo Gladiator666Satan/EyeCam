@@ -367,10 +367,18 @@ class ControlServer(
     private fun sendFrame(msgType: Short, payload: ByteArray) {
         val out = outStream ?: return
         try {
-            out.writeShort(CONTROL_MAGIC.toInt())
-            out.writeShort(msgType.toInt())
-            out.writeInt(payload.size)
-            out.write(payload)
+            val totalLen = 8 + payload.size
+            val packet = ByteArray(totalLen)
+            packet[0] = 0x43.toByte() // 'C'
+            packet[1] = 0x50.toByte() // 'P'
+            packet[2] = ((msgType.toInt() ushr 8) and 0xFF).toByte()
+            packet[3] = (msgType.toInt() and 0xFF).toByte()
+            packet[4] = ((payload.size ushr 24) and 0xFF).toByte()
+            packet[5] = ((payload.size ushr 16) and 0xFF).toByte()
+            packet[6] = ((payload.size ushr 8) and 0xFF).toByte()
+            packet[7] = (payload.size and 0xFF).toByte()
+            System.arraycopy(payload, 0, packet, 8, payload.size)
+            out.write(packet)
             out.flush()
         } catch (e: Exception) {
             Log.w(TAG, "Failed to send frame type=$msgType", e)

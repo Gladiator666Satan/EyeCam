@@ -103,3 +103,7 @@ env/
 *.crash
 /core
 /core.[0-9]*
+
+# Scratch files
+scratch/
+scratch_payload.json

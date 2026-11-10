@@ -170,6 +170,8 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         restartInactivityTimer()
     }
 
+    fun deactivateDisplayProtection() = wakeFromDisplayProtection()
+
     private fun restartInactivityTimer() {
         inactivityTimerJob?.cancel()
         if (!_uiState.value.isStreaming) return

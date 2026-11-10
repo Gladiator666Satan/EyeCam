@@ -1,8 +1,4 @@
-; -----------------------------------------------------------------------------
-; EyeCam Virtual Camera DirectShow Filter Module Definition
-; -----------------------------------------------------------------------------
 LIBRARY EyeCamFilter
-
 EXPORTS
     DllGetClassObject   PRIVATE
     DllCanUnloadNow     PRIVATE

@@ -82,6 +82,7 @@ if (WIN32)
     )
     target_include_directories(EyeCamStudio PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/windows/gui
     )
     target_link_libraries(EyeCamStudio PRIVATE
         EyeCamWindowsSink

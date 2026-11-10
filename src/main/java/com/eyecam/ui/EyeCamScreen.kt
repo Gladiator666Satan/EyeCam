@@ -70,8 +70,8 @@ fun EyeCamScreen(
 
         // Шар 3: Display Protection Mode оверлей (OLED Blackout з Pixel Shifting)
         DisplayProtectionOverlay(
-            isActive = uiState.isDisplayProtectionActive,
-            onDismiss = { viewModel.deactivateDisplayProtection() }
+            uiState = uiState,
+            onWake = { viewModel.wakeFromDisplayProtection() }
         )
     }
 }

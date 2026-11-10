@@ -98,7 +98,7 @@ bool WindowsDirectShowSink::Open(uint32_t width, uint32_t height, PixelFormat fo
 
     if (m_hMapFile == nullptr) {
         std::ostringstream ss;
-        ss << "Помилка виклику CreateFileMapping: " << GetLastError();
+        ss << "Помилка CreateFileMappingW (код: " << GetLastError() << ")";
         m_lastError = ss.str();
         return false;
     }
@@ -113,36 +113,43 @@ bool WindowsDirectShowSink::Open(uint32_t width, uint32_t height, PixelFormat fo
 
     if (m_pBuf == nullptr) {
         std::ostringstream ss;
-        ss << "Помилка виклику MapViewOfFile: " << GetLastError();
+        ss << "Помилка MapViewOfFile (код: " << GetLastError() << ")";
         m_lastError = ss.str();
         Close();
         return false;
     }
 
-    m_hFrameEvent = CreateEventW(nullptr, FALSE, FALSE, SHM_EVENT_NAME_GLOBAL);
+    // Створення події синхронізації (Event)
+    m_hFrameEvent = CreateEventW(nullptr, FALSE, FALSE, EVENT_FRAME_GLOBAL);
     if (m_hFrameEvent == nullptr) {
-        m_hFrameEvent = CreateEventW(nullptr, FALSE, FALSE, SHM_EVENT_NAME_LOCAL);
+        m_hFrameEvent = CreateEventW(nullptr, FALSE, FALSE, EVENT_FRAME_LOCAL);
     }
 
-    if (m_hFrameEvent == nullptr) {
-        std::ostringstream ss;
-        ss << "Помилка створення FrameEvent: " << GetLastError();
-        m_lastError = ss.str();
-        Close();
-        return false;
-    }
-
-    m_hMutex = CreateMutexW(nullptr, FALSE, SHM_MUTEX_NAME_GLOBAL);
+    // Створення м'ютекса (Mutex)
+    m_hMutex = CreateMutexW(nullptr, FALSE, MUTEX_NAME_GLOBAL);
     if (m_hMutex == nullptr) {
-        m_hMutex = CreateMutexW(nullptr, FALSE, SHM_MUTEX_NAME_LOCAL);
+        m_hMutex = CreateMutexW(nullptr, FALSE, MUTEX_NAME_LOCAL);
     }
 
-    if (m_hMutex == nullptr) {
-        std::ostringstream ss;
-        ss << "Помилка створення SHM Mutex: " << GetLastError();
-        m_lastError = ss.str();
-        Close();
-        return false;
+    // Ініціалізація заголовка спільної пам'яті
+    if (m_hMutex) {
+        WaitForSingleObject(m_hMutex, INFINITE);
+    }
+
+    auto* header = reinterpret_cast<SharedMemoryHeader*>(m_pBuf);
+    header->magicNumber = EYECAM_MAGIC;
+    header->version = 1;
+    header->width = width;
+    header->height = height;
+    header->pixelFormat = static_cast<uint32_t>(format);
+    header->fps = fps;
+    header->frameIndex = 0;
+    header->timestampNs = 0;
+    header->dataSize = static_cast<uint32_t>(m_frameSize);
+    header->isConnected = 1;
+
+    if (m_hMutex) {
+        ReleaseMutex(m_hMutex);
     }
 
     m_width = width;
@@ -150,43 +157,7 @@ bool WindowsDirectShowSink::Open(uint32_t width, uint32_t height, PixelFormat fo
     m_format = format;
     m_fps = fps;
     m_frameCount = 0;
-
-    // Ініціалізація заголовка у спільній пам'яті
-    DWORD waitResult = WaitForSingleObject(m_hMutex, 2000);
-    if (waitResult == WAIT_OBJECT_0 || waitResult == WAIT_ABANDONED) {
-        SharedMemoryHeader* header = reinterpret_cast<SharedMemoryHeader*>(m_pBuf);
-        header->magic = SHM_MAGIC;
-        header->version = SHM_PROTOCOL_VERSION;
-        header->headerSize = sizeof(SharedMemoryHeader);
-        header->totalSize = static_cast<uint32_t>(TOTAL_SHARED_MEMORY_SIZE);
-        header->maxFrameSize = static_cast<uint32_t>(MAX_FRAME_BUFFER_SIZE);
-        header->ringBufferOffset = static_cast<uint32_t>(sizeof(SharedMemoryHeader));
-        header->activeSlot = 0;
-        header->state = StreamState::RUNNING;
-
-        FrameMetadata* meta0 = reinterpret_cast<FrameMetadata*>(
-            reinterpret_cast<uint8_t*>(m_pBuf) + sizeof(SharedMemoryHeader)
-        );
-        meta0->width = width;
-        meta0->height = height;
-        meta0->fourcc = PixelFormatToFourCC(format);
-        meta0->stride = static_cast<uint32_t>(m_frameSize / height);
-        meta0->dataSize = static_cast<uint32_t>(m_frameSize);
-        meta0->fps = fps;
-        meta0->frameIndex = 0;
-        meta0->timestampNs = 0;
-
-        FrameMetadata* meta1 = reinterpret_cast<FrameMetadata*>(
-            reinterpret_cast<uint8_t*>(m_pBuf) + sizeof(SharedMemoryHeader) + SINGLE_SLOT_SIZE
-        );
-        *meta1 = *meta0;
-
-        ReleaseMutex(m_hMutex);
-    } else {
-        m_lastError = "Не вдалося захопити м'ютекс для ініціалізації заголовка SHM.";
-        Close();
-        return false;
-    }
+    m_lastError.clear();
 
     return true;
 #endif
@@ -194,28 +165,15 @@ bool WindowsDirectShowSink::Open(uint32_t width, uint32_t height, PixelFormat fo
 
 void WindowsDirectShowSink::Close() {
 #if defined(_WIN32)
-    if (m_hMutex != nullptr && m_pBuf != nullptr) {
-        DWORD waitResult = WaitForSingleObject(m_hMutex, 500);
-        if (waitResult == WAIT_OBJECT_0 || waitResult == WAIT_ABANDONED) {
-            SharedMemoryHeader* header = reinterpret_cast<SharedMemoryHeader*>(m_pBuf);
-            header->state = StreamState::STOPPED;
+    if (m_pBuf != nullptr) {
+        if (m_hMutex != nullptr) {
+            WaitForSingleObject(m_hMutex, 50);
+            auto* header = reinterpret_cast<SharedMemoryHeader*>(m_pBuf);
+            header->isConnected = 0;
             ReleaseMutex(m_hMutex);
         }
-    }
-
-    if (m_pBuf != nullptr) {
         UnmapViewOfFile(m_pBuf);
         m_pBuf = nullptr;
-    }
-
-    if (m_hMapFile != nullptr) {
-        CloseHandle(m_hMapFile);
-        m_hMapFile = nullptr;
-    }
-
-    if (m_hFrameEvent != nullptr) {
-        CloseHandle(m_hFrameEvent);
-        m_hFrameEvent = nullptr;
     }
 
     if (m_hMutex != nullptr) {
@@ -223,67 +181,112 @@ void WindowsDirectShowSink::Close() {
         m_hMutex = nullptr;
     }
 
+    if (m_hFrameEvent != nullptr) {
+        CloseHandle(m_hFrameEvent);
+        m_hFrameEvent = nullptr;
+    }
+
+    if (m_hMapFile != nullptr) {
+        CloseHandle(m_hMapFile);
+        m_hMapFile = nullptr;
+    }
+#endif
     m_width = 0;
     m_height = 0;
     m_frameSize = 0;
     m_frameCount = 0;
+}
+
+bool WindowsDirectShowSink::IsOpen() const {
+    return m_pBuf != nullptr && m_hMapFile != nullptr;
+}
+
+bool WindowsDirectShowSink::SetFormat(uint32_t width, uint32_t height, PixelFormat format, uint32_t fps) {
+    if (!IsOpen()) {
+        m_lastError = "Канал пам'яті не відкрито для зміни формату.";
+        return false;
+    }
+
+#if defined(_WIN32)
+    size_t newSize = CalculateFrameSize(width, height, format);
+    if (newSize == 0 || newSize > MAX_FRAME_BUFFER_SIZE) {
+        m_lastError = "Неприпустима геометрія або перевищено ліміт буфера.";
+        return false;
+    }
+
+    if (m_hMutex) {
+        WaitForSingleObject(m_hMutex, 200);
+    }
+
+    auto* header = reinterpret_cast<SharedMemoryHeader*>(m_pBuf);
+    header->width = width;
+    header->height = height;
+    header->pixelFormat = static_cast<uint32_t>(format);
+    header->fps = fps;
+    header->dataSize = static_cast<uint32_t>(newSize);
+
+    if (m_hMutex) {
+        ReleaseMutex(m_hMutex);
+    }
+
+    m_width = width;
+    m_height = height;
+    m_format = format;
+    m_fps = fps;
+    m_frameSize = newSize;
+
+    if (m_hFrameEvent) {
+        SetEvent(m_hFrameEvent);
+    }
+    return true;
+#else
+    return false;
 #endif
 }
 
 bool WindowsDirectShowSink::WriteFrame(const uint8_t* data, size_t size) {
-#if !defined(_WIN32)
-    return false;
-#else
-    if (!IsOpen() || data == nullptr || size == 0) {
-        m_lastError = "Спільна пам'ять не відкрита або вхідний буфер порожній.";
+    if (!IsOpen()) {
+        m_lastError = "Спроба запису в неініціалізований буфер Windows DirectShow.";
         return false;
     }
 
-    if (size > MAX_FRAME_BUFFER_SIZE) {
-        m_lastError = "Розмір кадру перевищує виділений розмір слоту пам'яті.";
+    if (data == nullptr || size != m_frameSize) {
+        std::ostringstream ss;
+        ss << "Невідповідність розміру кадру: надано " << size 
+           << " байт, очікується " << m_frameSize << " байт.";
+        m_lastError = ss.str();
         return false;
     }
 
-    DWORD waitResult = WaitForSingleObject(m_hMutex, 50);
-    if (waitResult != WAIT_OBJECT_0 && waitResult != WAIT_ABANDONED) {
-        m_lastError = "Таймаут очікування м'ютекса спільної пам'яті.";
-        return false;
+#if defined(_WIN32)
+    if (m_hMutex) {
+        WaitForSingleObject(m_hMutex, 50);
     }
 
-    SharedMemoryHeader* header = reinterpret_cast<SharedMemoryHeader*>(m_pBuf);
-    
-    // Подвійна буферизація: пишемо у пасивний слот
-    uint32_t writeSlot = 1 - header->activeSlot;
-    size_t slotOffset = sizeof(SharedMemoryHeader) + (static_cast<size_t>(writeSlot) * SINGLE_SLOT_SIZE);
-    
-    FrameMetadata* meta = reinterpret_cast<FrameMetadata*>(
-        reinterpret_cast<uint8_t*>(m_pBuf) + slotOffset
+    auto* header = reinterpret_cast<SharedMemoryHeader*>(m_pBuf);
+    uint8_t* pixelBuffer = reinterpret_cast<uint8_t*>(m_pBuf) + sizeof(SharedMemoryHeader);
+
+    // Швидке копіювання байтів у відображену спільну пам'ять
+    std::memcpy(pixelBuffer, data, size);
+
+    m_frameCount++;
+    header->frameIndex = m_frameCount;
+    header->timestampNs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()
+        ).count()
     );
 
-    uint8_t* pFramePayload = reinterpret_cast<uint8_t*>(meta) + sizeof(FrameMetadata);
+    if (m_hMutex) {
+        ReleaseMutex(m_hMutex);
+    }
 
-    meta->width = m_width;
-    meta->height = m_height;
-    meta->fourcc = PixelFormatToFourCC(m_format);
-    meta->stride = static_cast<uint32_t>(m_frameSize / m_height);
-    meta->dataSize = static_cast<uint32_t>(size);
-    meta->fps = m_fps;
-    meta->frameIndex = ++m_frameCount;
-    
-    auto now = std::chrono::steady_clock::now();
-    meta->timestampNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-
-    std::memcpy(pFramePayload, data, size);
-
-    // Атомарне перемикання активного слота для споживача (DirectShow фільтр)
-    header->activeSlot = writeSlot;
-
-    ReleaseMutex(m_hMutex);
-
-    // Сповіщення споживача про готовність нового кадру
-    SetEvent(m_hFrameEvent);
-
+    if (m_hFrameEvent) {
+        SetEvent(m_hFrameEvent);
+    }
     return true;
+#else
+    return false;
 #endif
 }
 
@@ -297,10 +300,6 @@ bool WindowsDirectShowSink::WriteFrame(const VideoFrame& frame) {
     }
 
     return WriteFrame(frame.data, frame.dataSize);
-}
-
-bool WindowsDirectShowSink::SetFormat(uint32_t width, uint32_t height, PixelFormat format, uint32_t fps) {
-    return Open(width, height, format, fps);
 }
 
 } // namespace EyeCam

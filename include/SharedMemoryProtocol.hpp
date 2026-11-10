@@ -14,6 +14,12 @@ constexpr const wchar_t* EVENT_FRAME_LOCAL       = L"Local\\EyeCam_VirtualCamera
 constexpr const wchar_t* MUTEX_NAME_GLOBAL       = L"Global\\EyeCam_VirtualCamera_Mutex";
 constexpr const wchar_t* MUTEX_NAME_LOCAL        = L"Local\\EyeCam_VirtualCamera_Mutex";
 
+// Сумісні аліаси для старих та нових викликів
+constexpr const wchar_t* SHM_EVENT_NAME_GLOBAL   = EVENT_FRAME_GLOBAL;
+constexpr const wchar_t* SHM_EVENT_NAME_LOCAL    = EVENT_FRAME_LOCAL;
+constexpr const wchar_t* SHM_MUTEX_NAME_GLOBAL   = MUTEX_NAME_GLOBAL;
+constexpr const wchar_t* SHM_MUTEX_NAME_LOCAL    = MUTEX_NAME_LOCAL;
+
 // Магічні константи протоколів
 constexpr uint32_t MAGIC_ECAM_TRIPLE             = 0x4543414D; // 'ECAM' (Triple Buffering з VirtualCameraSink)
 constexpr uint32_t MAGIC_EYECAM_DIRECT           = 0x45594543; // 'EYEC' (Direct Frame з WindowsDirectShowSink)

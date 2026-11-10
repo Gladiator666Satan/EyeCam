@@ -16,7 +16,7 @@ namespace EyeCam {
 // Допоміжний клас перелічувача пінів (IEnumPins)
 class CEnumPins : public IEnumPins {
 public:
-    explicit CEnumPins(EyeCamOutputPin* pPin) : m_pPin(pPin) {
+    CEnumPins(IPin* pPin) : m_pPin(pPin) {
         if (m_pPin) m_pPin->AddRef();
     }
     virtual ~CEnumPins() {
@@ -33,11 +33,7 @@ public:
         *ppv = nullptr;
         return E_NOINTERFACE;
     }
-
-    STDMETHODIMP_(ULONG) AddRef() override {
-        return ++m_refCount;
-    }
-
+    STDMETHODIMP_(ULONG) AddRef() override { return ++m_refCount; }
     STDMETHODIMP_(ULONG) Release() override {
         ULONG count = --m_refCount;
         if (count == 0) delete this;
@@ -49,27 +45,117 @@ public:
         if (cPins > 0 && m_index == 0 && m_pPin) {
             ppPins[0] = m_pPin;
             m_pPin->AddRef();
-            m_index = 1;
+            m_index++;
             if (pcFetched) *pcFetched = 1;
             return (cPins == 1) ? S_OK : S_FALSE;
         }
         if (pcFetched) *pcFetched = 0;
         return S_FALSE;
     }
-
     STDMETHODIMP Skip(ULONG cPins) override {
         m_index += cPins;
-        return S_OK;
+        return (m_index <= 1) ? S_OK : S_FALSE;
     }
-
     STDMETHODIMP Reset() override {
         m_index = 0;
         return S_OK;
     }
-
     STDMETHODIMP Clone(IEnumPins** ppEnum) override {
         if (!ppEnum) return E_POINTER;
         *ppEnum = new CEnumPins(m_pPin);
+        return S_OK;
+    }
+
+private:
+    std::atomic<ULONG> m_refCount{1};
+    IPin* m_pPin = nullptr;
+    ULONG m_index = 0;
+};
+
+// Допоміжні функції для роботи з форматами відео
+static void FreeMediaType(AM_MEDIA_TYPE& mt) {
+    if (mt.cbFormat != 0) {
+        CoTaskMemFree(mt.pbFormat);
+        mt.cbFormat = 0;
+        mt.pbFormat = nullptr;
+    }
+    if (mt.pUnk != nullptr) {
+        mt.pUnk->Release();
+        mt.pUnk = nullptr;
+    }
+}
+
+static HRESULT CopyMediaType(AM_MEDIA_TYPE* pDest, const AM_MEDIA_TYPE* pSrc) {
+    if (!pDest || !pSrc) return E_POINTER;
+    *pDest = *pSrc;
+    if (pSrc->cbFormat != 0 && pSrc->pbFormat != nullptr) {
+        pDest->pbFormat = static_cast<BYTE*>(CoTaskMemAlloc(pSrc->cbFormat));
+        if (!pDest->pbFormat) return E_OUTOFMEMORY;
+        std::memcpy(pDest->pbFormat, pSrc->pbFormat, pSrc->cbFormat);
+    }
+    if (pDest->pUnk != nullptr) {
+        pDest->pUnk->AddRef();
+    }
+    return S_OK;
+}
+
+// Пресети роздільних здатностей та FPS для виявлення вебкамерою
+struct FormatPreset {
+    uint32_t width;
+    uint32_t height;
+    uint32_t fps;
+    GUID subtype;
+};
+
+static const FormatPreset g_Presets[] = {
+    { 1920, 1080, 60, MEDIASUBTYPE_YUY2 },
+    { 1920, 1080, 30, MEDIASUBTYPE_YUY2 },
+    { 1920, 1080, 60, MEDIASUBTYPE_RGB24 },
+    { 1920, 1080, 30, MEDIASUBTYPE_RGB24 },
+    { 1280, 720,  60, MEDIASUBTYPE_YUY2 },
+    { 1280, 720,  30, MEDIASUBTYPE_YUY2 },
+    { 1280, 720,  60, MEDIASUBTYPE_RGB24 },
+    { 1280, 720,  30, MEDIASUBTYPE_RGB24 },
+    { 640,  480,  30, MEDIASUBTYPE_YUY2 },
+    { 640,  480,  30, MEDIASUBTYPE_RGB24 }
+};
+constexpr int g_PresetCount = sizeof(g_Presets) / sizeof(g_Presets[0]);
+
+// Клас перелічувача медіа-форматів (IEnumMediaTypes)
+class CEnumMediaTypes : public IEnumMediaTypes {
+public:
+    CEnumMediaTypes(EyeCamOutputPin* pPin) : m_pPin(pPin) {}
+    virtual ~CEnumMediaTypes() = default;
+
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IEnumMediaTypes) {
+            *ppv = static_cast<IEnumMediaTypes*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return ++m_refCount; }
+    STDMETHODIMP_(ULONG) Release() override {
+        ULONG count = --m_refCount;
+        if (count == 0) delete this;
+        return count;
+    }
+
+    STDMETHODIMP Next(ULONG cMediaTypes, AM_MEDIA_TYPE** ppMediaTypes, ULONG* pcFetched) override;
+    STDMETHODIMP Skip(ULONG cMediaTypes) override {
+        m_index += cMediaTypes;
+        return (m_index <= g_PresetCount) ? S_OK : S_FALSE;
+    }
+    STDMETHODIMP Reset() override {
+        m_index = 0;
+        return S_OK;
+    }
+    STDMETHODIMP Clone(IEnumMediaTypes** ppEnum) override {
+        if (!ppEnum) return E_POINTER;
+        *ppEnum = new CEnumMediaTypes(m_pPin);
         return S_OK;
     }
 
@@ -79,169 +165,178 @@ private:
     ULONG m_index = 0;
 };
 
-// ==============================================================================
-// Реалізація EyeCamOutputPin
-// ==============================================================================
+// ----------------------------------------------------------------------------
+// EyeCamOutputPin Реалізація
+// ----------------------------------------------------------------------------
 
-EyeCamOutputPin::EyeCamOutputPin(EyeCamCaptureFilter* pFilter, CCritSec* pLock, HRESULT* phr)
-    : CBaseOutputPin(NAME("EyeCamOutputPin"), pFilter, pLock, phr, L"Output"),
-      m_pFilter(pFilter) {
-    InitPresets();
-    m_hStopEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-    OpenSharedMemory();
+EyeCamOutputPin::EyeCamOutputPin(EyeCamCaptureFilter* pFilter)
+    : m_pFilter(pFilter) {
+    CreateDefaultMediaType(&m_mediaType, 1920, 1080, PixelFormat::YUY2, 60);
+    m_hasMediaType = true;
 }
 
 EyeCamOutputPin::~EyeCamOutputPin() {
-    CloseSharedMemory();
-    if (m_hStopEvent) {
-        CloseHandle(m_hStopEvent);
-        m_hStopEvent = nullptr;
-    }
+    Inactive();
+    FreeMediaType(m_mediaType);
 }
 
-STDMETHODIMP EyeCamOutputPin::NonDelegatingQueryInterface(REFIID riid, void** ppv) {
+STDMETHODIMP EyeCamOutputPin::QueryInterface(REFIID riid, void** ppv) {
     if (!ppv) return E_POINTER;
 
-    if (riid == _uuidof(IKsPropertySet)) {
-        return GetInterface(static_cast<IKsPropertySet*>(this), ppv);
-    }
-    if (riid == _uuidof(IAMStreamConfig)) {
-        return GetInterface(static_cast<IAMStreamConfig*>(this), ppv);
-    }
-
-    return CBaseOutputPin::NonDelegatingQueryInterface(riid, ppv);
-}
-
-void EyeCamOutputPin::InitPresets() {
-    m_presets.clear();
-
-    // 4K UHD (3840x2160) @ 60 FPS
-    m_presets.push_back({3840, 2160, 60, PixelFormat::NV12});
-    m_presets.push_back({3840, 2160, 60, PixelFormat::YUY2});
-
-    // 1080p FHD (1920x1080) @ 60 FPS (Основний режим за замовчуванням)
-    m_presets.push_back({1920, 1080, 60, PixelFormat::NV12});
-    m_presets.push_back({1920, 1080, 60, PixelFormat::YUY2});
-
-    // 720p HD (1280x720) @ 60 FPS
-    m_presets.push_back({1280, 720, 60, PixelFormat::NV12});
-    m_presets.push_back({1280, 720, 60, PixelFormat::YUY2});
-}
-
-HRESULT EyeCamOutputPin::GetMediaType(int iPosition, CMediaType* pMediaType) {
-    CAutoLock cAutoLock(m_pLock);
-    if (!pMediaType) return E_POINTER;
-    if (iPosition < 0) return E_INVALIDARG;
-
-    if (static_cast<size_t>(iPosition) >= m_presets.size()) {
-        return VFW_S_NO_MORE_ITEMS;
-    }
-
-    const auto& preset = m_presets[iPosition];
-    pMediaType->SetType(&MEDIATYPE_Video);
-
-    if (preset.format == PixelFormat::NV12) {
-        pMediaType->SetSubtype(&MEDIASUBTYPE_NV12);
-    } else if (preset.format == PixelFormat::YUY2) {
-        pMediaType->SetSubtype(&MEDIASUBTYPE_YUY2);
+    if (riid == IID_IUnknown || riid == IID_IPin) {
+        *ppv = static_cast<IPin*>(this);
+    } else if (riid == IID_IKsPropertySet) {
+        // Обов'язково для Zoom та Teams для запиту властивості PIN_CATEGORY_CAPTURE
+        *ppv = static_cast<IKsPropertySet*>(this);
+    } else if (riid == IID_IAMStreamConfig) {
+        // Необхідно для узгодження роздільної здатності та частоти кадрів клієнтським додатком
+        *ppv = static_cast<IAMStreamConfig*>(this);
     } else {
-        pMediaType->SetSubtype(&MEDIASUBTYPE_RGB24);
+        *ppv = nullptr;
+        return E_NOINTERFACE;
     }
 
-    pMediaType->SetFormatType(&FORMAT_VideoInfo);
-    pMediaType->SetTemporalCompression(FALSE);
+    AddRef();
+    return S_OK;
+}
 
-    VIDEOINFOHEADER* pvi = reinterpret_cast<VIDEOINFOHEADER*>(
-        pMediaType->AllocFormatBuffer(sizeof(VIDEOINFOHEADER)));
-    if (!pvi) return E_OUTOFMEMORY;
+STDMETHODIMP_(ULONG) EyeCamOutputPin::AddRef() {
+    return ++m_refCount;
+}
 
-    ZeroMemory(pvi, sizeof(VIDEOINFOHEADER));
-    pvi->rcSource = {0, 0, static_cast<LONG>(preset.width), static_cast<LONG>(preset.height)};
-    pvi->rcTarget = pvi->rcSource;
-    pvi->AvgTimePerFrame = 10000000LL / preset.fps; // 100-ns юніти
+STDMETHODIMP_(ULONG) EyeCamOutputPin::Release() {
+    ULONG count = --m_refCount;
+    if (count == 0) delete this;
+    return count;
+}
 
-    BITMAPINFOHEADER& bih = pvi->bmiHeader;
-    bih.biSize = sizeof(BITMAPINFOHEADER);
-    bih.biWidth = preset.width;
-    bih.biHeight = preset.height;
-    bih.biPlanes = 1;
+STDMETHODIMP EyeCamOutputPin::Connect(IPin* pReceivePin, const AM_MEDIA_TYPE* pmt) {
+    if (!pReceivePin) return E_POINTER;
+    if (m_pConnectedPin) return VFW_E_ALREADY_CONNECTED;
 
-    if (preset.format == PixelFormat::NV12) {
-        bih.biBitCount = 12;
-        bih.biCompression = MAKEFOURCC('N', 'V', '1', '2');
-        bih.biSizeImage = preset.width * preset.height * 3 / 2;
-    } else if (preset.format == PixelFormat::YUY2) {
-        bih.biBitCount = 16;
-        bih.biCompression = MAKEFOURCC('Y', 'U', 'Y', '2');
-        bih.biSizeImage = preset.width * preset.height * 2;
+    AM_MEDIA_TYPE mt{};
+    if (pmt) {
+        CopyMediaType(&mt, pmt);
     } else {
-        bih.biBitCount = 24;
-        bih.biCompression = BI_RGB;
-        bih.biSizeImage = preset.width * preset.height * 3;
+        CopyMediaType(&mt, &m_mediaType);
     }
 
-    pMediaType->SetSampleSize(bih.biSizeImage);
+    HRESULT hr = pReceivePin->ReceiveConnection(this, &mt);
+    if (SUCCEEDED(hr)) {
+        m_pConnectedPin = pReceivePin;
+        m_pConnectedPin->AddRef();
+
+        pReceivePin->QueryInterface(IID_IMemInputPin, reinterpret_cast<void**>(&m_pMemInputPin));
+        if (m_pMemInputPin) {
+            DecideAllocator(m_pMemInputPin, &m_pAllocator);
+        }
+
+        FreeMediaType(m_mediaType);
+        CopyMediaType(&m_mediaType, &mt);
+        m_hasMediaType = true;
+    }
+
+    FreeMediaType(mt);
+    return hr;
+}
+
+STDMETHODIMP EyeCamOutputPin::ReceiveConnection(IPin* pConnector, const AM_MEDIA_TYPE* pmt) {
+    (void)pConnector; (void)pmt;
+    return E_UNEXPECTED; // Вихідний пін не приймає з'єднань
+}
+
+STDMETHODIMP EyeCamOutputPin::Disconnect() {
+    if (!m_pConnectedPin) return S_FALSE;
+
+    if (m_pAllocator) {
+        m_pAllocator->Decommit();
+        m_pAllocator->Release();
+        m_pAllocator = nullptr;
+    }
+    if (m_pMemInputPin) {
+        m_pMemInputPin->Release();
+        m_pMemInputPin = nullptr;
+    }
+
+    m_pConnectedPin->Release();
+    m_pConnectedPin = nullptr;
     return S_OK;
 }
 
-HRESULT EyeCamOutputPin::CheckMediaType(const CMediaType* pMediaType) {
-    CAutoLock cAutoLock(m_pLock);
-    if (!pMediaType) return E_POINTER;
-
-    if (*pMediaType->Type() != MEDIATYPE_Video) {
-        return VFW_E_INVALIDMEDIATYPE;
-    }
-
-    const GUID* subtype = pMediaType->Subtype();
-    if (*subtype != MEDIASUBTYPE_NV12 && 
-        *subtype != MEDIASUBTYPE_YUY2 && 
-        *subtype != MEDIASUBTYPE_RGB24) {
-        return VFW_E_INVALIDMEDIATYPE;
-    }
-
-    if (*pMediaType->FormatType() != FORMAT_VideoInfo) {
-        return VFW_E_INVALIDMEDIATYPE;
-    }
-
-    VIDEOINFOHEADER* pvi = reinterpret_cast<VIDEOINFOHEADER*>(pMediaType->Format());
-    if (!pvi) return E_POINTER;
-
+STDMETHODIMP EyeCamOutputPin::ConnectedTo(IPin** pPin) {
+    if (!pPin) return E_POINTER;
+    if (!m_pConnectedPin) return VFW_E_NOT_CONNECTED;
+    *pPin = m_pConnectedPin;
+    (*pPin)->AddRef();
     return S_OK;
 }
 
-HRESULT EyeCamOutputPin::DecideBufferSize(IMemAllocator* pAlloc, ALLOCATOR_PROPERTIES* ppropInputRequest) {
-    CAutoLock cAutoLock(m_pLock);
-    if (!pAlloc || !ppropInputRequest) return E_POINTER;
+STDMETHODIMP EyeCamOutputPin::ConnectionMediaType(AM_MEDIA_TYPE* pmt) {
+    if (!pmt) return E_POINTER;
+    if (!m_pConnectedPin) return VFW_E_NOT_CONNECTED;
+    return CopyMediaType(pmt, &m_mediaType);
+}
 
-    HRESULT hr = S_OK;
-    VIDEOINFOHEADER* pvi = reinterpret_cast<VIDEOINFOHEADER*>(m_mt.Format());
-    if (!pvi) return E_UNEXPECTED;
-
-    ppropInputRequest->cBuffers = 3; // Triple Buffering у DirectShow графі
-    ppropInputRequest->cbBuffer = pvi->bmiHeader.biSizeImage;
-    if (ppropInputRequest->cbBuffer == 0) {
-        ppropInputRequest->cbBuffer = pvi->bmiHeader.biWidth * pvi->bmiHeader.biHeight * 2;
-    }
-
-    ALLOCATOR_PROPERTIES actual;
-    hr = pAlloc->SetProperties(ppropInputRequest, &actual);
-    if (FAILED(hr)) return hr;
-
-    if (actual.cbBuffer < ppropInputRequest->cbBuffer) {
-        return E_FAIL;
-    }
-
+STDMETHODIMP EyeCamOutputPin::QueryPinInfo(PIN_INFO* pInfo) {
+    if (!pInfo) return E_POINTER;
+    pInfo->pFilter = m_pFilter;
+    if (m_pFilter) m_pFilter->AddRef();
+    pInfo->dir = PINDIR_OUTPUT;
+    wcsncpy_s(pInfo->achName, L"Capture", _TRUNCATE);
     return S_OK;
 }
 
-// ------------------------------------------------------------------------------
-// IKsPropertySet (Позначення піна як камери для Skype, Teams, Chrome, OBS)
-// ------------------------------------------------------------------------------
+STDMETHODIMP EyeCamOutputPin::QueryDirection(PIN_DIRECTION* pPinDir) {
+    if (!pPinDir) return E_POINTER;
+    *pPinDir = PINDIR_OUTPUT;
+    return S_OK;
+}
 
+STDMETHODIMP EyeCamOutputPin::QueryId(LPWSTR* Id) {
+    if (!Id) return E_POINTER;
+    const wchar_t* pinId = L"Output";
+    size_t len = (wcslen(pinId) + 1) * sizeof(wchar_t);
+    *Id = static_cast<LPWSTR>(CoTaskMemAlloc(len));
+    if (!*Id) return E_OUTOFMEMORY;
+    std::memcpy(*Id, pinId, len);
+    return S_OK;
+}
+
+STDMETHODIMP EyeCamOutputPin::QueryAccept(const AM_MEDIA_TYPE* pmt) {
+    if (!pmt) return E_POINTER;
+    if (pmt->majortype != MEDIATYPE_Video) return S_FALSE;
+    if (pmt->subtype != MEDIASUBTYPE_YUY2 && 
+        pmt->subtype != MEDIASUBTYPE_RGB24 && 
+        pmt->subtype != MEDIASUBTYPE_RGB32) {
+        return S_FALSE;
+    }
+    return S_OK;
+}
+
+STDMETHODIMP EyeCamOutputPin::EnumMediaTypes(IEnumMediaTypes** ppEnum) {
+    if (!ppEnum) return E_POINTER;
+    *ppEnum = new CEnumMediaTypes(this);
+    return S_OK;
+}
+
+STDMETHODIMP EyeCamOutputPin::QueryInternalConnections(IPin** apPin, ULONG* nPin) {
+    (void)apPin; (void)nPin;
+    return E_NOTIMPL;
+}
+
+STDMETHODIMP EyeCamOutputPin::EndOfStream() { return S_OK; }
+STDMETHODIMP EyeCamOutputPin::BeginFlush() { return S_OK; }
+STDMETHODIMP EyeCamOutputPin::EndFlush() { return S_OK; }
+STDMETHODIMP EyeCamOutputPin::NewSegment(REFERENCE_TIME tStart, REFERENCE_TIME tStop, double dRate) {
+    (void)tStart; (void)tStop; (void)dRate;
+    return S_OK;
+}
+
+// IKsPropertySet - Критично важливий блок для детекції в Zoom, Teams, Discord
 STDMETHODIMP EyeCamOutputPin::Set(REFGUID guidPropSet, DWORD dwPropID, LPVOID pInstanceData, 
                                   DWORD cbInstanceData, LPVOID pPropData, DWORD cbPropData) {
-    (void)guidPropSet; (void)dwPropID; (void)pInstanceData; 
-    (void)cbInstanceData; (void)pPropData; (void)cbPropData;
+    (void)guidPropSet; (void)dwPropID; (void)pInstanceData; (void)cbInstanceData; 
+    (void)pPropData; (void)cbPropData;
     return E_NOTIMPL;
 }
 
@@ -252,7 +347,8 @@ STDMETHODIMP EyeCamOutputPin::Get(REFGUID guidPropSet, DWORD dwPropID, LPVOID pI
         if (!pPropData) return E_POINTER;
         if (cbPropData < sizeof(GUID)) return E_FAIL;
 
-        *static_cast<GUID*>(pPropData) = PIN_CATEGORY_CAPTURE;
+        // Повертаємо PIN_CATEGORY_CAPTURE, щоб DirectShow класифікував фільтр як вебкамеру
+        *reinterpret_cast<GUID*>(pPropData) = PIN_CATEGORY_CAPTURE;
         if (pcbReturned) *pcbReturned = sizeof(GUID);
         return S_OK;
     }
@@ -268,91 +364,128 @@ STDMETHODIMP EyeCamOutputPin::QuerySupported(REFGUID guidPropSet, DWORD dwPropID
     return E_PROP_SET_UNSUPPORTED;
 }
 
-// ------------------------------------------------------------------------------
 // IAMStreamConfig
-// ------------------------------------------------------------------------------
-
 STDMETHODIMP EyeCamOutputPin::SetFormat(AM_MEDIA_TYPE* pmt) {
-    CAutoLock cAutoLock(m_pLock);
     if (!pmt) return E_POINTER;
+    if (QueryAccept(pmt) != S_OK) return VFW_E_INVALIDMEDIATYPE;
 
-    if (m_pFilter->IsActive()) {
-        return VFW_E_WRONG_STATE;
-    }
-
-    HRESULT hr = CheckMediaType(reinterpret_cast<CMediaType*>(pmt));
-    if (FAILED(hr)) return hr;
-
-    m_mt = *pmt;
-    if (m_Connected) {
-        m_pFilter->ReconnectPin(this, pmt);
-    }
+    FreeMediaType(m_mediaType);
+    CopyMediaType(&m_mediaType, pmt);
+    m_hasMediaType = true;
     return S_OK;
 }
 
 STDMETHODIMP EyeCamOutputPin::GetFormat(AM_MEDIA_TYPE** ppmt) {
-    CAutoLock cAutoLock(m_pLock);
     if (!ppmt) return E_POINTER;
-
-    *ppmt = CreateMediaType(&m_mt);
-    return (*ppmt) ? S_OK : E_OUTOFMEMORY;
+    *ppmt = static_cast<AM_MEDIA_TYPE*>(CoTaskMemAlloc(sizeof(AM_MEDIA_TYPE)));
+    if (!*ppmt) return E_OUTOFMEMORY;
+    return CopyMediaType(*ppmt, &m_mediaType);
 }
 
 STDMETHODIMP EyeCamOutputPin::GetNumberOfCapabilities(int* piCount, int* piSize) {
     if (!piCount || !piSize) return E_POINTER;
-    *piCount = static_cast<int>(m_presets.size());
+    *piCount = g_PresetCount;
     *piSize = sizeof(VIDEO_STREAM_CONFIG_CAPS);
     return S_OK;
 }
 
 STDMETHODIMP EyeCamOutputPin::GetStreamCaps(int iIndex, AM_MEDIA_TYPE** ppmt, BYTE* pSCC) {
-    CAutoLock cAutoLock(m_pLock);
     if (!ppmt || !pSCC) return E_POINTER;
-    if (iIndex < 0 || static_cast<size_t>(iIndex) >= m_presets.size()) return E_INVALIDARG;
+    if (iIndex < 0 || iIndex >= g_PresetCount) return E_INVALIDARG;
 
-    CMediaType mt;
-    HRESULT hr = GetMediaType(iIndex, &mt);
-    if (FAILED(hr)) return hr;
-
-    *ppmt = CreateMediaType(&mt);
+    const auto& preset = g_Presets[iIndex];
+    *ppmt = static_cast<AM_MEDIA_TYPE*>(CoTaskMemAlloc(sizeof(AM_MEDIA_TYPE)));
     if (!*ppmt) return E_OUTOFMEMORY;
 
-    const auto& preset = m_presets[iIndex];
-    VIDEO_STREAM_CONFIG_CAPS* pCaps = reinterpret_cast<VIDEO_STREAM_CONFIG_CAPS*>(pSCC);
-    ZeroMemory(pCaps, sizeof(VIDEO_STREAM_CONFIG_CAPS));
+    PixelFormat fmt = (preset.subtype == MEDIASUBTYPE_YUY2) ? PixelFormat::YUY2 : PixelFormat::RGB24;
+    CreateDefaultMediaType(*ppmt, preset.width, preset.height, fmt, preset.fps);
 
-    pCaps->guid = FORMAT_VideoInfo;
-    pCaps->VideoStandard = 0;
-    pCaps->InputSize = {static_cast<LONG>(preset.width), static_cast<LONG>(preset.height)};
-    pCaps->MinCroppingSize = pCaps->InputSize;
-    pCaps->MaxCroppingSize = pCaps->InputSize;
-    pCaps->MinOutputSize = pCaps->InputSize;
-    pCaps->MaxOutputSize = pCaps->InputSize;
-    pCaps->MinFrameInterval = 10000000LL / preset.fps;
-    pCaps->MaxFrameInterval = 10000000LL / 15;
+    // Заповнення VIDEO_STREAM_CONFIG_CAPS
+    auto* caps = reinterpret_cast<VIDEO_STREAM_CONFIG_CAPS*>(pSCC);
+    std::memset(caps, 0, sizeof(VIDEO_STREAM_CONFIG_CAPS));
+    caps->guid = FORMAT_VideoInfo;
+    caps->VideoStandard = 0;
+    caps->InputSize.cx = preset.width;
+    caps->InputSize.cy = preset.height;
+    caps->MinCroppingSize.cx = preset.width;
+    caps->MinCroppingSize.cy = preset.height;
+    caps->MaxCroppingSize.cx = preset.width;
+    caps->MaxCroppingSize.cy = preset.height;
+    caps->MinOutputSize = caps->MinCroppingSize;
+    caps->MaxOutputSize = caps->MaxCroppingSize;
+    caps->MinFrameInterval = 10000000LL / preset.fps;
+    caps->MaxFrameInterval = 10000000LL / 10; // До 10 fps мінімум
 
     return S_OK;
 }
 
-// ------------------------------------------------------------------------------
-// Робота зі спільною пам'яттю EyeCam Shared Memory
-// ------------------------------------------------------------------------------
+HRESULT EyeCamOutputPin::CreateDefaultMediaType(AM_MEDIA_TYPE* pmt, uint32_t width, uint32_t height, 
+                                                PixelFormat fmt, uint32_t fps) {
+    std::memset(pmt, 0, sizeof(AM_MEDIA_TYPE));
+    pmt->majortype = MEDIATYPE_Video;
+    pmt->subtype = (fmt == PixelFormat::YUY2) ? MEDIASUBTYPE_YUY2 : MEDIASUBTYPE_RGB24;
+    pmt->bFixedSizeSamples = TRUE;
+    pmt->bTemporalCompression = FALSE;
+    pmt->lSampleSize = static_cast<ULONG>(CalculateFrameSize(width, height, fmt));
+    pmt->formattype = FORMAT_VideoInfo;
 
-bool EyeCamOutputPin::OpenSharedMemory() {
-    if (m_pSharedBuf) return true;
+    VIDEOINFOHEADER* vih = static_cast<VIDEOINFOHEADER*>(CoTaskMemAlloc(sizeof(VIDEOINFOHEADER)));
+    if (!vih) return E_OUTOFMEMORY;
 
+    std::memset(vih, 0, sizeof(VIDEOINFOHEADER));
+    vih->rcSource = {0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+    vih->rcTarget = vih->rcSource;
+    vih->AvgTimePerFrame = (fps > 0) ? (10000000LL / fps) : 333333LL;
+
+    BITMAPINFOHEADER& bih = vih->bmiHeader;
+    bih.biSize = sizeof(BITMAPINFOHEADER);
+    bih.biWidth = width;
+    bih.biHeight = height; // Додатнє значення для верхнього рядка першим у YUY2
+    bih.biPlanes = 1;
+    bih.biBitCount = (fmt == PixelFormat::YUY2) ? 16 : 24;
+    bih.biCompression = (fmt == PixelFormat::YUY2) ? MAKEFOURCC('Y','U','Y','2') : BI_RGB;
+    bih.biSizeImage = static_cast<DWORD>(pmt->lSampleSize);
+
+    pmt->cbFormat = sizeof(VIDEOINFOHEADER);
+    pmt->pbFormat = reinterpret_cast<BYTE*>(vih);
+    return S_OK;
+}
+
+HRESULT EyeCamOutputPin::DecideAllocator(IMemInputPin* pPin, IMemAllocator** ppAlloc) {
+    if (!pPin || !ppAlloc) return E_POINTER;
+
+    HRESULT hr = pPin->GetAllocator(ppAlloc);
+    if (FAILED(hr)) {
+        hr = CoCreateInstance(CLSID_MemoryAllocator, nullptr, CLSCTX_INPROC_SERVER, 
+                              IID_IMemAllocator, reinterpret_cast<void**>(ppAlloc));
+        if (FAILED(hr)) return hr;
+    }
+
+    ALLOCATOR_PROPERTIES propReq{}, propAct{};
+    propReq.cBuffers = 3;
+    propReq.cbBuffer = m_mediaType.lSampleSize;
+    propReq.cbAlign = 1;
+    propReq.cbPrefix = 0;
+
+    hr = (*ppAlloc)->SetProperties(&propReq, &propAct);
+    if (SUCCEEDED(hr)) {
+        hr = pPin->NotifyAllocator(*ppAlloc, FALSE);
+    }
+    return hr;
+}
+
+HRESULT EyeCamOutputPin::Active() {
+    if (m_workerThread.joinable()) {
+        return S_OK;
+    }
+
+    // Підключення до спільної пам'яті (спершу Global\, потім Local\)
     m_hMapFile = OpenFileMappingW(FILE_MAP_READ, FALSE, SHM_NAME_GLOBAL);
     if (!m_hMapFile) {
         m_hMapFile = OpenFileMappingW(FILE_MAP_READ, FALSE, SHM_NAME_LOCAL);
     }
-
-    if (!m_hMapFile) return false;
-
-    m_pSharedBuf = MapViewOfFile(m_hMapFile, FILE_MAP_READ, 0, 0, 0);
-    if (!m_pSharedBuf) {
-        CloseHandle(m_hMapFile);
-        m_hMapFile = nullptr;
-        return false;
+    if (m_hMapFile) {
+        m_pSharedBuf = MapViewOfFile(m_hMapFile, FILE_MAP_READ, 0, 0, TOTAL_SHARED_MEMORY_SIZE);
     }
 
     m_hFrameEvent = OpenEventW(SYNCHRONIZE, FALSE, EVENT_FRAME_GLOBAL);
@@ -365,18 +498,29 @@ bool EyeCamOutputPin::OpenSharedMemory() {
         m_hMutex = OpenMutexW(SYNCHRONIZE, FALSE, MUTEX_NAME_LOCAL);
     }
 
-    return true;
+    if (m_pAllocator) {
+        m_pAllocator->Commit();
+    }
+
+    m_stopThread = false;
+    m_workerThread = std::thread(&EyeCamOutputPin::ThreadProc, this);
+    return S_OK;
 }
 
-void EyeCamOutputPin::CloseSharedMemory() {
-    if (m_hMutex) {
-        CloseHandle(m_hMutex);
-        m_hMutex = nullptr;
-    }
+HRESULT EyeCamOutputPin::Inactive() {
+    m_stopThread = true;
     if (m_hFrameEvent) {
-        CloseHandle(m_hFrameEvent);
-        m_hFrameEvent = nullptr;
+        SetEvent(m_hFrameEvent); // Пробуджуємо робочий потік для зупинки
     }
+
+    if (m_workerThread.joinable()) {
+        m_workerThread.join();
+    }
+
+    if (m_pAllocator) {
+        m_pAllocator->Decommit();
+    }
+
     if (m_pSharedBuf) {
         UnmapViewOfFile(m_pSharedBuf);
         m_pSharedBuf = nullptr;
@@ -385,112 +529,94 @@ void EyeCamOutputPin::CloseSharedMemory() {
         CloseHandle(m_hMapFile);
         m_hMapFile = nullptr;
     }
-}
+    if (m_hFrameEvent) {
+        CloseHandle(m_hFrameEvent);
+        m_hFrameEvent = nullptr;
+    }
+    if (m_hMutex) {
+        CloseHandle(m_hMutex);
+        m_hMutex = nullptr;
+    }
 
-HRESULT EyeCamOutputPin::Active() {
-    CAutoLock cAutoLock(m_pLock);
-    HRESULT hr = CBaseOutputPin::Active();
-    if (FAILED(hr)) return hr;
-
-    ResetEvent(m_hStopEvent);
-    OpenSharedMemory();
-
-    // Запуск фонового потоку генерації та виштовхування кадрів DirectShow
-    m_workerThread = std::thread(&EyeCamOutputPin::ThreadProc, this);
     return S_OK;
 }
 
-HRESULT EyeCamOutputPin::Inactive() {
-    CAutoLock cAutoLock(m_pLock);
-    SetEvent(m_hStopEvent);
-
-    if (m_workerThread.joinable()) {
-        m_workerThread.join();
+void EyeCamOutputPin::ThreadProc() {
+    REFERENCE_TIME avgFrameDuration = 333333LL; // За замовчуванням 30 FPS (~33.3 мс)
+    if (m_mediaType.formattype == FORMAT_VideoInfo && m_mediaType.pbFormat) {
+        auto* vih = reinterpret_cast<VIDEOINFOHEADER*>(m_mediaType.pbFormat);
+        if (vih->AvgTimePerFrame > 0) {
+            avgFrameDuration = vih->AvgTimePerFrame;
+        }
     }
 
-    CloseSharedMemory();
-    return CBaseOutputPin::Inactive();
-}
+    DWORD waitTimeoutMs = static_cast<DWORD>(avgFrameDuration / 10000); // 100-нс в мс
 
-void EyeCamOutputPin::ThreadProc() {
-    REFERENCE_TIME rtStart = 0;
-    const REFERENCE_TIME rtAvg = 10000000LL / 60; // 60 FPS (16.6ms)
+    while (!m_stopThread) {
+        // Очікування нового кадру від продюсера через спільну подію або таймаут таймінгу
+        if (m_hFrameEvent) {
+            WaitForSingleObject(m_hFrameEvent, waitTimeoutMs);
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(waitTimeoutMs));
+        }
 
-    HANDLE waitHandles[2] = { m_hStopEvent, m_hFrameEvent };
+        if (m_stopThread) break;
 
-    while (true) {
-        DWORD waitRes = WaitForMultipleObjects(
-            (m_hFrameEvent ? 2 : 1), 
-            waitHandles, 
-            FALSE, 
-            16 // 16ms таймаут для стабільної частоти 60 FPS
-        );
-
-        if (waitRes == WAIT_OBJECT_0) {
-            // Зупинка потоку через StopEvent
-            break;
+        if (!m_pAllocator || !m_pMemInputPin) {
+            continue;
         }
 
         IMediaSample* pSample = nullptr;
-        HRESULT hr = GetDeliveryBuffer(&pSample, nullptr, nullptr, 0);
+        HRESULT hr = m_pAllocator->GetBuffer(&pSample, nullptr, nullptr, 0);
         if (FAILED(hr) || !pSample) {
             continue;
         }
 
         BYTE* pBuffer = nullptr;
         hr = pSample->GetPointer(&pBuffer);
-        long actualSize = pSample->GetSize();
-
-        if (SUCCEEDED(hr) && pBuffer && actualSize > 0) {
-            FillSampleBuffer(pBuffer, static_cast<size_t>(actualSize));
-
-            REFERENCE_TIME rtEnd = rtStart + rtAvg;
-            pSample->SetTime(&rtStart, &rtEnd);
-            pSample->SetSyncPoint(TRUE);
-            pSample->SetPreroll(FALSE);
-
-            Deliver(pSample);
-            rtStart = rtEnd;
+        if (SUCCEEDED(hr) && pBuffer) {
+            long bufferSize = pSample->GetSize();
+            FillBuffer(pBuffer, static_cast<size_t>(bufferSize));
         }
 
-        if (pSample) {
-            pSample->Release();
-        }
+        REFERENCE_TIME rtStart = m_rtFrameTime;
+        REFERENCE_TIME rtEnd = rtStart + avgFrameDuration;
+        m_rtFrameTime = rtEnd;
+
+        pSample->SetTime(&rtStart, &rtEnd);
+        pSample->SetSyncPoint(TRUE);
+
+        m_pMemInputPin->Receive(pSample);
+        pSample->Release();
     }
 }
 
-void EyeCamOutputPin::FillSampleBuffer(BYTE* pBuffer, size_t bufferSize) {
-    if (!m_pSharedBuf) {
-        OpenSharedMemory();
-    }
-
+void EyeCamOutputPin::FillBuffer(BYTE* pBuffer, size_t bufferSize) {
     bool frameRendered = false;
 
+    // Якщо клієнт підключений до спільної пам'яті
     if (m_pSharedBuf) {
         const uint32_t magic = *reinterpret_cast<const uint32_t*>(m_pSharedBuf);
 
-        // Формат 1: Triple Buffer (Zero-Lock)
+        // Формат 1: Кільцевий трипл-буфер VirtualCameraSink (0x4543414D 'ECAM')
         if (magic == MAGIC_ECAM_TRIPLE) {
-            const auto* header = reinterpret_cast<const TripleBufferShmHeader*>(m_pSharedBuf);
-            uint32_t slot = header->activeBufferIdx % 3;
+            auto* th = reinterpret_cast<const TripleBufferShmHeader*>(m_pSharedBuf);
+            uint32_t activeIdx = th->activeBufferIdx % 3;
+            size_t frameSize = CalculateFrameSize(th->width, th->height, PixelFormat::NV12);
+            const uint8_t* base = reinterpret_cast<const uint8_t*>(th + 1);
+            const uint8_t* src = base + (activeIdx * frameSize);
 
-            const uint8_t* slotBase = reinterpret_cast<const uint8_t*>(m_pSharedBuf) + sizeof(TripleBufferShmHeader);
-            const uint8_t* src = slotBase + (slot * MAX_FRAME_BUFFER_SIZE);
-
-            uint32_t w = header->width;
-            uint32_t h = header->height;
-            size_t frameSize = (header->fourcc == FOURCC_NV12) ? (w * h * 3 / 2) : (w * h * 2);
-
-            // Якщо формати збігаються, виконуємо копіювання
-            if (m_mediaType.subtype == MEDIASUBTYPE_YUY2 && header->fourcc == FOURCC_NV12) {
-                // Швидка асемблерна або прямолінійна конвертація NV12 -> YUY2
+            // Якщо джерело NV12, а клієнтський додаток (Zoom/Teams) очікує YUY2:
+            if (m_mediaType.subtype == MEDIASUBTYPE_YUY2 && th->fourcc == FOURCC_NV12) {
+                const uint32_t w = th->width;
+                const uint32_t h = th->height;
                 const uint8_t* yPlane = src;
                 const uint8_t* uvPlane = src + (w * h);
 
                 for (uint32_t y = 0; y < h; ++y) {
                     const uint8_t* yRow = yPlane + (y * w);
                     const uint8_t* uvRow = uvPlane + ((y / 2) * w);
-                    uint8_t* outRow = pBuffer + (y * w * 2);
+                    BYTE* outRow = pBuffer + (y * w * 2);
 
                     for (uint32_t x = 0; x < w; x += 2) {
                         outRow[x * 2]     = yRow[x];       // Y0
@@ -507,13 +633,13 @@ void EyeCamOutputPin::FillSampleBuffer(BYTE* pBuffer, size_t bufferSize) {
             }
         }
         // Формат 2: Прямий кадр WindowsDirectShowSink (0x45594543 'EYEC')
-        else if (magic == MAGIC_EYECAM_DIRECT && m_hMutex) {
+        else if (magic == EYECAM_MAGIC && m_hMutex) {
             DWORD waitRes = WaitForSingleObject(m_hMutex, 20);
             if (waitRes == WAIT_OBJECT_0) {
-                auto* header = reinterpret_cast<const TripleBufferShmHeader*>(m_pSharedBuf);
-                if (header->isConnected == 1) {
-                    const uint8_t* srcData = reinterpret_cast<const uint8_t*>(m_pSharedBuf) + sizeof(TripleBufferShmHeader);
-                    size_t copyBytes = bufferSize;
+                auto* header = reinterpret_cast<const SharedMemoryHeader*>(m_pSharedBuf);
+                if (header->isConnected == 1 && header->dataSize > 0) {
+                    const uint8_t* srcData = reinterpret_cast<const uint8_t*>(m_pSharedBuf) + sizeof(SharedMemoryHeader);
+                    size_t copyBytes = (header->dataSize < bufferSize) ? header->dataSize : bufferSize;
                     std::memcpy(pBuffer, srcData, copyBytes);
                     frameRendered = true;
                 }
@@ -533,46 +659,166 @@ void EyeCamOutputPin::FillSampleBuffer(BYTE* pBuffer, size_t bufferSize) {
                 pBuffer[i + 3] = 128; // V
             }
         } else {
-            // NV12 шаблон сірого
-            size_t ySize = bufferSize * 2 / 3;
-            std::memset(pBuffer, 128, ySize);
-            std::memset(pBuffer + ySize, 128, bufferSize - ySize);
+            // RGB24: темно-сірий фон
+            std::memset(pBuffer, 40, bufferSize);
         }
     }
 }
 
-// ==============================================================================
-// Реалізація EyeCamCaptureFilter
-// ==============================================================================
+// ----------------------------------------------------------------------------
+// CEnumMediaTypes Реалізація
+// ----------------------------------------------------------------------------
 
-EyeCamCaptureFilter::EyeCamCaptureFilter(LPUNKNOWN pUnk, HRESULT* phr)
-    : CBaseFilter(NAME("EyeCam Virtual Camera"), pUnk, &m_lock, CLSID_EyeCamVirtualCamera) {
-    m_pPin = new EyeCamOutputPin(this, &m_lock, phr);
-    if (!m_pPin && phr) {
-        *phr = E_OUTOFMEMORY;
+STDMETHODIMP CEnumMediaTypes::Next(ULONG cMediaTypes, AM_MEDIA_TYPE** ppMediaTypes, ULONG* pcFetched) {
+    if (!ppMediaTypes) return E_POINTER;
+    ULONG count = 0;
+
+    while (count < cMediaTypes && m_index < static_cast<ULONG>(g_PresetCount)) {
+        ppMediaTypes[count] = static_cast<AM_MEDIA_TYPE*>(CoTaskMemAlloc(sizeof(AM_MEDIA_TYPE)));
+        if (!ppMediaTypes[count]) break;
+
+        const auto& preset = g_Presets[m_index];
+        PixelFormat fmt = (preset.subtype == MEDIASUBTYPE_YUY2) ? PixelFormat::YUY2 : PixelFormat::RGB24;
+        
+        // Використовуємо метод створення типу піна
+        AM_MEDIA_TYPE tmp{};
+        // Виклик CreateDefaultMediaType через збережений пін або локально
+        std::memset(&tmp, 0, sizeof(AM_MEDIA_TYPE));
+        tmp.majortype = MEDIATYPE_Video;
+        tmp.subtype = preset.subtype;
+        tmp.bFixedSizeSamples = TRUE;
+        tmp.bTemporalCompression = FALSE;
+        tmp.lSampleSize = static_cast<ULONG>(CalculateFrameSize(preset.width, preset.height, fmt));
+        tmp.formattype = FORMAT_VideoInfo;
+
+        auto* vih = static_cast<VIDEOINFOHEADER*>(CoTaskMemAlloc(sizeof(VIDEOINFOHEADER)));
+        if (vih) {
+            std::memset(vih, 0, sizeof(VIDEOINFOHEADER));
+            vih->rcSource = {0, 0, static_cast<LONG>(preset.width), static_cast<LONG>(preset.height)};
+            vih->rcTarget = vih->rcSource;
+            vih->AvgTimePerFrame = 10000000LL / preset.fps;
+
+            BITMAPINFOHEADER& bih = vih->bmiHeader;
+            bih.biSize = sizeof(BITMAPINFOHEADER);
+            bih.biWidth = preset.width;
+            bih.biHeight = preset.height;
+            bih.biPlanes = 1;
+            bih.biBitCount = (fmt == PixelFormat::YUY2) ? 16 : 24;
+            bih.biCompression = (fmt == PixelFormat::YUY2) ? MAKEFOURCC('Y','U','Y','2') : BI_RGB;
+            bih.biSizeImage = tmp.lSampleSize;
+
+            tmp.cbFormat = sizeof(VIDEOINFOHEADER);
+            tmp.pbFormat = reinterpret_cast<BYTE*>(vih);
+        }
+
+        *ppMediaTypes[count] = tmp;
+        count++;
+        m_index++;
     }
+
+    if (pcFetched) *pcFetched = count;
+    return (count == cMediaTypes) ? S_OK : S_FALSE;
+}
+
+// ----------------------------------------------------------------------------
+// EyeCamCaptureFilter Реалізація
+// ----------------------------------------------------------------------------
+
+EyeCamCaptureFilter::EyeCamCaptureFilter() {
+    m_pPin = new EyeCamOutputPin(this);
 }
 
 EyeCamCaptureFilter::~EyeCamCaptureFilter() {
-    delete m_pPin;
-    m_pPin = nullptr;
-}
-
-CUnknown* WINAPI EyeCamCaptureFilter::CreateInstance(LPUNKNOWN pUnk, HRESULT* phr) {
-    EyeCamCaptureFilter* pFilter = new EyeCamCaptureFilter(pUnk, phr);
-    if (!pFilter && phr) {
-        *phr = E_OUTOFMEMORY;
+    if (m_pPin) {
+        m_pPin->Release();
+        m_pPin = nullptr;
     }
-    return pFilter;
+    if (m_pClock) {
+        m_pClock->Release();
+        m_pClock = nullptr;
+    }
 }
 
-int EyeCamCaptureFilter::GetPinCount() {
-    return 1;
+STDMETHODIMP EyeCamCaptureFilter::QueryInterface(REFIID riid, void** ppv) {
+    if (!ppv) return E_POINTER;
+
+    if (riid == IID_IUnknown || riid == IID_IBaseFilter || riid == IID_IMediaFilter) {
+        *ppv = static_cast<IBaseFilter*>(this);
+    } else if (riid == IID_IPersist) {
+        *ppv = static_cast<IPersist*>(this);
+    } else {
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    AddRef();
+    return S_OK;
 }
 
-CBasePin* EyeCamCaptureFilter::GetPin(int n) {
-    if (n == 0) return m_pPin;
-    return nullptr;
+STDMETHODIMP_(ULONG) EyeCamCaptureFilter::AddRef() {
+    return ++m_refCount;
+}
+
+STDMETHODIMP_(ULONG) EyeCamCaptureFilter::Release() {
+    ULONG count = --m_refCount;
+    if (count == 0) delete this;
+    return count;
+}
+
+STDMETHODIMP EyeCamCaptureFilter::GetClassID(CLSID* pClassID) {
+    if (!pClassID) return E_POINTER;
+    *pClassID = CLSID_EyeCamFilter;
+    return S_OK;
+}
+
+STDMETHODIMP EyeCamCaptureFilter::Stop() {
+    std::lock_guard<std::mutex> lock(m_filterLock);
+    m_state = State_Stopped;
+    if (m_pPin) {
+        m_pPin->Inactive();
+    }
+    return S_OK;
+}
+
+STDMETHODIMP EyeCamCaptureFilter::Pause() {
+    std::lock_guard<std::mutex> lock(m_filterLock);
+    m_state = State_Paused;
+    if (m_pPin) {
+        m_pPin->Active();
+    }
+    return S_OK;
+}
+
+STDMETHODIMP EyeCamCaptureFilter::Run(REFERENCE_TIME tStart) {
+    (void)tStart;
+    std::lock_guard<std::mutex> lock(m_filterLock);
+    m_state = State_Running;
+    if (m_pPin) {
+        m_pPin->Active();
+    }
+    return S_OK;
+}
+
+STDMETHODIMP EyeCamCaptureFilter::GetState(DWORD dwMilliSecsTimeout, FILTER_STATE* State) {
+    (void)dwMilliSecsTimeout;
+    if (!State) return E_POINTER;
+    *State = m_state;
+    return S_OK;
+}
+
+STDMETHODIMP EyeCamCaptureFilter::SetSyncSource(IReferenceClock* pClock) {
+    std::lock_guard<std::mutex> lock(m_filterLock);
+    if (m_pClock) m_pClock->Release();
+    m_pClock = pClock;
+    if (m_pClock) m_pClock->AddRef();
+    return S_OK;
+}
+
+STDMETHODIMP EyeCamCaptureFilter::GetSyncSource(IReferenceClock** pClock) {
+    if (!pClock) return E_POINTER;
+    *pClock = m_pClock;
+    if (*pClock) (*pClock)->AddRef();
+    return S_OK;
 }
 
 STDMETHODIMP EyeCamCaptureFilter::EnumPins(IEnumPins** ppEnum) {
@@ -592,6 +838,30 @@ STDMETHODIMP EyeCamCaptureFilter::FindPin(LPCWSTR Id, IPin** ppPin) {
     return VFW_E_NOT_FOUND;
 }
 
-} // namespace EyeCam
+STDMETHODIMP EyeCamCaptureFilter::QueryFilterInfo(FILTER_INFO* pInfo) {
+    if (!pInfo) return E_POINTER;
+    pInfo->pGraph = m_pGraph;
+    if (m_pGraph) m_pGraph->AddRef();
+    wcsncpy_s(pInfo->achName, m_filterName.c_str(), _TRUNCATE);
+    return S_OK;
+}
 
-#endif // _WIN32
+STDMETHODIMP EyeCamCaptureFilter::JoinFilterGraph(IFilterGraph* pGraph, LPCWSTR pName) {
+    std::lock_guard<std::mutex> lock(m_filterLock);
+    m_pGraph = pGraph; // Без AddRef для запобігання циклічним посиланням у DirectShow
+    m_filterName = (pName != nullptr) ? pName : L"";
+    return S_OK;
+}
+
+STDMETHODIMP EyeCamCaptureFilter::QueryVendorInfo(LPWSTR* pVendorInfo) {
+    if (!pVendorInfo) return E_POINTER;
+    const wchar_t* vendor = L"EyeCam Virtual Devices";
+    size_t len = (wcslen(vendor) + 1) * sizeof(wchar_t);
+    *pVendorInfo = static_cast<LPWSTR>(CoTaskMemAlloc(len));
+    if (!*pVendorInfo) return E_OUTOFMEMORY;
+    std::memcpy(*pVendorInfo, vendor, len);
+    return S_OK;
+}
+
+} // namespace EyeCam
+#endif

@@ -404,8 +404,11 @@ class CameraStreamService : Service() {
 
     fun switchSensor(sensorId: String) {
         val target = _uiState.value.availableSensors.find { it.id == sensorId }
-            ?: CameraSensorInfo(id = sensorId, isLogical = false, physicalCameraIds = emptySet(), sensorType = com.eyecam.model.SensorType.WIDE, lensFacing = android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK, focalLengths = floatArrayOf(24f), minFocusDistance = 0f, isoRange = 100..3200, exposureTimeRangeNs = 100000L..1000000000L)
-        switchSensor(target)
+        if (target != null) {
+            switchSensor(target)
+        } else {
+            cameraController.switchToSensor(sensorId)
+        }
     }
 
     fun setDisplayProtection(active: Boolean) {

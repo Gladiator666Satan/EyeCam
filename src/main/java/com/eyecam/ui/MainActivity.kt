@@ -104,20 +104,25 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun configureImmersiveMode() {
-        WindowCompat.setDecorFitsSystemWindows(window, false)
-        val controller = WindowCompat.getInsetsController(window, window.decorView)
-        controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-        controller.hide(WindowInsetsCompat.Type.systemBars())
-    }
-
-    private fun applyDisplayBrightness(isDisplayProtectionActive: Boolean) {
+    private fun applyDisplayBrightness(isDimmed: Boolean) {
         val layoutParams = window.attributes
-        layoutParams.screenBrightness = if (isDisplayProtectionActive) {
+        layoutParams.screenBrightness = if (isDimmed) {
             0.01f
         } else {
             WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
         }
         window.attributes = layoutParams
+    }
+
+    private fun configureImmersiveMode() {
+        val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
+        windowInsetsController.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        windowInsetsController.hide(WindowInsetsCompat.Type.systemBars())
+    }
+
+    override fun onUserInteraction() {
+        super.onUserInteraction()
+        viewModel.onUserInteraction()
     }
 }
