@@ -10,13 +10,10 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -40,9 +37,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.eyecam.model.CameraSensorInfo
 import com.eyecam.model.ConnectionType
-import com.eyecam.model.SensorType
 import com.eyecam.model.StreamUiState
 import com.eyecam.model.ThermalState
 import com.eyecam.ui.theme.OledBorder
@@ -55,18 +50,20 @@ import com.eyecam.ui.theme.StatusEmerald
 import com.eyecam.ui.theme.TextDimmed
 import com.eyecam.ui.theme.TextPrimary
 import com.eyecam.ui.theme.TextSecondary
+import kotlin.math.abs
 
 /**
  * Мінімалістичний плаваючий інтерфейс (HUD) швидкого керування трансляцією.
- * Оптимізований для OLED дисплеїв: темний фон, відсутність яскравих фонових площин,
- * збереження ресурсів акумулятора та захист від вигорання субпікселів.
+ * Автоматично підлаштовує кнопки зуму (0.5x, 1x, 2x, 3x, 5x, 10x) під можливості смартфона
+ * (наприклад, Samsung Galaxy S26 Ultra).
  */
 @Composable
 fun QuickToggleHud(
     uiState: StreamUiState,
     onToggleStream: () -> Unit,
     onToggleMicMute: () -> Unit,
-    onSwitchSensor: (CameraSensorInfo) -> Unit,
+    onSelectZoom: (Float) -> Unit,
+    onSelectFrontCamera: () -> Unit,
     onActivateDisplayProtection: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -75,20 +72,22 @@ fun QuickToggleHud(
             .fillMaxSize()
             .padding(16.dp)
     ) {
-        // ВЕРХНІЙ РЯДОК СТАТУСУ (Підключення, Температура, Батарея)
+        // ВЕРХНІЙ РЯДОК СТАТУСУ (Підключення USB/Wi-Fi + IP, Температура)
         TopStatusBar(
             uiState = uiState,
             modifier = Modifier.align(Alignment.TopCenter)
         )
 
-        // БОКОВИЙ / ЦЕНТРАЛЬНИЙ СЕЛЕКТОР ОБ'ЄКТИВІВ (0.5x, 1x, 3x, FRONT)
-        SensorSelectorBar(
-            sensors = uiState.availableSensors,
-            activeSensor = uiState.activeSensor,
-            onSelect = onSwitchSensor,
+        // БОКОВИЙ СЕЛЕКТОР ЗУМУ ТА КАМЕР (0.5x, 1x, 2x, 3x, 5x, 10x, SELF)
+        DynamicZoomSelectorBar(
+            supportedZooms = uiState.supportedZoomPresets,
+            currentZoom = uiState.currentZoomRatio,
+            isFrontCamera = uiState.isFrontCamera,
+            onSelectZoom = onSelectZoom,
+            onSelectFront = onSelectFrontCamera,
             modifier = Modifier
                 .align(Alignment.CenterEnd)
-                .padding(end = 8.dp)
+                .padding(end = 4.dp)
         )
 
         // НИЖНІЙ БЛОК: Телеметрія + Плаваючі кнопки дій
@@ -99,10 +98,8 @@ fun QuickToggleHud(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // Телеметрія (FPS, Bitrate, Роздільна здатність)
             StreamTelemetryBar(uiState = uiState)
 
-            // Панель швидких перемикачів (Mute, Stream, Sleep)
             FloatingActionControls(
                 isStreaming = uiState.isStreaming,
                 isMicMuted = uiState.isMicMuted,
@@ -114,9 +111,6 @@ fun QuickToggleHud(
     }
 }
 
-/**
- * Верхній бар статусу підключення та термального стану.
- */
 @Composable
 private fun TopStatusBar(
     uiState: StreamUiState,
@@ -129,13 +123,11 @@ private fun TopStatusBar(
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // Індикатор типу з'єднання (USB / Wi-Fi)
         ConnectionPill(
             type = uiState.telemetry.connectionType,
             details = uiState.telemetry.connectionDetails
         )
 
-        // Індикатор термального стану (Thermal Throttling)
         ThermalStatusPill(thermalState = uiState.telemetry.thermalState)
     }
 }
@@ -145,29 +137,35 @@ private fun ConnectionPill(
     type: ConnectionType,
     details: String
 ) {
-    val (icon, color, label) = when (type) {
-        ConnectionType.USB -> Triple(Icons.Default.Usb, StatusEmerald, "USB НАПРЯМУ")
+    val (icon, color, defaultLabel) = when (type) {
+        ConnectionType.USB -> Triple(Icons.Default.Usb, StatusEmerald, "USB ПІДКЛЮЧЕНО")
         ConnectionType.WIFI -> Triple(Icons.Default.Wifi, StatusCyan, "WI-FI LAN")
         ConnectionType.NONE -> Triple(Icons.Default.Usb, TextDimmed, "ОФЛАЙН")
+    }
+
+    val displayText = if (details.isNotBlank() && details != "Очікування підключення...") {
+        details
+    } else {
+        defaultLabel
     }
 
     Row(
         modifier = Modifier
             .clip(RoundedCornerShape(20.dp))
             .background(OledPillBackground)
-            .border(1.dp, OledBorder, RoundedCornerShape(20.dp))
+            .border(1.dp, if (type != ConnectionType.NONE) color.copy(alpha = 0.5f) else OledBorder, RoundedCornerShape(20.dp))
             .padding(horizontal = 12.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp)
     ) {
         Icon(
             imageVector = icon,
-            contentDescription = label,
+            contentDescription = displayText,
             tint = color,
             modifier = Modifier.size(16.dp)
         )
         Text(
-            text = label,
+            text = displayText,
             fontSize = 11.sp,
             fontWeight = FontWeight.Bold,
             color = color,
@@ -215,13 +213,16 @@ private fun ThermalStatusPill(
 }
 
 /**
- * Вертикальний перемикач активних об'єктивів (0.5x, 1x, 3x, FRONT).
+ * Вертикальний перемикач зуму та камер, що адаптується до апаратних можливостей телефону
+ * (наприклад: 0.5x, 1x, 2x, 3x, 5x, 10x, SELF на Samsung Galaxy S26 Ultra).
  */
 @Composable
-private fun SensorSelectorBar(
-    sensors: List<CameraSensorInfo>,
-    activeSensor: CameraSensorInfo?,
-    onSelect: (CameraSensorInfo) -> Unit,
+private fun DynamicZoomSelectorBar(
+    supportedZooms: List<Float>,
+    currentZoom: Float,
+    isFrontCamera: Boolean,
+    onSelectZoom: (Float) -> Unit,
+    onSelectFront: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -230,42 +231,55 @@ private fun SensorSelectorBar(
             .background(OledPillBackground)
             .border(1.dp, OledBorder, RoundedCornerShape(28.dp))
             .padding(vertical = 8.dp, horizontal = 4.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        sensors.forEach { sensor ->
-            val isSelected = activeSensor?.id == sensor.id
-            val label = when (sensor.sensorType) {
-                SensorType.ULTRA_WIDE -> "0.5x"
-                SensorType.WIDE -> "1.0x"
-                SensorType.TELEPHOTO -> "3.0x"
-                SensorType.FRONT -> "SELF"
-                else -> sensor.id
+        supportedZooms.forEach { zoom ->
+            val isSelected = !isFrontCamera && abs(currentZoom - zoom) < 0.15f
+            val label = if (zoom < 1.0f) {
+                "0.5x"
+            } else {
+                "${zoom.toInt()}x"
             }
 
             Box(
                 modifier = Modifier
-                    .size(44.dp)
+                    .size(42.dp)
                     .clip(CircleShape)
                     .background(if (isSelected) StatusEmerald else Color.Transparent)
-                    .clickable { onSelect(sensor) },
+                    .clickable { onSelectZoom(zoom) },
                 contentAlignment = Alignment.Center
             ) {
                 Text(
                     text = label,
-                    fontSize = 12.sp,
+                    fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
                     color = if (isSelected) Color.Black else TextSecondary,
                     fontFamily = FontFamily.Monospace
                 )
             }
         }
+
+        // Кнопка фронтальної камери (SELF)
+        Box(
+            modifier = Modifier
+                .size(42.dp)
+                .clip(CircleShape)
+                .background(if (isFrontCamera) StatusCyan else Color.Transparent)
+                .clickable { onSelectFront() },
+                contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = "SELF",
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                color = if (isFrontCamera) Color.Black else TextSecondary,
+                fontFamily = FontFamily.Monospace
+            )
+        }
     }
 }
 
-/**
- * Рядок з реальними показниками бітрейту, FPS та роздільної здатності.
- */
 @Composable
 private fun StreamTelemetryBar(
     uiState: StreamUiState,
@@ -290,8 +304,8 @@ private fun StreamTelemetryBar(
                 value = "${uiState.telemetry.fps}/${uiState.telemetry.targetFps}"
             )
             TelemetryItem(
-                label = "БІТРЕЙТ",
-                value = "${uiState.telemetry.bitrateKbps / 1000} Мбіт/с"
+                label = "ЗУМ",
+                value = if (uiState.isFrontCamera) "FRONT" else "${uiState.currentZoomRatio}x"
             )
             TelemetryItem(
                 label = "ЯКІСТЬ",
@@ -315,9 +329,6 @@ private fun TelemetryItem(label: String, value: String) {
     }
 }
 
-/**
- * Плаваючі кнопки дій у нижній частині екрана.
- */
 @Composable
 private fun FloatingActionControls(
     isStreaming: Boolean,
@@ -335,7 +346,6 @@ private fun FloatingActionControls(
         horizontalArrangement = Arrangement.spacedBy(24.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // Кнопка Mute / Unmute мікрофона
         IconButton(
             onClick = onToggleMicMute,
             modifier = Modifier
@@ -351,7 +361,6 @@ private fun FloatingActionControls(
             )
         }
 
-        // Головна кнопка Старт / Стоп стріму
         Box(
             modifier = Modifier
                 .size(64.dp)
@@ -368,7 +377,6 @@ private fun FloatingActionControls(
             )
         }
 
-        // Кнопка миттєвого блокування / Display Protection Mode
         IconButton(
             onClick = onActivateDisplayProtection,
             modifier = Modifier

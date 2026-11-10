@@ -1,11 +1,14 @@
 package com.eyecam.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
@@ -13,6 +16,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -23,29 +27,36 @@ import com.eyecam.viewmodel.StreamViewModel
 /**
  * Головна Activity додатку EyeCam.
  * Відповідає за:
- * - Повноекранний Immersive режим (приховування системних панелей).
+ * - Запит дозволів CAMERA, RECORD_AUDIO та POST_NOTIFICATIONS при запуску (запобігає падінню на Android 14/15/16).
+ * - Повноекранний Immersive режим.
  * - Утримання екрана активним під час стрімінгу (FLAG_KEEP_SCREEN_ON).
- * - Апаратне регулювання яскравості екрана для режиму Display Protection Mode (OLED Blackout).
  */
 class MainActivity : ComponentActivity() {
 
     private val viewModel: StreamViewModel by viewModels()
 
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { results ->
+        val cameraGranted = results[Manifest.permission.CAMERA] == true ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        if (cameraGranted) {
+            viewModel.onPermissionsGranted()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        // Утримуємо екран активним, щоб система не блокувала пристрій під час відеосесії
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
-        // Приховуємо навігаційний та статус-бари для імерсивного OLED-досвіду
         configureImmersiveMode()
+        requestRequiredPermissionsIfNeeded()
 
         setContent {
             EyeCamTheme {
                 val uiState by viewModel.uiState.collectAsState()
 
-                // Апаратне керування яскравістю під час переходу в режим захисту
                 LaunchedEffect(uiState.isDisplayProtectionActive) {
                     applyDisplayBrightness(uiState.isDisplayProtectionActive)
                 }
@@ -54,30 +65,44 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = OledPureBlack
                 ) {
-                    EyeCamScreen(viewModel = viewModel)
+                    EyeCamScreen(
+                        viewModel = viewModel,
+                        onRequestPermissions = { requestRequiredPermissionsIfNeeded() }
+                    )
                 }
             }
         }
     }
 
-    /**
-     * Динамічне регулювання яскравості підсвітки екрана:
-     * Коли активний захист — знижуємо яскравість до абсолютного мінімуму (0.01f),
-     * що суттєво мінімізує тепловиділення та розряд акумулятора.
-     */
+    private fun requestRequiredPermissionsIfNeeded() {
+        val perms = mutableListOf(
+            Manifest.permission.CAMERA,
+            Manifest.permission.RECORD_AUDIO
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            perms.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
+        val missing = perms.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isNotEmpty()) {
+            permissionLauncher.launch(missing.toTypedArray())
+        } else {
+            viewModel.onPermissionsGranted()
+        }
+    }
+
     private fun applyDisplayBrightness(isDimmed: Boolean) {
         val layoutParams = window.attributes
         layoutParams.screenBrightness = if (isDimmed) {
-            0.01f // Мінімальна апаратна яскравість
+            0.01f
         } else {
-            WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE // Повернення системної яскравості
+            WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
         }
         window.attributes = layoutParams
     }
 
-    /**
-     * Конфігурація повноекранного режиму з приховуванням жестів та барів.
-     */
     private fun configureImmersiveMode() {
         val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
         windowInsetsController.systemBarsBehavior =

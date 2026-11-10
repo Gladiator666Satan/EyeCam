@@ -16,12 +16,13 @@ import com.eyecam.ui.theme.OledPureBlack
 import com.eyecam.viewmodel.StreamViewModel
 
 /**
- * Головний екран програми EyeCam, що поєднує попередній перегляд камери,
- * плаваючий HUD з перемикачами та оверлей захисту OLED екрана.
+ * Головний екран програми EyeCam, що поєднує живий попередній перегляд камери,
+ * плаваючий HUD з перемикачами зуму (до 10x) та оверлей захисту OLED екрана.
  */
 @Composable
 fun EyeCamScreen(
     viewModel: StreamViewModel,
+    onRequestPermissions: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val uiState by viewModel.uiState.collectAsState()
@@ -30,7 +31,6 @@ fun EyeCamScreen(
         modifier = modifier
             .fillMaxSize()
             .background(OledPureBlack)
-            // Будь-яка взаємодія користувача скидає таймер до авто-затемнення екрана
             .pointerInput(uiState.isDisplayProtectionActive) {
                 if (!uiState.isDisplayProtectionActive) {
                     detectTapGestures(
@@ -41,19 +41,23 @@ fun EyeCamScreen(
                 }
             }
     ) {
-        // Шар 1: Прев'ю камери (автоматично відключається при активному захисті для збереження енергії)
+        // Шар 1: Живе прев'ю камери з підключенням SurfaceHolder до CameraController
         CameraPreview(
             isStreaming = uiState.isStreaming,
-            isDisplayProtectionActive = uiState.isDisplayProtectionActive
+            hasCameraPermission = uiState.hasCameraPermission,
+            isDisplayProtectionActive = uiState.isDisplayProtectionActive,
+            onSurfaceChanged = { surface -> viewModel.attachPreviewSurface(surface) },
+            onRequestPermissions = onRequestPermissions
         )
 
         // Шар 2: Швидкі перемикачі HUD (видимі, коли захист екрану вимкнено)
         if (!uiState.isDisplayProtectionActive) {
             QuickToggleHud(
                 uiState = uiState,
-                onToggleStream = { viewModel.toggleStreaming() },
+                onToggleStream = { viewModel.toggleStreaming(onPermissionMissing = onRequestPermissions) },
                 onToggleMicMute = { viewModel.toggleMicMute() },
-                onSwitchSensor = { sensor -> viewModel.switchSensor(sensor) },
+                onSelectZoom = { zoom -> viewModel.setZoomRatio(zoom) },
+                onSelectFrontCamera = { viewModel.setFrontCamera(true) },
                 onActivateDisplayProtection = { viewModel.activateDisplayProtection() }
             )
         }
