@@ -8,7 +8,8 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <windowsx.h>
-#include <ole2.h>
+#include <objbase.h>
+#include <wincodec.h>
 #include <shlwapi.h>
 #include <dwmapi.h>
 #include <shellapi.h>
@@ -27,17 +28,13 @@
 #include <thread>
 #include <vector>
 
-using std::min;
-using std::max;
-#include <gdiplus.h>
-
 #include "WindowsDirectShowSink.hpp"
 #include "SharedMemoryProtocol.hpp"
 
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "dwmapi.lib")
-#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "shell32.lib")
@@ -397,9 +394,7 @@ public:
     bool Initialize(HINSTANCE hInstance, int nCmdShow) {
         WSADATA wsaData{};
         WSAStartup(MAKEWORD(2, 2), &wsaData);
-
-        Gdiplus::GdiplusStartupInput gdiplusStartupInput;
-        Gdiplus::GdiplusStartup(&m_gdiplusToken, &gdiplusStartupInput, nullptr);
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
         HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &m_pD2DFactory);
         if (FAILED(hr)) return false;
@@ -413,9 +408,8 @@ public:
 
         CreateTextFormats();
 
-        // Завантаження іконки ноутбука з оком та бліком об'єктива (ресурс ID 101)
-        HICON hAppIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(101));
-        if (!hAppIcon) hAppIcon = LoadIconW(nullptr, IDI_APPLICATION);
+        // Завантаження фірмової іконки ноутбука з оком та бліком об'єктива (eyecam_pc.ico)
+        HICON hAppIcon = LoadCustomStudioIcon(hInstance);
 
         WNDCLASSEXW wc{};
         wc.cbSize = sizeof(WNDCLASSEXW);
@@ -537,11 +531,35 @@ private:
         if (m_pFontMono) { m_pFontMono->Release(); m_pFontMono = nullptr; }
         if (m_pDWriteFactory) { m_pDWriteFactory->Release(); m_pDWriteFactory = nullptr; }
         if (m_pD2DFactory) { m_pD2DFactory->Release(); m_pD2DFactory = nullptr; }
-        if (m_gdiplusToken) {
-            Gdiplus::GdiplusShutdown(m_gdiplusToken);
-            m_gdiplusToken = 0;
-        }
+        CoUninitialize();
         WSACleanup();
+    }
+
+    static HICON LoadCustomStudioIcon(HINSTANCE hInstance) {
+        wchar_t exePath[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        std::wstring dirPath(exePath);
+        size_t pos = dirPath.find_last_of(L"\\/");
+        if (pos != std::wstring::npos) {
+            dirPath = dirPath.substr(0, pos);
+        }
+
+        std::wstring ico1 = dirPath + L"\\eyecam_pc.ico";
+        HICON hIco = static_cast<HICON>(LoadImageW(
+            nullptr, ico1.c_str(), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE
+        ));
+        if (hIco) return hIco;
+
+        std::wstring ico2 = dirPath + L"\\..\\..\\src\\windows\\gui\\eyecam_pc.ico";
+        hIco = static_cast<HICON>(LoadImageW(
+            nullptr, ico2.c_str(), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE
+        ));
+        if (hIco) return hIco;
+
+        hIco = LoadIconW(hInstance, MAKEINTRESOURCEW(101));
+        if (hIco) return hIco;
+
+        return LoadIconW(nullptr, IDI_APPLICATION);
     }
 
     void CloseActivePhoneSocket() {
@@ -602,6 +620,15 @@ private:
 
     // Постійний клієнтський потік прийому живого відео та метаданих зі смартфона (USB ADB або Wi-Fi LAN)
     void PhoneStreamClientLoop() {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        IWICImagingFactory* pWicFactory = nullptr;
+        CoCreateInstance(
+            CLSID_WICImagingFactory,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&pWicFactory)
+        );
+
         auto lastStatTime = std::chrono::steady_clock::now();
         uint64_t bytesWindow = 0;
         uint32_t framesWindow = 0;
@@ -683,7 +710,7 @@ private:
 
                 if (msgType == 7 && !payload.empty()) {
                     // MSG_TYPE_VIDEO_FRAME = 7 (Живий JPEG-кадр із камери смартфона)
-                    DecodeIncomingJpegFrame(payload.data(), payload.size());
+                    DecodeIncomingJpegFrame(pWicFactory, payload.data(), payload.size());
                     m_state.rxFrames++;
                     framesWindow++;
                 } else if (msgType == 1 && !payload.empty()) {
@@ -708,6 +735,11 @@ private:
             m_state.measuredBitrateKbps = 0;
             m_state.measuredFps = 0;
         }
+
+        if (pWicFactory) {
+            pWicFactory->Release();
+        }
+        CoUninitialize();
     }
 
     void ParseDeviceCapabilitiesJson(const std::string& json) {
@@ -726,56 +758,77 @@ private:
         }
     }
 
-    // Декодування живого JPEG-кадру зі смартфона у BGRA прев'ю та YUY2 буфер DirectShow віртуальної камери
-    void DecodeIncomingJpegFrame(const uint8_t* jpegData, size_t jpegLen) {
+    // Декодування живого JPEG-кадру зі смартфона через WIC у BGRA прев'ю та YUY2 буфер DirectShow віртуальної камери
+    void DecodeIncomingJpegFrame(IWICImagingFactory* pWicFactory, const uint8_t* jpegData, size_t jpegLen) {
+        if (!pWicFactory || !jpegData || jpegLen == 0) return;
+
         IStream* pStream = SHCreateMemStream(jpegData, static_cast<UINT>(jpegLen));
         if (!pStream) return;
 
-        Gdiplus::Bitmap* bmp = Gdiplus::Bitmap::FromStream(pStream);
-        if (bmp && bmp->GetLastStatus() == Gdiplus::Ok) {
-            const uint32_t pw = 640;
-            const uint32_t ph = 360;
+        IWICBitmapDecoder* pDecoder = nullptr;
+        HRESULT hr = pWicFactory->CreateDecoderFromStream(
+            pStream, nullptr, WICDecodeMetadataCacheOnDemand, &pDecoder
+        );
+        if (SUCCEEDED(hr) && pDecoder) {
+            IWICBitmapFrameDecode* pFrame = nullptr;
+            hr = pDecoder->GetFrame(0, &pFrame);
+            if (SUCCEEDED(hr) && pFrame) {
+                const uint32_t pw = 640;
+                const uint32_t ph = 360;
 
-            Gdiplus::Bitmap scaled(static_cast<INT>(pw), static_cast<INT>(ph), PixelFormat32bppARGB);
-            {
-                Gdiplus::Graphics g(&scaled);
-                g.SetInterpolationMode(Gdiplus::InterpolationModeBilinear);
-                g.DrawImage(bmp, 0, 0, static_cast<INT>(pw), static_cast<INT>(ph));
-            }
-
-            Gdiplus::Rect lockRect(0, 0, static_cast<INT>(pw), static_cast<INT>(ph));
-            Gdiplus::BitmapData bmpData{};
-            if (scaled.LockBits(&lockRect, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bmpData) == Gdiplus::Ok) {
-                std::vector<uint8_t> localPreview(pw * ph * 4);
-                for (uint32_t y = 0; y < ph; ++y) {
-                    const uint8_t* srcLine = static_cast<const uint8_t*>(bmpData.Scan0) +
-                                             static_cast<intptr_t>(y) * static_cast<intptr_t>(bmpData.Stride);
-                    uint8_t* dstLine = localPreview.data() + y * pw * 4;
-                    if (!m_state.mirrorHorizontal) {
-                        std::memcpy(dstLine, srcLine, pw * 4);
-                    } else {
-                        for (uint32_t x = 0; x < pw; ++x) {
-                            uint32_t sx = pw - 1 - x;
-                            dstLine[x * 4 + 0] = srcLine[sx * 4 + 0];
-                            dstLine[x * 4 + 1] = srcLine[sx * 4 + 1];
-                            dstLine[x * 4 + 2] = srcLine[sx * 4 + 2];
-                            dstLine[x * 4 + 3] = 255;
+                IWICBitmapScaler* pScaler = nullptr;
+                hr = pWicFactory->CreateBitmapScaler(&pScaler);
+                if (SUCCEEDED(hr) && pScaler) {
+                    hr = pScaler->Initialize(pFrame, pw, ph, WICBitmapInterpolationModeLinear);
+                    if (SUCCEEDED(hr)) {
+                        IWICFormatConverter* pConverter = nullptr;
+                        hr = pWicFactory->CreateFormatConverter(&pConverter);
+                        if (SUCCEEDED(hr) && pConverter) {
+                            hr = pConverter->Initialize(
+                                pScaler,
+                                GUID_WICPixelFormat32bppBGRA,
+                                WICBitmapDitherTypeNone,
+                                nullptr,
+                                0.0,
+                                WICBitmapPaletteTypeCustom
+                            );
+                            if (SUCCEEDED(hr)) {
+                                std::vector<uint8_t> localPreview(pw * ph * 4);
+                                hr = pConverter->CopyPixels(
+                                    nullptr,
+                                    pw * 4,
+                                    static_cast<UINT>(localPreview.size()),
+                                    localPreview.data()
+                                );
+                                if (SUCCEEDED(hr)) {
+                                    if (m_state.mirrorHorizontal) {
+                                        for (uint32_t y = 0; y < ph; ++y) {
+                                            uint8_t* row = localPreview.data() + y * pw * 4;
+                                            for (uint32_t x = 0; x < pw / 2; ++x) {
+                                                uint32_t rx = pw - 1 - x;
+                                                for (int c = 0; c < 4; ++c) {
+                                                    std::swap(row[x * 4 + c], row[rx * 4 + c]);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    {
+                                        std::lock_guard<std::mutex> lock(m_frameMutex);
+                                        m_previewPixels = std::move(localPreview);
+                                        m_hasLiveFrame = true;
+                                    }
+                                    PushFrameToDirectShow();
+                                }
+                            }
+                            pConverter->Release();
                         }
                     }
+                    pScaler->Release();
                 }
-                scaled.UnlockBits(&bmpData);
-
-                {
-                    std::lock_guard<std::mutex> lock(m_frameMutex);
-                    m_previewPixels = std::move(localPreview);
-                    m_hasLiveFrame = true;
-                }
-
-                // Запис кадру у спільну пам'ять віртуальної камери WindowsDirectShowSink (до 4K UHD)
-                PushFrameToDirectShow();
+                pFrame->Release();
             }
+            pDecoder->Release();
         }
-        delete bmp;
         pStream->Release();
     }
 
@@ -1592,7 +1645,6 @@ private:
 
 private:
     HWND m_hwnd = nullptr;
-    ULONG_PTR m_gdiplusToken = 0;
     ID2D1Factory* m_pD2DFactory = nullptr;
     IDWriteFactory* m_pDWriteFactory = nullptr;
     ID2D1HwndRenderTarget* m_pRenderTarget = nullptr;
