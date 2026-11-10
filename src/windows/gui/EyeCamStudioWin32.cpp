@@ -540,22 +540,22 @@ private:
             dirPath = dirPath.substr(0, pos);
         }
 
-        std::wstring ico1 = dirPath + L"\\eyecam_pc.ico";
+        std::wstring primaryIconPath = dirPath + L"\\eyecam_pc.ico";
         HICON hIco = static_cast<HICON>(LoadImageW(
-            nullptr, ico1.c_str(), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE
+            nullptr, primaryIconPath.c_str(), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE
         ));
         if (hIco) return hIco;
 
-        std::wstring ico2 = dirPath + L"\\..\\..\\src\\windows\\gui\\eyecam_pc.ico";
+        std::wstring fallbackIconPath = dirPath + L"\\..\\..\\src\\windows\\gui\\eyecam_pc.ico";
         hIco = static_cast<HICON>(LoadImageW(
-            nullptr, ico2.c_str(), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE
+            nullptr, fallbackIconPath.c_str(), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE
         ));
         if (hIco) return hIco;
 
         hIco = LoadIconW(hInstance, MAKEINTRESOURCEW(101));
         if (hIco) return hIco;
 
-        return LoadIconW(nullptr, IDI_APPLICATION);
+        return LoadIcon(nullptr, IDI_APPLICATION);
     }
 
     void CloseActivePhoneSocket() {
@@ -923,9 +923,6 @@ private:
         fmt->SetTextAlignment(align);
         fmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         m_pBrush->SetColor(color);
-#ifdef DrawText
-#undef DrawText
-#endif
         m_pRenderTarget->DrawText(
             text.c_str(),
             static_cast<UINT32>(text.size()),
