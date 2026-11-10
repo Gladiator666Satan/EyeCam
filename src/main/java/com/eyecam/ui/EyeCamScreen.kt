@@ -46,6 +46,8 @@ fun EyeCamScreen(
             isStreaming = uiState.isStreaming,
             hasCameraPermission = uiState.hasCameraPermission,
             isDisplayProtectionActive = uiState.isDisplayProtectionActive,
+            streamWidth = uiState.telemetry.resolutionWidth,
+            streamHeight = uiState.telemetry.resolutionHeight,
             onSurfaceChanged = { surface -> viewModel.attachPreviewSurface(surface) },
             onFocusPointTapped = { x, y -> viewModel.triggerFocusAtPoint(x, y) },
             onRequestPermissions = onRequestPermissions
@@ -57,7 +59,12 @@ fun EyeCamScreen(
                 uiState = uiState,
                 onToggleStream = { viewModel.toggleStreaming(onPermissionMissing = onRequestPermissions) },
                 onToggleMicMute = { viewModel.toggleMicMute() },
-                onSelectZoom = { zoom -> viewModel.setZoomRatio(zoom) },
+                onSelectZoom = { zoom ->
+                    if (uiState.isFrontCamera) {
+                        viewModel.setFrontCamera(false)
+                    }
+                    viewModel.setZoomRatio(zoom)
+                },
                 onSelectFrontCamera = { viewModel.setFrontCamera(true) },
                 onTriggerAutoFocus = { viewModel.triggerAutoFocus() },
                 onActivateDisplayProtection = { viewModel.activateDisplayProtection() }

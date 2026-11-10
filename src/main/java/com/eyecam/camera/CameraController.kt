@@ -34,9 +34,6 @@ class CameraController(private val context: Context) {
 
     companion object {
         private const val TAG = "CameraController"
-        private val IDENTITY_COLOR_TRANSFORM = ColorSpaceTransform(
-            intArrayOf(1, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 1, 0, 1, 1, 1)
-        )
     }
 
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -554,51 +551,89 @@ class CameraController(private val context: Context) {
     }
 
     fun setZoomRatio(zoomRatio: Float) {
-        val clamped = zoomRatio.coerceIn(minZoomRatio, maxZoomRatio)
-        currentZoomRatio = clamped
-
-        // Автоматичне перемикання фізичних модулів (0.5x Ultra-Wide, 1x Wide, 3x Tele, 5x/10x Periscope)
-        if (!isFrontCameraActive) {
-            val targetModuleId = when {
-                clamped < 1.0f && ultraWideCameraId != null -> ultraWideCameraId
-                clamped in 1.0f..2.99f -> mainWideCameraId
-                clamped in 3.0f..4.99f && telephotoCameraId != null -> telephotoCameraId
-                clamped >= 5.0f && periscopeCameraId != null -> periscopeCameraId
-                else -> mainWideCameraId
+        if (isFrontCameraActive) {
+            val chars = currentSensorCharacteristics
+            val maxDigZoom = chars?.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 4.0f
+            val clamped = zoomRatio.coerceIn(1.0f, maxDigZoom)
+            currentZoomRatio = clamped
+            val session = captureSession ?: return
+            val builder = previewRequestBuilder ?: return
+            val handler = cameraHandler ?: return
+            try {
+                applyZoomToBuilder(builder, clamped)
+                session.setRepeatingRequest(builder.build(), null, handler)
+                Log.i(TAG, "Applied front camera digital zoom: ${clamped}x")
+            } catch (e: Exception) {
+                Log.e(TAG, "Error setting front zoom", e)
             }
-
-            if (targetModuleId != null && targetModuleId != activeLogicalCameraId) {
-                val baseZoom = when (targetModuleId) {
-                    ultraWideCameraId -> 1.0f
-                    mainWideCameraId -> clamped
-                    telephotoCameraId -> (clamped / 3.0f).coerceAtLeast(1.0f)
-                    periscopeCameraId -> (clamped / 5.0f).coerceAtLeast(1.0f)
-                    else -> clamped
-                }
-                switchCameraModule(targetModuleId, baseZoom)
-                return
-            }
-        } else if (clamped > 1.0f) {
-            switchFrontBack(false)
             return
         }
 
-        val session = captureSession ?: return
-        val builder = previewRequestBuilder ?: return
-        val handler = cameraHandler ?: return
+        // Тилова камера: 0.5x, 1x, 2x, 3x, 5x, 10x
+        val clamped = zoomRatio.coerceIn(minZoomRatio, maxZoomRatio)
+        currentZoomRatio = clamped
 
-        try {
-            applyZoomToBuilder(builder, clamped)
-            session.setRepeatingRequest(builder.build(), null, handler)
-            Log.i(TAG, "Applied zoom ratio: ${clamped}x on camera $activeLogicalCameraId")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error setting zoom ratio", e)
+        // Перевіряємо, чи підтримує активна логічна камера (id "0" на Samsung Galaxy S26 Ultra)
+        // плавний зум через CONTROL_ZOOM_RATIO_RANGE (включаючи оптичне перемикання лінз на рівні HAL)
+        val chars = currentSensorCharacteristics
+        val zoomRange = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            chars?.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+        } else null
+
+        val isLogicalRear = (activeLogicalCameraId == backCameraId || activeLogicalCameraId == mainWideCameraId || activeLogicalCameraId == "0")
+
+        if (isLogicalRear && (zoomRange == null || (clamped >= zoomRange.lower - 0.05f && clamped <= zoomRange.upper + 0.05f))) {
+            val session = captureSession ?: return
+            val builder = previewRequestBuilder ?: return
+            val handler = cameraHandler ?: return
+
+            try {
+                applyZoomToBuilder(builder, clamped)
+                session.setRepeatingRequest(builder.build(), null, handler)
+                Log.i(TAG, "Applied zoom ratio: ${clamped}x on rear logical camera $activeLogicalCameraId")
+            } catch (e: Exception) {
+                Log.e(TAG, "Error applying zoom ratio on rear camera", e)
+            }
+            return
+        }
+
+        // Якщо ultra-wide є окремою незалежною камерою в cameraIdList (а не суб-камерою):
+        val targetModuleId = if (clamped < 1.0f && ultraWideCameraId != null && cameraManager.cameraIdList.contains(ultraWideCameraId)) {
+            ultraWideCameraId
+        } else {
+            backCameraId
+        }
+
+        if (targetModuleId != null && targetModuleId != activeLogicalCameraId) {
+            openCamera(
+                logicalCameraId = targetModuleId,
+                previewSurface = previewSurface,
+                encoderSurface = encoderSurface
+            )
+        } else {
+            val session = captureSession ?: return
+            val builder = previewRequestBuilder ?: return
+            val handler = cameraHandler ?: return
+            try {
+                applyZoomToBuilder(builder, clamped)
+                session.setRepeatingRequest(builder.build(), null, handler)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error setting zoom ratio fallback", e)
+            }
         }
     }
 
     fun switchFrontBack(useFront: Boolean) {
-        val targetId = if (useFront) (frontCameraId ?: "1") else mainWideCameraId
-        switchCameraModule(targetId, 1.0f)
+        val targetId = if (useFront) (frontCameraId ?: "1") else backCameraId
+        if (activeLogicalCameraId != targetId || cameraDevice == null || isFrontCameraActive != useFront) {
+            isFrontCameraActive = useFront
+            currentZoomRatio = 1.0f
+            openCamera(
+                logicalCameraId = targetId,
+                previewSurface = previewSurface,
+                encoderSurface = encoderSurface
+            )
+        }
     }
 
     private fun applyZoomToBuilder(builder: CaptureRequest.Builder, zoom: Float) {
@@ -621,11 +656,20 @@ class CameraController(private val context: Context) {
     }
 
     fun switchCameraModule(targetCameraId: String, targetZoom: Float) {
+        // Запобігаємо виклику openCamera для фізичних суб-камер, які заборонено відкривати напряму
+        val isSubCamera = !cameraManager.cameraIdList.contains(targetCameraId)
+        if (isSubCamera) {
+            Log.w(TAG, "Target camera ID $targetCameraId is a physical sub-camera. Applying zoom on logical camera instead.")
+            if (isFrontCameraActive) switchFrontBack(false)
+            setZoomRatio(targetZoom)
+            return
+        }
+
         this.isFrontCameraActive = (targetCameraId == frontCameraId)
         this.currentZoomRatio = targetZoom
 
         if (activeLogicalCameraId != targetCameraId || cameraDevice == null) {
-            Log.i(TAG, "Switching physical camera module: from $activeLogicalCameraId to $targetCameraId (zoom ${targetZoom}x)")
+            Log.i(TAG, "Switching camera: from $activeLogicalCameraId to $targetCameraId (zoom ${targetZoom}x)")
             openCamera(
                 logicalCameraId = targetCameraId,
                 previewSurface = previewSurface,
@@ -648,33 +692,33 @@ class CameraController(private val context: Context) {
         when (moduleOrId.lowercase()) {
             "front", "self", "3_front" -> switchFrontBack(true)
             "0.5x", "0" -> {
-                val targetId = ultraWideCameraId ?: backCameraId
-                switchCameraModule(targetId, if (targetId == ultraWideCameraId) 1.0f else minZoomRatio)
+                if (isFrontCameraActive) switchFrontBack(false)
+                setZoomRatio(0.5f)
             }
             "1.0x", "1x", "1" -> {
-                switchCameraModule(mainWideCameraId, 1.0f)
+                if (isFrontCameraActive) switchFrontBack(false)
+                setZoomRatio(1.0f)
             }
             "2.0x", "2x" -> {
-                switchCameraModule(mainWideCameraId, 2.0f)
+                if (isFrontCameraActive) switchFrontBack(false)
+                setZoomRatio(2.0f)
             }
             "3.0x", "3x", "2" -> {
-                val targetId = telephotoCameraId ?: mainWideCameraId
-                val targetZoom = if (targetId == telephotoCameraId) 1.0f else 3.0f
-                switchCameraModule(targetId, targetZoom)
+                if (isFrontCameraActive) switchFrontBack(false)
+                setZoomRatio(3.0f)
             }
             "5.0x", "5x" -> {
-                val targetId = periscopeCameraId ?: telephotoCameraId ?: mainWideCameraId
-                val targetZoom = if (targetId == periscopeCameraId) 1.0f else if (targetId == telephotoCameraId) 1.67f else 5.0f
-                switchCameraModule(targetId, targetZoom)
+                if (isFrontCameraActive) switchFrontBack(false)
+                setZoomRatio(5.0f)
             }
             "10.0x", "10x" -> {
-                val targetId = periscopeCameraId ?: telephotoCameraId ?: mainWideCameraId
-                val targetZoom = if (targetId == periscopeCameraId) 2.0f else if (targetId == telephotoCameraId) 3.33f else 10.0f
-                switchCameraModule(targetId, targetZoom)
+                if (isFrontCameraActive) switchFrontBack(false)
+                setZoomRatio(10.0f)
             }
             else -> {
                 val parsedZoom = moduleOrId.removeSuffix("x").toFloatOrNull()
                 if (parsedZoom != null) {
+                    if (isFrontCameraActive) switchFrontBack(false)
                     setZoomRatio(parsedZoom)
                 } else {
                     switchPhysicalCameraSeamless(moduleOrId)
@@ -696,8 +740,34 @@ class CameraController(private val context: Context) {
                 val focal = targetSensor.focalLengths.maxOrNull() ?: 0f
                 if (focal > 12.0f) switchToSensor("5.0x") else switchToSensor("3.0x")
             }
-            else -> switchCameraModule(physicalId, 1.0f)
+            else -> {
+                if (cameraManager.cameraIdList.contains(physicalId)) {
+                    switchCameraModule(physicalId, 1.0f)
+                } else {
+                    switchToSensor("1.0x")
+                }
+            }
         }
+    }
+
+    fun updateManualIso(iso: Int) {
+        val oldMode = currentMode as? CameraMode.Manual ?: CameraMode.Manual()
+        setMode(oldMode.copy(iso = iso))
+    }
+
+    fun updateManualExposure(exposureTimeNs: Long) {
+        val oldMode = currentMode as? CameraMode.Manual ?: CameraMode.Manual()
+        setMode(oldMode.copy(exposureTimeNs = exposureTimeNs))
+    }
+
+    fun updateManualFocus(distance: Float) {
+        val oldMode = currentMode as? CameraMode.Manual ?: CameraMode.Manual()
+        setMode(oldMode.copy(focusDistance = distance))
+    }
+
+    fun updateManualWhiteBalance(kelvin: Int) {
+        val oldMode = currentMode as? CameraMode.Manual ?: CameraMode.Manual()
+        setMode(oldMode.copy(whiteBalanceKelvin = kelvin))
     }
 
     fun setMode(mode: CameraMode) {
@@ -728,21 +798,42 @@ class CameraController(private val context: Context) {
                 builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
 
                 val minFocusDist = chars?.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 10.0f
-                builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
-                builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, CameraUtils.clampFocusDistance(mode.focusDistance, minFocusDist))
+                if (mode.focusDistance > 0.0f) {
+                    builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+                    builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, CameraUtils.clampFocusDistance(mode.focusDistance, minFocusDist))
+                } else {
+                    builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                }
 
                 val isoRange = chars?.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
                 val expRange = chars?.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
 
-                builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
-                builder.set(CaptureRequest.SENSOR_SENSITIVITY, CameraUtils.clampIso(mode.iso, isoRange))
-                builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, CameraUtils.clampExposureTime(mode.exposureTimeNs, expRange))
+                if (mode.iso > 0 && mode.exposureTimeNs > 0L) {
+                    builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+                    builder.set(CaptureRequest.SENSOR_SENSITIVITY, CameraUtils.clampIso(mode.iso, isoRange))
+                    builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, CameraUtils.clampExposureTime(mode.exposureTimeNs, expRange))
+                } else if (mode.iso > 0) {
+                    builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+                    builder.set(CaptureRequest.SENSOR_SENSITIVITY, CameraUtils.clampIso(mode.iso, isoRange))
+                    val defaultExp = 20_000_000L
+                    builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, CameraUtils.clampExposureTime(defaultExp, expRange))
+                } else if (mode.exposureTimeNs > 0L) {
+                    builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+                    builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, CameraUtils.clampExposureTime(mode.exposureTimeNs, expRange))
+                    val defaultIso = 100
+                    builder.set(CaptureRequest.SENSOR_SENSITIVITY, CameraUtils.clampIso(defaultIso, isoRange))
+                } else {
+                    builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+                }
 
-                val rggbVector: RggbChannelVector = CameraUtils.kelvinToRggbChannelVector(mode.whiteBalanceKelvin)
-                builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
-                builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
-                builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, rggbVector)
-                builder.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, IDENTITY_COLOR_TRANSFORM)
+                if (mode.whiteBalanceKelvin > 0) {
+                    val rggbVector: RggbChannelVector = CameraUtils.kelvinToRggbChannelVector(mode.whiteBalanceKelvin)
+                    builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
+                    builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_FAST)
+                    builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, rggbVector)
+                } else {
+                    builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
+                }
             }
         }
     }

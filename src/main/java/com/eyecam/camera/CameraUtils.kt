@@ -1,4 +1,4 @@
-﻿package com.eyecam.camera
+package com.eyecam.camera
 
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.params.RggbChannelVector
@@ -38,21 +38,23 @@ object CameraUtils {
     }
 
     fun kelvinToRggbChannelVector(kelvin: Int): RggbChannelVector {
-        val clampedKelvin = kelvin.coerceIn(2000, 10000)
-        val temp = clampedKelvin / 100.0
-
-        val red: Double = if (temp <= 66.0) 255.0 else 329.698727446 * Math.pow(temp - 60.0, -0.1332047592)
-        val green: Double = if (temp <= 66.0) {
-            99.4708025861 * Math.log(temp) - 161.1195681661
+        val k = kelvin.coerceIn(2000, 10000).toFloat()
+        // Природний баланс білого без зеленого спотворення для сенсорів Bayer:
+        // Нейтральне денне світло (5500K): R ≈ 2.0f, G = 1.0f, B ≈ 1.9f
+        // Тепліше світло (2000K, лампа розжарювання): R ≈ 1.25f, B ≈ 3.2f
+        // Холодніше світло (10000K, тінь): R ≈ 2.85f, B ≈ 1.2f
+        val rGain = if (k <= 5500f) {
+            1.25f + (k - 2000f) / 3500f * 0.75f
         } else {
-            288.1221695283 * Math.pow(temp - 60.0, -0.0755148492)
+            2.0f + (k - 5500f) / 4500f * 0.85f
         }
-        val blue: Double = if (temp >= 66.0) 255.0 else if (temp <= 19.0) 0.0 else 138.5177312231 * Math.log(temp - 10.0) - 305.0447927307
+        val bGain = if (k <= 5500f) {
+            3.2f - (k - 2000f) / 3500f * 1.3f
+        } else {
+            1.9f - (k - 5500f) / 4500f * 0.7f
+        }
 
-        val rGain = (green.coerceIn(1.0, 255.0) / red.coerceIn(1.0, 255.0)).toFloat().coerceIn(1.0f, 4.0f)
-        val bGain = (green.coerceIn(1.0, 255.0) / blue.coerceIn(1.0, 255.0)).toFloat().coerceIn(1.0f, 4.0f)
-
-        return RggbChannelVector(rGain, 1.0f, 1.0f, bGain)
+        return RggbChannelVector(rGain.coerceIn(1.0f, 4.0f), 1.0f, 1.0f, bGain.coerceIn(1.0f, 4.0f))
     }
 
     fun clampIso(iso: Int, isoRange: Range<Int>?): Int = isoRange?.clamp(iso) ?: iso

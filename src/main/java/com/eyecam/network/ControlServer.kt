@@ -151,82 +151,58 @@ class ControlServer(
         }
     }
 
-    fun sendDeviceCapabilities() {
-        val modelName = "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL}"
-        val presetsArr = JSONArray()
-        cameraController.supportedZoomPresets.forEach { presetsArr.put(it.toDouble()) }
-
-        val capObj = JSONObject().apply {
-            put("type", "device_capabilities")
-            put("device_name", modelName)
-            put("min_zoom", cameraController.minZoomRatio.toDouble())
-            put("max_zoom", cameraController.maxZoomRatio.toDouble())
-            put("supports_4k", cameraController.supports4K)
-            put("zoom_presets", presetsArr)
-        }
-        sendFrame(MSG_TYPE_JSON_COMMAND, capObj.toString().toByteArray(StandardCharsets.UTF_8))
-    }
-
-    fun sendVideoFrame(jpegBytes: ByteArray) {
-        if (!isClientConnected) return
-        sendFrame(MSG_TYPE_VIDEO_FRAME, jpegBytes)
-    }
-
     private fun processMessage(msgType: Short, payload: ByteArray, rxTimeUs: Long) {
-        val jsonStr = String(payload, StandardCharsets.UTF_8)
-
         when (msgType) {
             MSG_TYPE_FRAME_PING -> {
-                try {
-                    val obj = JSONObject(jsonStr)
-                    val t1 = obj.optLong("t1_us", 0L)
-                    val t2 = rxTimeUs
-                    val t3 = SystemClock.elapsedRealtimeNanos() / 1000
-
-                    val pongObj = JSONObject().apply {
-                        put("t1_us", t1)
-                        put("t2_us", t2)
-                        put("t3_us", t3)
-                    }
-                    sendFrame(MSG_TYPE_FRAME_PONG, pongObj.toString().toByteArray(StandardCharsets.UTF_8))
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to parse ping", e)
+                if (payload.size >= 8) {
+                    val frameIndex = java.nio.ByteBuffer.wrap(payload, 0, 4).int
+                    val txTimeUs = java.nio.ByteBuffer.wrap(payload, 4, 8).long
+                    sendFramePong(frameIndex, txTimeUs, rxTimeUs)
                 }
             }
-
             MSG_TYPE_KEYFRAME_REQUEST -> {
                 onKeyframeRequested()
             }
-
+            MSG_TYPE_KEEP_ALIVE -> {
+                // Heartbeat handled
+            }
             MSG_TYPE_JSON_COMMAND -> {
-                executeJsonCommand(jsonStr)
+                val jsonStr = String(payload, StandardCharsets.UTF_8)
+                handleJsonCommand(jsonStr)
             }
         }
     }
 
-    private fun executeJsonCommand(jsonStr: String) {
-        var action = ""
-        var success = true
-        var errorMessage = ""
-
+    private fun handleJsonCommand(jsonStr: String) {
         try {
             val json = JSONObject(jsonStr)
-            action = if (json.has("action")) json.getString("action") else json.optString("cmd", "")
+            val action = json.optString("action", "")
+            val commandId = json.optString("command_id", "")
+
+            var success = true
+            var errorMessage: String? = null
 
             when (action) {
-                "GetCapabilities" -> {
+                "GetDeviceCapabilities" -> {
                     sendDeviceCapabilities()
                     return
                 }
 
-                "SetZoom" -> {
-                    val zoom = json.optDouble("zoom", 1.0).toFloat()
+                "SetZoomRatio" -> {
+                    val zoom = json.optDouble("zoom_ratio", 1.0).toFloat()
                     cameraController.setZoomRatio(zoom)
-                    onZoomUpdatedFromPc?.invoke(zoom, false)
+                    onZoomUpdatedFromPc?.invoke(zoom, cameraController.isFrontCameraActive)
                 }
 
-                "SetCameraModule" -> {
-                    val module = json.optString("module", "1.0x")
+                "SwitchCamera", "SetCamera" -> {
+                    val facing = json.optString("facing", "")
+                    val isFront = facing.equals("FRONT", ignoreCase = true) || json.optBoolean("front", false)
+                    cameraController.switchFrontBack(isFront)
+                    onZoomUpdatedFromPc?.invoke(1.0f, isFront)
+                }
+
+                "SwitchSensor", "SwitchModule" -> {
+                    val module = json.optString("module", json.optString("sensor_id", "1.0x"))
                     cameraController.switchToSensor(module)
                     val isFront = module.equals("front", ignoreCase = true) || module.equals("self", ignoreCase = true)
                     val zoomVal = module.removeSuffix("x").toFloatOrNull() ?: 1.0f
@@ -255,9 +231,9 @@ class ControlServer(
                     val isAuto = json.optBoolean("auto", true)
                     val iso = json.optInt("iso", 100)
                     if (isAuto) {
-                        cameraController.setMode(CameraMode.Auto)
+                        cameraController.updateManualIso(0)
                     } else {
-                        cameraController.setMode(CameraMode.Manual(iso = iso))
+                        cameraController.updateManualIso(iso)
                     }
                 }
 
@@ -265,9 +241,9 @@ class ControlServer(
                     val isAuto = json.optBoolean("auto", true)
                     val expNs = json.optLong("exposure_ns", 20_000_000L)
                     if (isAuto) {
-                        cameraController.setMode(CameraMode.Auto)
+                        cameraController.updateManualExposure(0L)
                     } else {
-                        cameraController.setMode(CameraMode.Manual(exposureTimeNs = expNs))
+                        cameraController.updateManualExposure(expNs)
                     }
                 }
 
@@ -275,9 +251,9 @@ class ControlServer(
                     val mode = json.optString("mode", "AUTO")
                     val diopters = json.optDouble("distance_diopters", 0.0).toFloat()
                     if (mode == "MANUAL") {
-                        cameraController.setMode(CameraMode.Manual(focusDistance = diopters))
+                        cameraController.updateManualFocus(diopters)
                     } else {
-                        cameraController.setMode(CameraMode.Auto)
+                        cameraController.updateManualFocus(0.0f)
                     }
                 }
 
@@ -285,9 +261,9 @@ class ControlServer(
                     val mode = json.optString("mode", "AUTO")
                     val kelvin = json.optInt("kelvin", 5500)
                     if (mode == "MANUAL_KELVIN") {
-                        cameraController.setMode(CameraMode.Manual(whiteBalanceKelvin = kelvin))
+                        cameraController.updateManualWhiteBalance(kelvin)
                     } else {
-                        cameraController.setMode(CameraMode.Auto)
+                        cameraController.updateManualWhiteBalance(0)
                     }
                 }
 
@@ -304,13 +280,13 @@ class ControlServer(
                     val param = json.optString("param", "")
                     val value = json.optDouble("value", 0.0)
                     when (param) {
-                        "iso" -> cameraController.setMode(CameraMode.Manual(iso = value.toInt()))
+                        "iso" -> cameraController.updateManualIso(value.toInt())
                         "shutter" -> {
-                            val expNs = if (value > 0) (1_000_000_000.0 / value).toLong() else 20_000_000L
-                            cameraController.setMode(CameraMode.Manual(exposureTimeNs = expNs))
+                            val expNs = if (value > 0) (1_000_000_000.0 / value).toLong() else 0L
+                            cameraController.updateManualExposure(expNs)
                         }
-                        "focus" -> cameraController.setMode(CameraMode.Manual(focusDistance = value.toFloat()))
-                        "wb" -> cameraController.setMode(CameraMode.Manual(whiteBalanceKelvin = value.toInt()))
+                        "focus" -> cameraController.updateManualFocus(value.toFloat())
+                        "wb" -> cameraController.updateManualWhiteBalance(value.toInt())
                     }
                 }
 
@@ -319,50 +295,92 @@ class ControlServer(
                     errorMessage = "Unknown command: $action"
                 }
             }
-        } catch (e: Exception) {
-            success = false
-            errorMessage = e.message ?: "Execution error"
-        }
 
-        val ackObj = JSONObject().apply {
-            put("type", "ack")
-            put("action", action)
-            put("success", success)
-            if (!success) put("error", errorMessage)
+            // Reply ACK
+            val resp = JSONObject().apply {
+                put("type", "COMMAND_ACK")
+                put("command_id", commandId)
+                put("action", action)
+                put("success", success)
+                if (errorMessage != null) put("error", errorMessage)
+            }
+            sendJson(resp)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error handling JSON command", e)
         }
-        sendFrame(MSG_TYPE_JSON_COMMAND, ackObj.toString().toByteArray(StandardCharsets.UTF_8))
+    }
+
+    fun sendVideoFrame(jpegBytes: ByteArray) {
+        val stream = outStream ?: return
+        try {
+            synchronized(this) {
+                stream.writeShort(CONTROL_MAGIC.toInt())
+                stream.writeShort(MSG_TYPE_VIDEO_FRAME.toInt())
+                stream.writeInt(jpegBytes.size)
+                stream.write(jpegBytes)
+                stream.flush()
+            }
+        } catch (_: SocketException) {
+            // Client likely closed
+        } catch (e: Exception) {
+            Log.w(TAG, "Error sending video frame: ${e.message}")
+        }
+    }
+
+    private fun sendDeviceCapabilities() {
+        val model = "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL}"
+        val resp = JSONObject().apply {
+            put("type", "DEVICE_CAPABILITIES")
+            put("model_name", model)
+            put("min_zoom", cameraController.minZoomRatio)
+            put("max_zoom", cameraController.maxZoomRatio)
+            put("supports_4k", cameraController.supports4K)
+            put("zoom_presets", JSONArray(cameraController.supportedZoomPresets))
+            put("stream_width", cameraController.streamWidth)
+            put("stream_height", cameraController.streamHeight)
+            put("stream_fps", cameraController.streamFps)
+            put("is_front", cameraController.isFrontCameraActive)
+        }
+        sendJson(resp)
     }
 
     private fun sendTelemetryState() {
-        val modelName = "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL}"
-        val stateObj = JSONObject().apply {
-            put("type", "device_state")
-            put("device_name", modelName)
-            put("min_zoom", cameraController.minZoomRatio.toDouble())
-            put("max_zoom", cameraController.maxZoomRatio.toDouble())
-            put("supports_4k", cameraController.supports4K)
-            put("state", JSONObject().apply {
-                put("battery_level", 85.0)
-                put("thermal_temp_c", 36.5)
-                put("measured_fps", 60)
-                put("measured_bitrate_kbps", 18000)
-            })
+        val resp = JSONObject().apply {
+            put("type", "TELEMETRY_UPDATE")
+            put("zoom_ratio", cameraController.minZoomRatio)
+            put("stream_fps", cameraController.streamFps)
+            put("is_front", cameraController.isFrontCameraActive)
         }
-        sendFrame(MSG_TYPE_JSON_COMMAND, stateObj.toString().toByteArray(StandardCharsets.UTF_8))
+        sendJson(resp)
     }
 
-    @Synchronized
-    private fun sendFrame(msgType: Short, payload: ByteArray) {
-        val out = outStream ?: return
-        try {
-            out.writeShort(CONTROL_MAGIC.toInt())
-            out.writeShort(msgType.toInt())
-            out.writeInt(payload.size)
-            out.write(payload)
-            out.flush()
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to send frame type=$msgType", e)
+    private fun sendFramePong(frameIndex: Int, txTimeUs: Long, rxTimeUs: Long) {
+        val pongTimeUs = SystemClock.elapsedRealtimeNanos() / 1000
+        val buffer = java.nio.ByteBuffer.allocate(28).apply {
+            putInt(frameIndex)
+            putLong(txTimeUs)
+            putLong(rxTimeUs)
+            putLong(pongTimeUs)
         }
+        sendRawMessage(MSG_TYPE_FRAME_PONG, buffer.array())
+    }
+
+    private fun sendJson(json: JSONObject) {
+        val bytes = json.toString().toByteArray(StandardCharsets.UTF_8)
+        sendRawMessage(MSG_TYPE_JSON_COMMAND, bytes)
+    }
+
+    private fun sendRawMessage(msgType: Short, payload: ByteArray) {
+        val stream = outStream ?: return
+        try {
+            synchronized(this) {
+                stream.writeShort(CONTROL_MAGIC.toInt())
+                stream.writeShort(msgType.toInt())
+                stream.writeInt(payload.size)
+                stream.write(payload)
+                stream.flush()
+            }
+        } catch (_: Exception) {}
     }
 
     fun stop() {
@@ -370,9 +388,7 @@ class ControlServer(
         telemetryJob?.cancel()
         try { activeSocket?.close() } catch (_: Exception) {}
         try { serverSocket?.close() } catch (_: Exception) {}
-        serverSocket = null
         activeSocket = null
         outStream = null
-        Log.i(TAG, "ControlServer stopped.")
     }
 }

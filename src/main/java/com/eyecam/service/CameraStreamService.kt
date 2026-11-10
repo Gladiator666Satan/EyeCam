@@ -32,11 +32,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.net.Inet4Address
 import java.net.NetworkInterface
@@ -150,47 +150,25 @@ class CameraStreamService : Service() {
         _uiState.update { current ->
             current.copy(
                 hasCameraPermission = hasPerm,
-                activeSensor = sensors.firstOrNull(),
                 availableSensors = sensors,
                 minZoomRatio = cameraController.minZoomRatio,
                 maxZoomRatio = cameraController.maxZoomRatio,
                 supportedZoomPresets = cameraController.supportedZoomPresets,
-                deviceModelName = modelName
+                deviceModelName = modelName,
+                telemetry = current.telemetry.copy(
+                    resolutionWidth = cameraController.streamWidth,
+                    resolutionHeight = cameraController.streamHeight,
+                    targetFps = cameraController.streamFps
+                )
             )
         }
-
-        if (hasPerm && currentPreviewSurface != null) {
-            cameraController.updatePreviewSurface(currentPreviewSurface)
-        }
-    }
-
-    fun attachPreviewSurface(surface: Surface?) {
-        currentPreviewSurface = surface
-        if (surface != null && surface.isValid && cameraController.hasCameraPermission()) {
-            cameraController.updatePreviewSurface(surface)
-        } else if (surface == null) {
-            if (_uiState.value.isStreaming) {
-                // Утримуємо трансляцію активною у фоні та при заблокованому екрані
-                cameraController.updatePreviewSurface(null)
-            } else {
-                cameraController.closeCamera()
-            }
-        }
-    }
-
-    fun triggerAutoFocus() {
-        cameraController.triggerAutoFocus()
-    }
-
-    fun triggerFocusAtPoint(x: Float, y: Float) {
-        cameraController.triggerFocusAtPoint(x, y)
     }
 
     private fun startConnectionMonitorLoop() {
         serviceScope.launch {
             while (isActive) {
                 refreshConnectionStatus()
-                delay(1500)
+                delay(2000L)
             }
         }
     }
@@ -379,8 +357,7 @@ class CameraStreamService : Service() {
         cameraController.setZoomRatio(zoom)
         _uiState.update {
             it.copy(
-                currentZoomRatio = zoom.coerceIn(cameraController.minZoomRatio, cameraController.maxZoomRatio),
-                isFrontCamera = false
+                currentZoomRatio = zoom.coerceIn(cameraController.minZoomRatio, cameraController.maxZoomRatio)
             )
         }
         updateNotification()
@@ -389,7 +366,10 @@ class CameraStreamService : Service() {
     fun setFrontCamera(useFront: Boolean) {
         cameraController.switchFrontBack(useFront)
         _uiState.update {
-            it.copy(isFrontCamera = useFront)
+            it.copy(
+                isFrontCamera = useFront,
+                currentZoomRatio = 1.0f
+            )
         }
         updateNotification()
     }
@@ -452,33 +432,29 @@ class CameraStreamService : Service() {
             this, 2, muteIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val micStatus = if (_uiState.value.isMicMuted) "Мікрофон: ВИМКНЕНО" else "Мікрофон: АКТИВНИЙ"
-        val zoomLabel = if (_uiState.value.isFrontCamera) "FRONT" else "${_uiState.value.currentZoomRatio}x"
-        val thermalName = _uiState.value.telemetry.thermalState.descriptionUa
+        val isMuted = _uiState.value.isMicMuted
+        val muteActionTitle = if (isMuted) "Увімкнути мікрофон" else "Вимкнути звук"
 
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setContentTitle("EyeCam: Трансляція активна")
-            .setContentText("Зум: $zoomLabel | $micStatus | $thermalName")
-            .setSmallIcon(R.drawable.ic_eyecam_logo)
+            .setContentText("Камера транслюється на ПК (${_uiState.value.telemetry.connectionDetails})")
+            .setSmallIcon(android.R.drawable.presence_video_online)
+            .setColor(Color.parseColor("#00E5FF"))
             .setOngoing(true)
-            .setOnlyAlertOnce(true)
-            .setColor(Color.BLACK)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Зупинити", stopPendingIntent)
             .addAction(
-                if (_uiState.value.isMicMuted) android.R.drawable.stat_notify_call_mute else android.R.drawable.presence_audio_online,
-                if (_uiState.value.isMicMuted) "Увімкнути звук" else "Вимкнути звук",
+                if (isMuted) android.R.drawable.ic_lock_silent_mode_off else android.R.drawable.ic_lock_silent_mode,
+                muteActionTitle,
                 mutePendingIntent
             )
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .build()
     }
 
     private fun updateNotification() {
-        if (_uiState.value.isStreaming) {
-            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            notificationManager.notify(NOTIFICATION_ID, buildNotification())
-        }
+        if (!_uiState.value.isStreaming) return
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.notify(NOTIFICATION_ID, buildNotification())
     }
 
     private fun createNotificationChannel() {
@@ -488,23 +464,34 @@ class CameraStreamService : Service() {
                 NOTIFICATION_CHANNEL_NAME,
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Постійне сповіщення активної відеотрансляції EyeCam"
+                description = "Сповіщення про роботу фонової відеотрансляції EyeCam"
                 enableLights(false)
                 enableVibration(false)
-                setShowBadge(false)
             }
-            val manager = getSystemService(NotificationManager::class.java)
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             manager.createNotificationChannel(channel)
         }
     }
 
+    fun attachPreviewSurface(surface: Surface?) {
+        this.currentPreviewSurface = surface
+        cameraController.updatePreviewSurface(surface)
+    }
+
+    fun triggerAutoFocus() {
+        cameraController.triggerAutoFocus()
+    }
+
+    fun triggerFocusAtPoint(xNorm: Float, yNorm: Float) {
+        cameraController.triggerFocusAtPoint(xNorm, yNorm)
+    }
+
     override fun onDestroy() {
         super.onDestroy()
-        Log.i(TAG, "Знищення CameraStreamService та звільнення ресурсів")
-        serviceJob.cancel()
+        Log.i(TAG, "Знищення CameraStreamService...")
+        stopStreaming()
         controlServer.stop()
         cameraController.closeCamera()
-        thermalManager.stopMonitoring()
-        powerLockManager.releaseAll()
+        serviceScope.cancel()
     }
 }

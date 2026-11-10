@@ -62,6 +62,8 @@ fun CameraPreview(
     isStreaming: Boolean,
     hasCameraPermission: Boolean = true,
     isDisplayProtectionActive: Boolean = false,
+    streamWidth: Int = 1920,
+    streamHeight: Int = 1080,
     onSurfaceChanged: (Surface?) -> Unit = {},
     onFocusPointTapped: ((Float, Float) -> Unit)? = null,
     onRequestPermissions: () -> Unit = {},
@@ -83,16 +85,21 @@ fun CameraPreview(
         contentAlignment = Alignment.Center
     ) {
         if (hasCameraPermission) {
-            // Розрахунок точних пропорцій: запобігає розтягуванню зображення
             val isLandscape = maxWidth > maxHeight
-            val targetRatio = if (isLandscape) (16f / 9f) else (9f / 16f)
+
+            // Точний розрахунок пропорцій для усунення розтягування (Aspect Fit з Letterboxing)
+            val streamAspect = if (streamHeight > 0) streamWidth.toFloat() / streamHeight.toFloat() else (16f / 9f)
+            val targetAspect = if (isLandscape) streamAspect else (1.0f / streamAspect)
 
             var viewW = maxWidth
-            var viewH = maxWidth / targetRatio
+            var viewH = maxWidth / targetAspect
             if (viewH > maxHeight) {
                 viewH = maxHeight
-                viewW = viewH * targetRatio
+                viewW = viewH * targetAspect
             }
+
+            val targetSurfaceW = if (isLandscape) streamWidth else streamHeight
+            val targetSurfaceH = if (isLandscape) streamHeight else streamWidth
 
             Box(
                 modifier = Modifier
@@ -115,8 +122,11 @@ fun CameraPreview(
                 AndroidView(
                     factory = { context ->
                         SurfaceView(context).apply {
+                            holder.setKeepScreenOn(true)
+                            holder.setFixedSize(targetSurfaceW, targetSurfaceH)
                             holder.addCallback(object : SurfaceHolder.Callback {
                                 override fun surfaceCreated(holder: SurfaceHolder) {
+                                    holder.setFixedSize(targetSurfaceW, targetSurfaceH)
                                     onSurfaceChanged(holder.surface)
                                 }
 
@@ -134,6 +144,9 @@ fun CameraPreview(
                                 }
                             })
                         }
+                    },
+                    update = { surfaceView ->
+                        surfaceView.holder.setFixedSize(targetSurfaceW, targetSurfaceH)
                     },
                     modifier = Modifier.fillMaxSize()
                 )
@@ -156,8 +169,9 @@ fun CameraPreview(
                             .border(1.dp, OledBorder, RoundedCornerShape(12.dp))
                             .padding(horizontal = 10.dp, vertical = 4.dp)
                     ) {
+                        val resLabel = "${streamWidth}x${streamHeight}"
                         Text(
-                            text = if (isLandscape) "📷 16:9 ВЕБ-КАМЕРА (ЛАНДШАФТ)" else "📷 16:9 ВЕБ-КАМЕРА (ПОРТРЕТ)",
+                            text = if (isLandscape) "📷 16:9 ВЕБ-КАМЕРА [$resLabel]" else "📷 9:16 ВЕРТИКАЛЬНО [$resLabel]",
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
                             color = StatusCyan,
