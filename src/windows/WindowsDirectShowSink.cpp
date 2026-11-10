@@ -75,7 +75,7 @@ bool WindowsDirectShowSink::Open(uint32_t width, uint32_t height, PixelFormat fo
         return false;
     }
 
-    // Спроба відкриття Global\\ об'єкта, у разі відсутності прав UAC - відкат до Local\\
+    // Спроба відкриття Global об'єкта, у разі відсутності прав UAC - відкат до Local префікса
     m_hMapFile = CreateFileMappingW(
         INVALID_HANDLE_VALUE,
         nullptr,
