@@ -8,7 +8,6 @@ import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
 import android.hardware.camera2.*
-import android.hardware.camera2.params.ColorSpaceTransform
 import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.RggbChannelVector
@@ -37,16 +36,15 @@ class CameraController(private val context: Context) {
     }
 
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+    private var cameraDevice: CameraDevice? = null
+    private var captureSession: CameraCaptureSession? = null
     private var cameraThread: HandlerThread? = null
     private var cameraHandler: Handler? = null
 
-    private var cameraDevice: CameraDevice? = null
-    private var captureSession: CameraCaptureSession? = null
-    private var previewRequestBuilder: CaptureRequest.Builder? = null
-    private var imageReader: ImageReader? = null
-
     private var previewSurface: Surface? = null
     private var encoderSurface: Surface? = null
+    private var imageReader: ImageReader? = null
+    private var previewRequestBuilder: CaptureRequest.Builder? = null
 
     var onJpegFrameAvailable: ((ByteArray, Int, Int) -> Unit)? = null
     var isNetworkStreamActive: Boolean = false
@@ -85,6 +83,11 @@ class CameraController(private val context: Context) {
 
     private val _availableSensors = mutableListOf<CameraSensorInfo>()
     val availableSensors: List<CameraSensorInfo> get() = _availableSensors
+
+    private var reusableNv21: ByteArray? = null
+    private val reusableJpegOut = ByteArrayOutputStream(262144)
+    private val encodeExecutor = Executors.newSingleThreadExecutor()
+    private val isEncoding = AtomicBoolean(false)
 
     private var lastFrameSentTimeMs: Long = 0L
     var streamWidth: Int = 1920
@@ -237,7 +240,7 @@ class CameraController(private val context: Context) {
             detectedMaxZoom = 10.0f
         }
 
-        minZoomRatio = if (detectedMinZoom <= 0.65f) 0.5f else 1.0f
+        minZoomRatio = if (detectedMinZoom <= 0.65f || foundUltraWide || ultraWideCameraId != null) 0.5f else 1.0f
         maxZoomRatio = detectedMaxZoom.coerceIn(1.0f, 10.0f)
 
         val candidatePresets = listOf(0.5f, 1.0f, 2.0f, 3.0f, 5.0f, 10.0f)
@@ -424,9 +427,9 @@ class CameraController(private val context: Context) {
             builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
             builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
             session.setRepeatingRequest(builder.build(), null, handler)
-            Log.i(TAG, "Focus triggered at point: ($xNorm, $yNorm)")
+            Log.i(TAG, "Tap-to-focus triggered at ($centerX, $centerY)")
         } catch (e: Exception) {
-            Log.e(TAG, "Error in tap-to-focus", e)
+            Log.e(TAG, "Error triggering tap-to-focus", e)
         }
     }
 
@@ -434,27 +437,48 @@ class CameraController(private val context: Context) {
         val callback = onJpegFrameAvailable ?: return
         if (!isNetworkStreamActive) return
 
-        val now = System.currentTimeMillis()
-        if (now - lastFrameSentTimeMs < 28) return // ~35 FPS стабільний потік без перевантаження TCP буфера
-        lastFrameSentTimeMs = now
+        if (!isEncoding.compareAndSet(false, true)) {
+            // Попередній кадр ще стискається / відправляється — пропускаємо без накопичення затримок
+            return
+        }
+
+        val width = image.width
+        val height = image.height
+        val requiredSize = width * height * 3 / 2
+        var nv21 = reusableNv21
+        if (nv21 == null || nv21.size != requiredSize) {
+            nv21 = ByteArray(requiredSize)
+            reusableNv21 = nv21
+        }
 
         try {
-            val nv21 = yuv420888ToNv21(image)
-            val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
-            val out = ByteArrayOutputStream(65536)
-            yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), 78, out)
-            callback(out.toByteArray(), image.width, image.height)
+            yuv420888ToNv21Fast(image, nv21)
         } catch (e: Exception) {
-            Log.w(TAG, "Frame encode warning: ${e.message}")
+            isEncoding.set(false)
+            return
+        }
+
+        encodeExecutor.execute {
+            try {
+                synchronized(reusableJpegOut) {
+                    reusableJpegOut.reset()
+                    val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+                    // Якість 75 забезпечує ідеальний баланс між деталізацією 1080p/4K та надшвидким кодуванням у 60 FPS
+                    yuvImage.compressToJpeg(Rect(0, 0, width, height), 75, reusableJpegOut)
+                    callback(reusableJpegOut.toByteArray(), width, height)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Frame encode warning: ${e.message}")
+            } finally {
+                isEncoding.set(false)
+            }
         }
     }
 
-    private fun yuv420888ToNv21(image: Image): ByteArray {
+    private fun yuv420888ToNv21Fast(image: Image, outNv21: ByteArray) {
         val width = image.width
         val height = image.height
         val ySize = width * height
-        val uvSize = width * height / 2
-        val nv21 = ByteArray(ySize + uvSize)
 
         val yPlane = image.planes[0]
         val uPlane = image.planes[1]
@@ -465,15 +489,13 @@ class CameraController(private val context: Context) {
         val vBuffer = vPlane.buffer
 
         val yRowStride = yPlane.rowStride
-        var pos = 0
-
         if (yRowStride == width) {
-            yBuffer.get(nv21, 0, ySize)
-            pos = ySize
+            yBuffer.get(outNv21, 0, ySize)
         } else {
+            var pos = 0
             for (row in 0 until height) {
                 yBuffer.position(row * yRowStride)
-                yBuffer.get(nv21, pos, width)
+                yBuffer.get(outNv21, pos, width)
                 pos += width
             }
         }
@@ -482,15 +504,23 @@ class CameraController(private val context: Context) {
         val uvPixelStride = uPlane.pixelStride
         val uvHeight = height / 2
         val uvWidth = width / 2
+        var pos = ySize
 
-        for (row in 0 until uvHeight) {
-            for (col in 0 until uvWidth) {
-                val vuPos = row * uvRowStride + col * uvPixelStride
-                nv21[pos++] = vBuffer.get(vuPos)
-                nv21[pos++] = uBuffer.get(vuPos)
+        // Швидке пряме копіювання, якщо U/V площини вже перемежовані у пам'яті HAL
+        if (uvPixelStride == 2 && uvRowStride == width) {
+            val vRem = vBuffer.remaining()
+            val toCopy = minOf(vRem, outNv21.size - pos)
+            vBuffer.get(outNv21, pos, toCopy)
+        } else {
+            for (row in 0 until uvHeight) {
+                val rowOffsetV = row * uvRowStride
+                for (col in 0 until uvWidth) {
+                    val vuPos = rowOffsetV + col * uvPixelStride
+                    outNv21[pos++] = vBuffer.get(vuPos)
+                    outNv21[pos++] = uBuffer.get(vuPos)
+                }
             }
         }
-        return nv21
     }
 
     private fun createCaptureSessionInternal() {
@@ -574,7 +604,7 @@ class CameraController(private val context: Context) {
         currentZoomRatio = clamped
 
         // Перевіряємо, чи підтримує активна логічна камера (id "0" на Samsung Galaxy S26 Ultra)
-        // плавний зум через CONTROL_ZOOM_RATIO_RANGE (включаючи оптичне перемикання лінз на рівні HAL)
+        // плавний оптичний зум через CONTROL_ZOOM_RATIO_RANGE (включаючи оптичне перемикання лінз на рівні HAL)
         val chars = currentSensorCharacteristics
         val zoomRange = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             chars?.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
@@ -582,22 +612,32 @@ class CameraController(private val context: Context) {
 
         val isLogicalRear = (activeLogicalCameraId == backCameraId || activeLogicalCameraId == mainWideCameraId || activeLogicalCameraId == "0")
 
-        if (isLogicalRear && (zoomRange == null || (clamped >= zoomRange.lower - 0.05f && clamped <= zoomRange.upper + 0.05f))) {
-            val session = captureSession ?: return
-            val builder = previewRequestBuilder ?: return
-            val handler = cameraHandler ?: return
-
-            try {
-                applyZoomToBuilder(builder, clamped)
-                session.setRepeatingRequest(builder.build(), null, handler)
-                Log.i(TAG, "Applied zoom ratio: ${clamped}x on rear logical camera $activeLogicalCameraId")
-            } catch (e: Exception) {
-                Log.e(TAG, "Error applying zoom ratio on rear camera", e)
+        // 1. Якщо це логічна тилова камера і вона підтримує оптичний зум через CONTROL_ZOOM_RATIO_RANGE:
+        // На Samsung Galaxy Ultra (S20U..S26U) діапазон [0.6, 100.0] включає 0.5x/0.6x Ultra-Wide, 1x Wide, 3x Tele та 5x/10x Periscope.
+        if (isLogicalRear && zoomRange != null) {
+            val effectiveZoom = if (clamped <= 0.65f && zoomRange.lower <= 0.7f) {
+                zoomRange.lower
+            } else {
+                clamped.coerceIn(zoomRange.lower, zoomRange.upper)
             }
-            return
+
+            if (clamped >= 0.95f || zoomRange.lower <= 0.7f) {
+                val session = captureSession ?: return
+                val builder = previewRequestBuilder ?: return
+                val handler = cameraHandler ?: return
+
+                try {
+                    applyZoomToBuilder(builder, effectiveZoom)
+                    session.setRepeatingRequest(builder.build(), null, handler)
+                    Log.i(TAG, "Applied zoom ratio: ${effectiveZoom}x on rear logical camera $activeLogicalCameraId")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error applying zoom ratio on rear camera", e)
+                }
+                return
+            }
         }
 
-        // Якщо ultra-wide є окремою незалежною камерою в cameraIdList (а не суб-камерою):
+        // 2. Якщо Ultra-Wide є окремим сенсором у cameraIdList і логічна камера не має < 1.0f:
         val targetModuleId = if (clamped < 1.0f && ultraWideCameraId != null && cameraManager.cameraIdList.contains(ultraWideCameraId)) {
             ultraWideCameraId
         } else {
@@ -605,6 +645,7 @@ class CameraController(private val context: Context) {
         }
 
         if (targetModuleId != null && targetModuleId != activeLogicalCameraId) {
+            Log.i(TAG, "Switching camera device from $activeLogicalCameraId to $targetModuleId for zoom ${clamped}x")
             openCamera(
                 logicalCameraId = targetModuleId,
                 previewSurface = previewSurface,
@@ -641,7 +682,8 @@ class CameraController(private val context: Context) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val range = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
             if (range != null) {
-                builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom.coerceIn(range.lower, range.upper))
+                val effectiveTarget = if (zoom <= 0.65f && range.lower <= 0.7f) range.lower else zoom.coerceIn(range.lower, range.upper)
+                builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, effectiveTarget)
                 return
             }
         }
@@ -721,86 +763,91 @@ class CameraController(private val context: Context) {
                     if (isFrontCameraActive) switchFrontBack(false)
                     setZoomRatio(parsedZoom)
                 } else {
-                    switchPhysicalCameraSeamless(moduleOrId)
+                    val matchedSensor = _availableSensors.firstOrNull { it.id == moduleOrId }
+                    if (matchedSensor != null) {
+                        switchCameraModule(matchedSensor.id, 1.0f)
+                    }
                 }
             }
         }
     }
 
-    fun switchPhysicalCameraSeamless(physicalId: String) {
-        val targetSensor = _availableSensors.find { it.id == physicalId }
-        if (targetSensor?.sensorType == SensorType.FRONT) {
-            switchFrontBack(true)
-            return
-        }
-        when (targetSensor?.sensorType) {
-            SensorType.ULTRA_WIDE -> switchToSensor("0.5x")
-            SensorType.WIDE -> switchToSensor("1.0x")
+    fun switchPhysicalCameraSeamless(targetId: String) {
+        val sensor = _availableSensors.firstOrNull { it.id == targetId }
+        val targetZoom = when (sensor?.sensorType) {
+            SensorType.ULTRA_WIDE -> 0.5f
+            SensorType.WIDE -> 1.0f
             SensorType.TELEPHOTO -> {
-                val focal = targetSensor.focalLengths.maxOrNull() ?: 0f
-                if (focal > 12.0f) switchToSensor("5.0x") else switchToSensor("3.0x")
+                val maxFocal = sensor.focalLengths.maxOrNull() ?: 0f
+                if (maxFocal > 12.0f) 5.0f else 3.0f
             }
-            else -> {
-                if (cameraManager.cameraIdList.contains(physicalId)) {
-                    switchCameraModule(physicalId, 1.0f)
-                } else {
-                    switchToSensor("1.0x")
-                }
-            }
+            SensorType.FRONT -> 1.0f
+            else -> 1.0f
         }
-    }
-
-    fun updateManualIso(iso: Int) {
-        val oldMode = currentMode as? CameraMode.Manual ?: CameraMode.Manual()
-        setMode(oldMode.copy(iso = iso))
-    }
-
-    fun updateManualExposure(exposureTimeNs: Long) {
-        val oldMode = currentMode as? CameraMode.Manual ?: CameraMode.Manual()
-        setMode(oldMode.copy(exposureTimeNs = exposureTimeNs))
-    }
-
-    fun updateManualFocus(distance: Float) {
-        val oldMode = currentMode as? CameraMode.Manual ?: CameraMode.Manual()
-        setMode(oldMode.copy(focusDistance = distance))
-    }
-
-    fun updateManualWhiteBalance(kelvin: Int) {
-        val oldMode = currentMode as? CameraMode.Manual ?: CameraMode.Manual()
-        setMode(oldMode.copy(whiteBalanceKelvin = kelvin))
+        switchCameraModule(targetId, targetZoom)
     }
 
     fun setMode(mode: CameraMode) {
         this.currentMode = mode
-        val builder = previewRequestBuilder ?: return
         val session = captureSession ?: return
+        val builder = previewRequestBuilder ?: return
         val handler = cameraHandler ?: return
 
-        applyModeToBuilder(builder, mode)
         try {
+            applyModeToBuilder(builder, mode)
             session.setRepeatingRequest(builder.build(), null, handler)
         } catch (e: Exception) {
-            Log.e(TAG, "Error updating mode", e)
+            Log.e(TAG, "Error applying camera mode", e)
+        }
+    }
+
+    fun updateManualIso(iso: Int) {
+        if (currentMode is CameraMode.Manual) {
+            setMode((currentMode as CameraMode.Manual).copy(iso = iso))
+        } else {
+            setMode(CameraMode.Manual(iso = iso))
+        }
+    }
+
+    fun updateManualExposure(exposureTimeNs: Long) {
+        if (currentMode is CameraMode.Manual) {
+            setMode((currentMode as CameraMode.Manual).copy(exposureTimeNs = exposureTimeNs))
+        } else {
+            setMode(CameraMode.Manual(exposureTimeNs = exposureTimeNs))
+        }
+    }
+
+    fun updateManualFocus(focusDistance: Float) {
+        if (currentMode is CameraMode.Manual) {
+            setMode((currentMode as CameraMode.Manual).copy(focusDistance = focusDistance))
+        } else {
+            setMode(CameraMode.Manual(focusDistance = focusDistance))
+        }
+    }
+
+    fun updateManualWhiteBalance(kelvin: Int) {
+        if (currentMode is CameraMode.Manual) {
+            setMode((currentMode as CameraMode.Manual).copy(whiteBalanceKelvin = kelvin))
+        } else {
+            setMode(CameraMode.Manual(whiteBalanceKelvin = kelvin))
         }
     }
 
     private fun applyModeToBuilder(builder: CaptureRequest.Builder, mode: CameraMode) {
         val chars = currentSensorCharacteristics
-
         when (mode) {
             is CameraMode.Auto -> {
                 builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-                builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
                 builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+                builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
                 builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
             }
             is CameraMode.Manual -> {
                 builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
 
-                val minFocusDist = chars?.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 10.0f
-                if (mode.focusDistance > 0.0f) {
+                if (mode.focusDistance >= 0.0f) {
                     builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
-                    builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, CameraUtils.clampFocusDistance(mode.focusDistance, minFocusDist))
+                    builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, mode.focusDistance)
                 } else {
                     builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
                 }
@@ -848,7 +895,14 @@ class CameraController(private val context: Context) {
         cameraDevice = null
         imageReader = null
         previewRequestBuilder = null
+        // Важливо: НЕ зупиняємо backgroundThread тут, щоб не ламати асинхронні виклики openCamera при перемиканні сенсорів
+    }
+
+    @Synchronized
+    fun release() {
+        closeCamera()
         stopBackgroundThread()
+        encodeExecutor.shutdown()
     }
 
     private fun startBackgroundThread() {

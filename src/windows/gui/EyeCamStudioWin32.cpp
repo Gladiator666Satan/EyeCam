@@ -1,362 +1,277 @@
-#if defined(_WIN32)
-
-#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
 #define NOMINMAX
-#endif
 
+#include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <windows.h>
-#include <windowsx.h>
-#include <ole2.h>
-#include <dwmapi.h>
-#include <shellapi.h>
 #include <d2d1.h>
 #include <dwrite.h>
 #include <wincodec.h>
-#include <dxgiformat.h>
+#include <commctrl.h>
 
-#include <algorithm>
+#include <string>
+#include <vector>
+#include <memory>
+#include <thread>
 #include <atomic>
+#include <mutex>
+#include <sstream>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <mutex>
-#include <string>
-#include <thread>
-#include <vector>
 
 #include "WindowsDirectShowSink.hpp"
-#include "SharedMemoryProtocol.hpp"
 
+#pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
-#pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "windowscodecs.lib")
-#pragma comment(lib, "ws2_32.lib")
-#pragma comment(lib, "shell32.lib")
-#pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "oleaut32.lib")
-#pragma comment(lib, "uuid.lib")
-
-#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
-#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
-#endif
-#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
-#define DWMWA_WINDOW_CORNER_PREFERENCE 33
-#endif
-#ifndef DWMWA_CAPTION_COLOR
-#define DWMWA_CAPTION_COLOR 35
-#endif
+#pragma comment(lib, "comctl32.lib")
 
 namespace {
 
 // ============================================================================
-// Кольорова палітра Windows 11 Dark Studio (Fluent / OLED Dark)
+// Фірмові кольори Win11 Fluent Dark для EyeCam
 // ============================================================================
-D2D1_COLOR_F HexColor(uint32_t rgb, float alpha = 1.0f) {
+constexpr D2D1_COLOR_F COL_BG_DARK       = {0.047f, 0.055f, 0.071f, 1.0f}; // #0C0E12
+constexpr D2D1_COLOR_F COL_BG_CARD       = {0.082f, 0.098f, 0.125f, 1.0f}; // #151920
+constexpr D2D1_COLOR_F COL_BG_CARD_HOVER = {0.118f, 0.137f, 0.176f, 1.0f}; // #1E232D
+constexpr D2D1_COLOR_F COL_BORDER        = {0.157f, 0.180f, 0.224f, 1.0f}; // #282E39
+constexpr D2D1_COLOR_F COL_EMERALD       = {0.063f, 0.725f, 0.506f, 1.0f}; // #10B981
+constexpr D2D1_COLOR_F COL_CYAN          = {0.024f, 0.710f, 0.831f, 1.0f}; // #06B6D4
+constexpr D2D1_COLOR_F COL_TEXT_PRIMARY  = {0.941f, 0.949f, 0.961f, 1.0f}; // #F0F2F5
+constexpr D2D1_COLOR_F COL_TEXT_MUTED    = {0.580f, 0.620f, 0.690f, 1.0f}; // #949EB0
+constexpr D2D1_COLOR_F COL_TEXT_DIM      = {0.380f, 0.420f, 0.480f, 1.0f}; // #616B7A
+constexpr D2D1_COLOR_F COL_RED           = {0.937f, 0.267f, 0.267f, 1.0f}; // #EF4444
+
+inline D2D1_COLOR_F HexColor(uint32_t rgb, float a = 1.0f) {
     return D2D1::ColorF(
         static_cast<float>((rgb >> 16) & 0xFF) / 255.0f,
         static_cast<float>((rgb >> 8) & 0xFF) / 255.0f,
         static_cast<float>(rgb & 0xFF) / 255.0f,
-        alpha
+        a
     );
 }
 
-const D2D1_COLOR_F COL_BG_MAIN       = HexColor(0x0B0E14);
-const D2D1_COLOR_F COL_BG_PANEL      = HexColor(0x131822);
-const D2D1_COLOR_F COL_BG_CARD       = HexColor(0x1A202C);
-const D2D1_COLOR_F COL_BG_DROPDOWN   = HexColor(0x0F141D);
-const D2D1_COLOR_F COL_BORDER        = HexColor(0x283142);
-const D2D1_COLOR_F COL_EMERALD       = HexColor(0x00E676);
-const D2D1_COLOR_F COL_CYAN          = HexColor(0x00E5FF);
-const D2D1_COLOR_F COL_AMBER         = HexColor(0xFFB300);
-const D2D1_COLOR_F COL_CRIMSON       = HexColor(0xFF1744);
-const D2D1_COLOR_F COL_TEXT_PRIMARY  = HexColor(0xF0F4F8);
-const D2D1_COLOR_F COL_TEXT_SECOND   = HexColor(0x94A3B8);
-const D2D1_COLOR_F COL_TEXT_DIM      = HexColor(0x64748B);
+std::wstring Utf8ToWide(const std::string& str) {
+    if (str.empty()) return L"";
+    int count = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), static_cast<int>(str.length()), nullptr, 0);
+    std::wstring out(count, 0);
+    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), static_cast<int>(str.length()), &out[0], count);
+    return out;
+}
+
+std::string WideToUtf8(const std::wstring& wstr) {
+    if (wstr.empty()) return "";
+    int count = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), static_cast<int>(wstr.length()), nullptr, 0, nullptr, nullptr);
+    std::string out(count, 0);
+    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), static_cast<int>(wstr.length()), &out[0], count, nullptr, nullptr);
+    return out;
+}
 
 struct UiRect {
-    float left = 0;
-    float top = 0;
-    float right = 0;
-    float bottom = 0;
+    float left = 0.0f;
+    float top = 0.0f;
+    float right = 0.0f;
+    float bottom = 0.0f;
 
     bool Contains(float x, float y) const {
         return x >= left && x <= right && y >= top && y <= bottom;
-    }
-    D2D1_RECT_F ToD2D() const {
-        return D2D1::RectF(left, top, right, bottom);
     }
     float Width() const { return right - left; }
     float Height() const { return bottom - top; }
 };
 
 enum class TransportTab {
-    WIFI_LAN = 0,
-    USB_ADB  = 1
+    USB_ADB = 0,
+    WIFI_LAN = 1
 };
 
-struct UsbDeviceEntry {
+struct UsbDeviceItem {
     std::string serial;
-    std::wstring displayName;
-    bool authorized = true;
+    std::string model;
+    std::string state;
 };
 
 struct StudioState {
-    // Підключення та транспорт (лише Wi-Fi LAN та USB ADB — без зайвого тест-потоку)
     TransportTab transport = TransportTab::USB_ADB;
-    std::string deviceIp = "192.168.1.105";
-    bool ipInputFocused = false;
-    bool isStreaming = true;
-    bool isDriverRegistered = false;
-    std::atomic<bool> isPhoneConnected{false};
 
-    // Випадаючий список USB пристроїв (ADB)
-    std::vector<UsbDeviceEntry> usbDevices;
-    int selectedUsbIdx = 0;
+    // USB ADB стан
+    std::vector<UsbDeviceItem> usbDevices;
+    int selectedUsbIdx = -1;
     bool usbDropdownOpen = false;
 
-    // Профіль підключеного смартфона (наприклад, Samsung Galaxy S26 Ultra)
-    std::wstring connectedPhoneName = L"Очікування підключення смартфона...";
-    float phoneMinZoom = 0.5f;
-    float phoneMaxZoom = 10.0f;
-    bool phoneSupports4K = true;
+    // Wi-Fi LAN стан
+    std::string deviceIp = "192.168.1.100";
+    uint16_t devicePort = 8554;
+    bool ipInputFocused = false;
 
-    // Параметри відеопотоку (включаючи 4K UHD та 2K QHD)
-    int resPresetIdx = 2; // 0: 4K UHD (3840x2160), 1: 2K QHD (2560x1440), 2: 1080p 60, 3: 720p 60
+    // Стан віртуальної камери DirectShow
+    bool isStreaming = false;
+    bool isDirectShowRegistered = false;
+    bool isPhoneConnected = false;
+    std::wstring connectedPhoneName = L"Не підключено";
+
+    // Налаштування роздільної здатності (до 4K UHD!)
     uint32_t width = 1920;
     uint32_t height = 1080;
     uint32_t fps = 60;
+    int resPresetIdx = 2; // 0=4K, 1=2K, 2=1080p, 3=720p
 
-    // Керування оптикою та зумом (0.5x, 1x, 2x, 3x, 5x, 10x, Front)
-    int activeLensIdx = 1; // 0: 0.5x, 1: 1x, 2: 2x, 3: 3x, 4: 5x, 5: 10x, 6: Front
+    // Оптика та Зум (підтримка до 10x на флагманах на кшталт S26 Ultra)
+    float phoneMinZoom = 0.5f;
+    float phoneMaxZoom = 10.0f;
     float currentZoom = 1.0f;
+    int activeLensIdx = 1; // 0=0.5x, 1=1x, 2=2x, 3=3x, 4=5x, 5=10x, 6=Front
     float zoomSliderNorm = 0.05f; // Плавний зум від phoneMinZoom до phoneMaxZoom
+
+    // Ручний Pro ISP режим
     bool isProManual = false;
+    float isoNorm = 0.2f;       // 100 .. 3200
+    float shutterNorm = 0.3f;   // 1/30 .. 1/4000
+    float focusNorm = 0.5f;     // 0 .. 10 D
+    float wbNorm = 0.5f;        // 2800K .. 8500K
+
+    // Ефекти та композиція
     bool mirrorHorizontal = false;
-    bool showGrid = false;
+    bool showFramingGrid = false;
 
-    // Повзунки Pro режиму (0.0 .. 1.0 нормалізовані)
-    float isoNorm = 0.20f;     // 100 .. 3200
-    float shutterNorm = 0.35f; // 1/30 .. 1/4000
-    float focusNorm = 0.0f;    // 0.0 .. 1.0
-    float wbNorm = 0.48f;      // 2800K .. 8500K
-
-    // Телеметрія реального часу
-    std::atomic<uint64_t> rxFrames{0};
-    std::atomic<uint64_t> rxBytes{0};
-    std::atomic<uint32_t> measuredBitrateKbps{0};
-    std::atomic<uint32_t> measuredFps{0};
-    std::atomic<uint64_t> shmFramesWritten{0};
+    // Мережева телеметрія
+    uint32_t measuredBitrateKbps = 0;
+    uint32_t measuredFps = 0;
+    uint64_t rxBytes = 0;
+    uint64_t rxFrames = 0;
 };
 
-std::wstring Utf8ToWide(const std::string& str) {
-    if (str.empty()) return L"";
-    int sz = MultiByteToWideChar(CP_UTF8, 0, str.data(), static_cast<int>(str.size()), nullptr, 0);
-    if (sz <= 0) return L"";
-    std::wstring res(sz, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, str.data(), static_cast<int>(str.size()), res.data(), sz);
-    return res;
-}
-
-// Пошук виконуваного файлу adb.exe (вбудованого в інсталятор або системного)
-std::wstring ResolveAdbExecutablePath() {
-    wchar_t exePath[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-    std::wstring dirPath(exePath);
-    size_t pos = dirPath.find_last_of(L"\\/");
-    if (pos != std::wstring::npos) {
-        dirPath = dirPath.substr(0, pos);
-    }
-
-    // 1. Вбудований у директорію інсталятора {app}\adb\adb.exe
-    std::wstring bundled1 = dirPath + L"\\adb\\adb.exe";
-    if (GetFileAttributesW(bundled1.c_str()) != INVALID_FILE_ATTRIBUTES) return bundled1;
-
-    // 2. Поруч із EyeCamStudio.exe
-    std::wstring bundled2 = dirPath + L"\\adb.exe";
-    if (GetFileAttributesW(bundled2.c_str()) != INVALID_FILE_ATTRIBUTES) return bundled2;
-
-    // 3. Стандартний шлях Android SDK у профілі користувача
-    wchar_t localAppData[MAX_PATH]{};
-    if (GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH) > 0) {
-        std::wstring sdkAdb = std::wstring(localAppData) + L"\\Android\\Sdk\\platform-tools\\adb.exe";
-        if (GetFileAttributesW(sdkAdb.c_str()) != INVALID_FILE_ATTRIBUTES) return sdkAdb;
-    }
-
-    return L"adb.exe";
-}
-
-// Тихий запуск консольної команди (без миготіння чорного вікна CMD) з читанням stdout
-std::string RunHiddenCommandOutput(const std::wstring& cmdLine) {
+// ============================================================================
+// Допоміжні функції сканування USB ADB пристроїв
+// ============================================================================
+std::string ExecuteCommandSilent(const std::string& cmd) {
+    std::string result;
+    HANDLE hReadPipe, hWritePipe;
     SECURITY_ATTRIBUTES sa{};
-    sa.nLength = sizeof(sa);
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
     sa.bInheritHandle = TRUE;
 
-    HANDLE hRead = nullptr;
-    HANDLE hWrite = nullptr;
-    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return "";
-    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return "";
+    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
 
-    STARTUPINFOW si{};
+    STARTUPINFOA si{};
     si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.hStdOutput = hWrite;
-    si.hStdError = hWrite;
+    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
     si.wShowWindow = SW_HIDE;
+    si.hStdOutput = hWritePipe;
+    si.hStdError = hWritePipe;
 
     PROCESS_INFORMATION pi{};
-    std::wstring mutableCmd = cmdLine;
-    BOOL ok = CreateProcessW(
-        nullptr,
-        mutableCmd.data(),
-        nullptr,
-        nullptr,
-        TRUE,
-        CREATE_NO_WINDOW,
-        nullptr,
-        nullptr,
-        &si,
-        &pi
-    );
-    CloseHandle(hWrite);
+    char cmdBuf[1024];
+    strncpy_s(cmdBuf, cmd.c_str(), sizeof(cmdBuf) - 1);
 
-    if (!ok) {
-        CloseHandle(hRead);
-        return "";
+    if (CreateProcessA(nullptr, cmdBuf, nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(hWritePipe);
+        char buf[512];
+        DWORD bytesRead = 0;
+        while (ReadFile(hReadPipe, buf, sizeof(buf) - 1, &bytesRead, nullptr) && bytesRead > 0) {
+            buf[bytesRead] = '\0';
+            result += buf;
+        }
+        WaitForSingleObject(pi.hProcess, 2000);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    } else {
+        CloseHandle(hWritePipe);
     }
-
-    std::string output;
-    char buf[1024];
-    DWORD bytesRead = 0;
-    while (ReadFile(hRead, buf, sizeof(buf), &bytesRead, nullptr) && bytesRead > 0) {
-        output.append(buf, bytesRead);
-    }
-
-    WaitForSingleObject(pi.hProcess, 3000);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    CloseHandle(hRead);
-    return output;
+    CloseHandle(hReadPipe);
+    return result;
 }
 
-// Сканування підключених по USB смартфонів через `adb devices -l`
-std::vector<UsbDeviceEntry> ScanConnectedUsbDevices() {
-    std::vector<UsbDeviceEntry> list;
-    std::wstring adbPath = ResolveAdbExecutablePath();
-    std::string out = RunHiddenCommandOutput(L"\"" + adbPath + L"\" devices -l");
-    if (out.empty()) return list;
+std::vector<UsbDeviceItem> ScanConnectedAdbDevices() {
+    std::vector<UsbDeviceItem> list;
+    std::string out = ExecuteCommandSilent("adb devices -l");
+    std::istringstream stream(out);
+    std::string line;
 
-    size_t pos = 0;
-    while (pos < out.size()) {
-        size_t end = out.find('\n', pos);
-        if (end == std::string::npos) end = out.size();
-        std::string line = out.substr(pos, end - pos);
-        pos = end + 1;
-
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty() || line.find("List of devices") != std::string::npos || line[0] == '*') continue;
-
-        // Розбір рядка: "<serial>   device product:... model:SM_S948B device:..."
-        size_t spacePos = line.find_first_of(" \t");
-        if (spacePos == std::string::npos) continue;
-        std::string serial = line.substr(0, spacePos);
-        std::string rest = line.substr(spacePos);
-
-        // Ігноруємо мережеві ADB-з'єднання, залишаємо фізичні USB
-        if (serial.find(':') != std::string::npos) continue;
-
-        bool isUnauthorized = (rest.find("unauthorized") != std::string::npos);
-        bool isOffline = (rest.find("offline") != std::string::npos);
-        if (isOffline) continue;
-
-        std::string modelName = "Android USB Smartphone";
-        size_t mPos = rest.find("model:");
-        if (mPos != std::string::npos) {
-            size_t mStart = mPos + 6;
-            size_t mEnd = rest.find_first_of(" \t\r\n", mStart);
-            modelName = rest.substr(mStart, (mEnd == std::string::npos) ? std::string::npos : (mEnd - mStart));
-            std::replace(modelName.begin(), modelName.end(), '_', ' ');
+    bool headerPassed = false;
+    while (std::getline(stream, line)) {
+        if (!headerPassed) {
+            if (line.find("List of devices attached") != std::string::npos) {
+                headerPassed = true;
+            }
+            continue;
         }
+        if (line.empty() || line[0] == '\r') continue;
 
-        UsbDeviceEntry entry;
-        entry.serial = serial;
-        entry.authorized = !isUnauthorized;
-        std::wstring wModel = Utf8ToWide(modelName);
-        std::wstring wSerial = Utf8ToWide(serial);
-        if (isUnauthorized) {
-            entry.displayName = wModel + L" (" + wSerial + L") — Підтвердіть USB на телефоні!";
-        } else {
-            entry.displayName = wModel + L"  [" + wSerial + L"]";
-        }
-        list.push_back(entry);
-    }
-
-    // Якщо є авторизований пристрій — автоматично прокидаємо порт TCP 8554 для нього
-    for (const auto& dev : list) {
-        if (dev.authorized) {
-            std::wstring wSer = Utf8ToWide(dev.serial);
-            RunHiddenCommandOutput(L"\"" + adbPath + L"\" -s " + wSer + L" forward tcp:8554 tcp:8554");
-            break;
+        std::istringstream lineStream(line);
+        std::string serial, state;
+        if (lineStream >> serial >> state) {
+            std::string model = "Android Device";
+            std::string token;
+            while (lineStream >> token) {
+                if (token.rfind("model:", 0) == 0) {
+                    model = token.substr(6);
+                    std::replace(model.begin(), model.end(), '_', ' ');
+                }
+            }
+            list.push_back({serial, model, state});
         }
     }
     return list;
 }
 
-// Перевірка реєстрації DirectShow фільтра EyeCam у реєстрі Windows
+bool ForwardAdbPort(const std::string& serial, uint16_t port) {
+    std::string cmd = "adb ";
+    if (!serial.empty()) {
+        cmd += "-s " + serial + " ";
+    }
+    cmd += "forward tcp:" + std::to_string(port) + " tcp:" + std::to_string(port);
+    std::string out = ExecuteCommandSilent(cmd);
+    return out.find("error") == std::string::npos;
+}
+
+// ============================================================================
+// Перевірка та реєстрація DirectShow фільтра віртуальної камери
+// ============================================================================
 bool CheckDirectShowDriverRegistered() {
     HKEY hKey = nullptr;
-    const wchar_t* subKey = L"CLSID\\{5C9D017A-C081-4FE7-99E4-500D06474F29}\\InprocServer32";
-    LONG res = RegOpenKeyExW(HKEY_CLASSES_ROOT, subKey, 0, KEY_READ, &hKey);
-    if (res == ERROR_SUCCESS && hKey != nullptr) {
+    // CLSID віртуальної камери EyeCam DirectShow Filter:
+    // {8A9E1983-4712-4C10-B180-22D2C2081985}
+    const wchar_t* subkey = L"CLSID\\{8A9E1983-4712-4C10-B180-22D2C2081985}";
+    if (RegOpenKeyExW(HKEY_CLASSES_ROOT, subkey, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         RegCloseKey(hKey);
         return true;
     }
     return false;
 }
 
-// Реєстрація DirectShow фільтра EyeCamFilter.dll з підвищенням прав (UAC)
-bool RegisterDirectShowDriver(HWND hwnd) {
+bool RegisterDirectShowDriver() {
     wchar_t exePath[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-    std::wstring dirPath(exePath);
-    size_t pos = dirPath.find_last_of(L"\\/");
-    if (pos != std::wstring::npos) {
-        dirPath = dirPath.substr(0, pos);
+    std::wstring dir(exePath);
+    size_t lastSlash = dir.find_last_of(L"\\/");
+    if (lastSlash != std::wstring::npos) {
+        dir = dir.substr(0, lastSlash);
     }
-    std::wstring dllPath = dirPath + L"\\EyeCamFilter.dll";
+    std::wstring dllPath = dir + L"\\EyeCamFilter.dll";
 
     if (GetFileAttributesW(dllPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        MessageBoxW(hwnd,
-            L"Файл EyeCamFilter.dll не знайдено у директорії програми.\n"
-            L"Переконайтеся, що EyeCamFilter.dll знаходиться поруч із EyeCamStudio.exe.",
-            L"EyeCam Studio — Помилка драйвера",
-            MB_ICONWARNING | MB_OK);
-        return false;
+        // Також шукаємо в батьківській папці або build
+        dllPath = dir + L"\\bin\\EyeCamFilter.dll";
     }
 
-    std::wstring params = L"/s \"" + dllPath + L"\"";
+    std::wstring cmd = L"regsvr32.exe /s \"" + dllPath + L"\"";
     SHELLEXECUTEINFOW sei{};
     sei.cbSize = sizeof(sei);
     sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-    sei.hwnd = hwnd;
-    sei.lpVerb = L"runas";
+    sei.lpVerb = L"runas"; // Вимагає UAC підвищення прав для реєстрації COM фільтра
     sei.lpFile = L"regsvr32.exe";
+    std::wstring params = L"/s \"" + dllPath + L"\"";
     sei.lpParameters = params.c_str();
     sei.nShow = SW_HIDE;
 
-    if (ShellExecuteExW(&sei)) {
-        if (sei.hProcess) {
-            WaitForSingleObject(sei.hProcess, 5000);
-            CloseHandle(sei.hProcess);
-        }
+    if (ShellExecuteExW(&sei) && sei.hProcess) {
+        WaitForSingleObject(sei.hProcess, 5000);
+        CloseHandle(sei.hProcess);
         return CheckDirectShowDriverRegistered();
     }
     return false;
@@ -398,90 +313,55 @@ public:
     bool Initialize(HINSTANCE hInstance, int nCmdShow) {
         WSADATA wsaData{};
         WSAStartup(MAKEWORD(2, 2), &wsaData);
-        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-
-        HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &m_pD2DFactory);
-        if (FAILED(hr)) return false;
-
-        hr = DWriteCreateFactory(
-            DWRITE_FACTORY_TYPE_SHARED,
-            __uuidof(IDWriteFactory),
-            reinterpret_cast<IUnknown**>(&m_pDWriteFactory)
-        );
-        if (FAILED(hr)) return false;
-
-        CreateTextFormats();
-
-        // Завантаження фірмової іконки ноутбука з оком та бліком об'єктива (eyecam_pc.ico)
-        HICON hAppIcon = LoadCustomStudioIcon(hInstance);
 
         WNDCLASSEXW wc{};
         wc.cbSize = sizeof(WNDCLASSEXW);
         wc.style = CS_HREDRAW | CS_VREDRAW;
-        wc.lpfnWndProc = EyeCamStudioWindow::WndProc;
+        wc.lpfnWndProc = WndProcThunk;
         wc.hInstance = hInstance;
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        wc.hIcon = hAppIcon;
-        wc.hIconSm = hAppIcon;
+        wc.hbrBackground = nullptr;
         wc.lpszClassName = L"EyeCamStudioWin11Class";
-        RegisterClassExW(&wc);
 
-        m_hwnd = CreateWindowExW(
-            0,
+        // Програмна генерація іконки: стилізоване око з бліком об'єктиву у рамці монітора
+        HICON hIcon = GenerateEyeCamWindowIcon();
+        wc.hIcon = hIcon;
+        wc.hIconSm = hIcon;
+
+        if (!RegisterClassExW(&wc)) return false;
+
+        const int w = 1180;
+        const int h = 760;
+        int screenW = GetSystemMetrics(SM_CXSCREEN);
+        int screenH = GetSystemMetrics(SM_CYSCREEN);
+        int posX = (screenW - w) / 2;
+        int posY = (screenH - h) / 2;
+
+        m_hWnd = CreateWindowExW(
+            WS_EX_APPWINDOW,
             wc.lpszClassName,
-            L"EyeCam Studio — Ultra-Low Latency 4K Virtual Webcam",
-            WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT, CW_USEDEFAULT, 1280, 780,
+            L"EyeCam Studio — Віртуальна 4K веб-камера нового покоління",
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+            posX, posY, w, h,
             nullptr, nullptr, hInstance, this
         );
-        if (!m_hwnd) return false;
 
-        SendMessageW(m_hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(hAppIcon));
-        SendMessageW(m_hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(hAppIcon));
+        if (!m_hWnd) return false;
 
-        // Активація темної теми заголовка Windows 11 та заокруглених кутів
-        BOOL darkMode = TRUE;
-        DwmSetWindowAttribute(m_hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &darkMode, sizeof(darkMode));
-        DWORD cornerPref = 2; // DWMWCP_ROUND
-        DwmSetWindowAttribute(m_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cornerPref, sizeof(cornerPref));
-        COLORREF captionCol = RGB(11, 14, 20);
-        DwmSetWindowAttribute(m_hwnd, DWMWA_CAPTION_COLOR, &captionCol, sizeof(captionCol));
+        if (!InitDirect2D()) return false;
 
-        m_state.isDriverRegistered = CheckDirectShowDriverRegistered();
+        m_state.isDirectShowRegistered = CheckDirectShowDriverRegistered();
 
-        if (!m_state.isDriverRegistered) {
-            wchar_t exePath[MAX_PATH]{};
-            GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-            std::wstring dirPath(exePath);
-            size_t pos = dirPath.find_last_of(L"\\/");
-            if (pos != std::wstring::npos) dirPath = dirPath.substr(0, pos);
-            std::wstring dllPath = dirPath + L"\\EyeCamFilter.dll";
-            HMODULE hFilter = LoadLibraryW(dllPath.c_str());
-            if (hFilter) {
-                using DllRegFn = HRESULT(STDAPICALLTYPE*)();
-                auto fn = reinterpret_cast<DllRegFn>(GetProcAddress(hFilter, "DllRegisterServer"));
-                if (fn && SUCCEEDED(fn())) {
-                    m_state.isDriverRegistered = true;
-                }
-                FreeLibrary(hFilter);
-            }
-        }
+        // Початкове сканування USB пристроїв
+        RefreshUsbDeviceListAsync();
 
-        // Початкове сканування USB ADB пристроїв у фоновому потоці
-        RefreshUsbDevicesAsync();
-
-        // Запуск каналу спільної пам'яті DirectShow віртуальної камери
-        m_sink.Open(m_state.width, m_state.height, EyeCam::PixelFormat::YUY2, m_state.fps);
-
-        // Запуск фонового потоку підключення до смартфона (TCP :8554 — відео + керування)
         m_running = true;
         m_streamThread = std::thread(&EyeCamStudioWindow::PhoneStreamClientLoop, this);
 
-        SetTimer(m_hwnd, 1, 30, nullptr);   // ~33 FPS оновлення UI
-        SetTimer(m_hwnd, 2, 4000, nullptr); // Авто-оновлення списку USB пристроїв кожні 4 с
+        ShowWindow(m_hWnd, nCmdShow);
+        UpdateWindow(m_hWnd);
 
-        ShowWindow(m_hwnd, nCmdShow);
-        UpdateWindow(m_hwnd);
+        SetTimer(m_hWnd, 1, 16, nullptr); // ~60 кадрів/сек для плавної анімації інтерфейсу
         return true;
     }
 
@@ -495,27 +375,169 @@ public:
     }
 
 private:
-    void CreateTextFormats() {
+    HWND m_hWnd = nullptr;
+    ID2D1Factory* m_pD2DFactory = nullptr;
+    ID2D1HwndRenderTarget* m_pRenderTarget = nullptr;
+    IDWriteFactory* m_pDWriteFactory = nullptr;
+    ID2D1SolidColorBrush* m_pBrush = nullptr;
+    ID2D1Bitmap* m_pPreviewBitmap = nullptr;
+
+    IDWriteTextFormat* m_pFontTitle = nullptr;
+    IDWriteTextFormat* m_pFontSection = nullptr;
+    IDWriteTextFormat* m_pFontBody = nullptr;
+    IDWriteTextFormat* m_pFontMono = nullptr;
+
+    StudioState m_state{};
+    EyeCam::WindowsDirectShowSink m_sink{};
+
+    std::atomic<bool> m_running{false};
+    std::atomic<bool> m_usbScanInProgress{false};
+    std::mutex m_socketMutex;
+    std::mutex m_usbMutex;
+    std::mutex m_frameMutex;
+    SOCKET m_phoneSocket = INVALID_SOCKET;
+    std::thread m_streamThread;
+
+    uint32_t m_frameTick = 0;
+    bool m_hasLiveFrame = false;
+    std::vector<uint8_t> m_previewPixels;
+    std::vector<uint8_t> m_yuy2Buffer;
+    std::vector<uint8_t> m_fullBgraBuffer;
+    std::vector<uint8_t> m_cachedPreviewBuffer;
+
+    // Інтерактивні зони UI
+    UiRect m_rcTransportTabs[2]{};
+    UiRect m_rcIpInput{};
+    UiRect m_rcUsbDropdown{};
+    UiRect m_rcBtnRefreshUsb{};
+    std::vector<UiRect> m_rcUsbItems;
+    UiRect m_rcBtnStartStop{};
+    UiRect m_rcBtnRegisterDriver{};
+    UiRect m_rcLensBtns[7]{};
+    UiRect m_rcZoomSlider{};
+    UiRect m_rcResBtns[4]{};
+    UiRect m_rcBtnModeToggle{};
+    UiRect m_rcBtnRefocus{};
+    UiRect m_rcSliders[4]{};
+    UiRect m_rcBtnMirror{};
+    UiRect m_rcBtnGrid{};
+    int m_activeSliderDrag = -1;
+
+    // ========================================================================
+    // Генерація системної іконки вікна: рамка ноутбука + діафрагма ока з бліком
+    // ========================================================================
+    HICON GenerateEyeCamWindowIcon() {
+        const int s = 32;
+        HDC hdc = GetDC(nullptr);
+        HDC memDC = CreateCompatibleDC(hdc);
+        HBITMAP hBitmap = CreateCompatibleBitmap(hdc, s, s);
+        HBITMAP hOldBmp = (HBITMAP)SelectObject(memDC, hBitmap);
+
+        HBRUSH bgBrush = CreateSolidBrush(RGB(12, 14, 18));
+        RECT r{0, 0, s, s};
+        FillRect(memDC, &r, bgBrush);
+        DeleteObject(bgBrush);
+
+        // Рамка екрана / ноутбука
+        HPEN framePen = CreatePen(PS_SOLID, 2, RGB(40, 46, 57));
+        HPEN oldPen = (HPEN)SelectObject(memDC, framePen);
+        SelectObject(memDC, GetStockObject(NULL_BRUSH));
+        RoundRect(memDC, 2, 3, 30, 25, 4, 4);
+
+        // Підставка ноутбука
+        MoveToEx(memDC, 5, 27, nullptr);
+        LineTo(memDC, 27, 27);
+        MoveToEx(memDC, 12, 28, nullptr);
+        LineTo(memDC, 20, 28);
+        SelectObject(memDC, oldPen);
+        DeleteObject(framePen);
+
+        // Зовнішній контур ока
+        HBRUSH cyanBrush = CreateSolidBrush(RGB(6, 182, 212));
+        HBRUSH oldBrush = (HBRUSH)SelectObject(memDC, cyanBrush);
+        Ellipse(memDC, 6, 7, 26, 21);
+        SelectObject(memDC, oldBrush);
+        DeleteObject(cyanBrush);
+
+        // Зіниця ока (об'єктив)
+        HBRUSH darkBrush = CreateSolidBrush(RGB(8, 12, 18));
+        SelectObject(memDC, darkBrush);
+        Ellipse(memDC, 11, 9, 21, 19);
+        SelectObject(memDC, oldBrush);
+        DeleteObject(darkBrush);
+
+        // Блік лінзи об'єктива
+        HBRUSH flareBrush = CreateSolidBrush(RGB(240, 250, 255));
+        SelectObject(memDC, flareBrush);
+        Ellipse(memDC, 13, 11, 16, 14);
+        SelectObject(memDC, oldBrush);
+        DeleteObject(flareBrush);
+
+        SelectObject(memDC, hOldBmp);
+        DeleteDC(memDC);
+        ReleaseDC(nullptr, hdc);
+
+        HBITMAP hMask = CreateBitmap(s, s, 1, 1, nullptr);
+        ICONINFO ii{};
+        ii.fIcon = TRUE;
+        ii.hbmColor = hBitmap;
+        ii.hbmMask = hMask;
+
+        HICON icon = CreateIconIndirect(&ii);
+        DeleteObject(hBitmap);
+        DeleteObject(hMask);
+        return icon;
+    }
+
+    bool InitDirect2D() {
+        HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &m_pD2DFactory);
+        if (FAILED(hr)) return false;
+
+        hr = DWriteCreateFactory(
+            DWRITE_FACTORY_TYPE_SHARED,
+            __uuidof(IDWriteFactory),
+            reinterpret_cast<IUnknown**>(&m_pDWriteFactory)
+        );
+        if (FAILED(hr)) return false;
+
+        RECT rc{};
+        GetClientRect(m_hWnd, &rc);
+        D2D1_SIZE_U size = D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top);
+
+        hr = m_pD2DFactory->CreateHwndRenderTarget(
+            D2D1::RenderTargetProperties(),
+            D2D1::HwndRenderTargetProperties(m_hWnd, size, D2D1_PRESENT_OPTIONS_IMMEDIATELY),
+            &m_pRenderTarget
+        );
+        if (FAILED(hr)) return false;
+
+        m_pRenderTarget->CreateSolidColorBrush(COL_TEXT_PRIMARY, &m_pBrush);
+
         m_pDWriteFactory->CreateTextFormat(
             L"Segoe UI Variable Display", nullptr,
             DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-            19.0f, L"uk-UA", &m_pFontTitle
+            18.0f, L"uk-UA", &m_pFontTitle
         );
+
         m_pDWriteFactory->CreateTextFormat(
-            L"Segoe UI", nullptr,
+            L"Segoe UI Variable Text", nullptr,
             DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
             13.0f, L"uk-UA", &m_pFontSection
         );
+
         m_pDWriteFactory->CreateTextFormat(
-            L"Segoe UI", nullptr,
+            L"Segoe UI Variable Text", nullptr,
             DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
             12.0f, L"uk-UA", &m_pFontBody
         );
+
         m_pDWriteFactory->CreateTextFormat(
-            L"Consolas", nullptr,
-            DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-            12.0f, L"uk-UA", &m_pFontMono
+            L"Cascadia Code", nullptr,
+            DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+            11.5f, L"en-US", &m_pFontMono
         );
+
+        return true;
     }
 
     void Shutdown() {
@@ -524,46 +546,21 @@ private:
         if (m_streamThread.joinable()) {
             m_streamThread.join();
         }
-        m_sink.Close();
+        if (m_sink.IsOpen()) {
+            m_sink.Close();
+        }
 
         if (m_pPreviewBitmap) { m_pPreviewBitmap->Release(); m_pPreviewBitmap = nullptr; }
         if (m_pBrush) { m_pBrush->Release(); m_pBrush = nullptr; }
-        if (m_pRenderTarget) { m_pRenderTarget->Release(); m_pRenderTarget = nullptr; }
         if (m_pFontTitle) { m_pFontTitle->Release(); m_pFontTitle = nullptr; }
         if (m_pFontSection) { m_pFontSection->Release(); m_pFontSection = nullptr; }
         if (m_pFontBody) { m_pFontBody->Release(); m_pFontBody = nullptr; }
         if (m_pFontMono) { m_pFontMono->Release(); m_pFontMono = nullptr; }
+        if (m_pRenderTarget) { m_pRenderTarget->Release(); m_pRenderTarget = nullptr; }
         if (m_pDWriteFactory) { m_pDWriteFactory->Release(); m_pDWriteFactory = nullptr; }
         if (m_pD2DFactory) { m_pD2DFactory->Release(); m_pD2DFactory = nullptr; }
-        CoUninitialize();
+
         WSACleanup();
-    }
-
-    static HICON LoadCustomStudioIcon(HINSTANCE hInstance) {
-        wchar_t exePath[MAX_PATH]{};
-        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-        std::wstring dirPath(exePath);
-        size_t pos = dirPath.find_last_of(L"\\/");
-        if (pos != std::wstring::npos) {
-            dirPath = dirPath.substr(0, pos);
-        }
-
-        std::wstring primaryIconPath = dirPath + L"\\eyecam_pc.ico";
-        HICON hIco = static_cast<HICON>(LoadImageW(
-            nullptr, primaryIconPath.c_str(), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE
-        ));
-        if (hIco) return hIco;
-
-        std::wstring fallbackIconPath = dirPath + L"\\..\\..\\src\\windows\\gui\\eyecam_pc.ico";
-        hIco = static_cast<HICON>(LoadImageW(
-            nullptr, fallbackIconPath.c_str(), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE
-        ));
-        if (hIco) return hIco;
-
-        hIco = LoadIconW(hInstance, MAKEINTRESOURCEW(101));
-        if (hIco) return hIco;
-
-        return LoadIcon(nullptr, IDI_APPLICATION);
     }
 
     void CloseActivePhoneSocket() {
@@ -574,28 +571,29 @@ private:
         }
     }
 
-    void RefreshUsbDevicesAsync() {
-        if (m_usbScanInProgress.exchange(true)) return;
+    void RefreshUsbDeviceListAsync() {
+        if (m_usbScanInProgress) return;
+        m_usbScanInProgress = true;
+
         std::thread([this]() {
-            auto found = ScanConnectedUsbDevices();
+            auto devices = ScanConnectedAdbDevices();
             {
                 std::lock_guard<std::mutex> lock(m_usbMutex);
-                m_state.usbDevices = std::move(found);
-                if (m_state.selectedUsbIdx >= static_cast<int>(m_state.usbDevices.size())) {
-                    m_state.selectedUsbIdx = 0;
+                m_state.usbDevices = std::move(devices);
+                if (m_state.selectedUsbIdx < 0 || m_state.selectedUsbIdx >= static_cast<int>(m_state.usbDevices.size())) {
+                    m_state.selectedUsbIdx = m_state.usbDevices.empty() ? -1 : 0;
                 }
             }
             m_usbScanInProgress = false;
-            if (m_hwnd) InvalidateRect(m_hwnd, nullptr, FALSE);
+            InvalidateRect(m_hWnd, nullptr, FALSE);
         }).detach();
     }
 
-    // Надсилання JSON-команди керування смартфону по активному або новому сокету
     void SendControlJson(const std::string& jsonPayload) {
         std::thread([this, jsonPayload]() {
-            uint8_t header[8];
-            header[0] = 0x43; // 'C'
-            header[1] = 0x50; // 'P'
+            uint8_t header[8]{};
+            header[0] = 0x43;
+            header[1] = 0x50;
             header[2] = 0x00;
             header[3] = 0x01; // MSG_TYPE_JSON_COMMAND = 1
             uint32_t len = static_cast<uint32_t>(jsonPayload.size());
@@ -804,17 +802,20 @@ private:
                             WICBitmapPaletteTypeCustom
                         );
                         if (SUCCEEDED(hr)) {
-                            std::vector<uint8_t> fullBgra(imgW * imgH * 4);
+                            size_t requiredBgra = static_cast<size_t>(imgW) * imgH * 4;
+                            if (m_fullBgraBuffer.size() != requiredBgra) {
+                                m_fullBgraBuffer.resize(requiredBgra);
+                            }
                             hr = pFullConverter->CopyPixels(
                                 nullptr,
                                 imgW * 4,
-                                static_cast<UINT>(fullBgra.size()),
-                                fullBgra.data()
+                                static_cast<UINT>(requiredBgra),
+                                m_fullBgraBuffer.data()
                             );
                             if (SUCCEEDED(hr)) {
                                 if (m_state.mirrorHorizontal) {
                                     for (UINT y = 0; y < imgH; ++y) {
-                                        uint8_t* row = fullBgra.data() + y * imgW * 4;
+                                        uint8_t* row = m_fullBgraBuffer.data() + y * imgW * 4;
                                         for (UINT x = 0; x < imgW / 2; ++x) {
                                             UINT rx = imgW - 1 - x;
                                             for (int c = 0; c < 4; ++c) {
@@ -823,62 +824,37 @@ private:
                                         }
                                     }
                                 }
-                                PushFrameToDirectShow(fullBgra.data(), imgW, imgH);
+                                PushFrameToDirectShow(m_fullBgraBuffer.data(), imgW, imgH);
+
+                                // 2. Швидкий прямокутний даунсемплінг у 640x360 для UI прев'ю без другого циклу WIC (< 0.2 мс)
+                                const uint32_t pw = 640;
+                                const uint32_t ph = 360;
+                                size_t previewSize = static_cast<size_t>(pw) * ph * 4;
+                                if (m_cachedPreviewBuffer.size() != previewSize) {
+                                    m_cachedPreviewBuffer.resize(previewSize);
+                                }
+
+                                const uint32_t* srcPixels = reinterpret_cast<const uint32_t*>(m_fullBgraBuffer.data());
+                                uint32_t* dstPixels = reinterpret_cast<uint32_t*>(m_cachedPreviewBuffer.data());
+
+                                for (uint32_t y = 0; y < ph; ++y) {
+                                    uint32_t srcY = (y * imgH) / ph;
+                                    const uint32_t* srcRow = srcPixels + srcY * imgW;
+                                    uint32_t* dstRow = dstPixels + y * pw;
+                                    for (uint32_t x = 0; x < pw; ++x) {
+                                        uint32_t srcX = (x * imgW) / pw;
+                                        dstRow[x] = srcRow[srcX];
+                                    }
+                                }
+
+                                {
+                                    std::lock_guard<std::mutex> lock(m_frameMutex);
+                                    m_previewPixels = m_cachedPreviewBuffer;
+                                    m_hasLiveFrame = true;
+                                }
                             }
                         }
                         pFullConverter->Release();
-                    }
-
-                    // 2. Масштабування до 640x360 виключно для відмальовки прев'ю у вікні програми
-                    const uint32_t pw = 640;
-                    const uint32_t ph = 360;
-                    IWICBitmapScaler* pScaler = nullptr;
-                    hr = pWicFactory->CreateBitmapScaler(&pScaler);
-                    if (SUCCEEDED(hr) && pScaler) {
-                        hr = pScaler->Initialize(pFrame, pw, ph, WICBitmapInterpolationModeLinear);
-                        if (SUCCEEDED(hr)) {
-                            IWICFormatConverter* pPreviewConverter = nullptr;
-                            hr = pWicFactory->CreateFormatConverter(&pPreviewConverter);
-                            if (SUCCEEDED(hr) && pPreviewConverter) {
-                                hr = pPreviewConverter->Initialize(
-                                    pScaler,
-                                    GUID_WICPixelFormat32bppBGRA,
-                                    WICBitmapDitherTypeNone,
-                                    nullptr,
-                                    0.0,
-                                    WICBitmapPaletteTypeCustom
-                                );
-                                if (SUCCEEDED(hr)) {
-                                    std::vector<uint8_t> localPreview(pw * ph * 4);
-                                    hr = pPreviewConverter->CopyPixels(
-                                        nullptr,
-                                        pw * 4,
-                                        static_cast<UINT>(localPreview.size()),
-                                        localPreview.data()
-                                    );
-                                    if (SUCCEEDED(hr)) {
-                                        if (m_state.mirrorHorizontal) {
-                                            for (uint32_t y = 0; y < ph; ++y) {
-                                                uint8_t* row = localPreview.data() + y * pw * 4;
-                                                for (uint32_t x = 0; x < pw / 2; ++x) {
-                                                    uint32_t rx = pw - 1 - x;
-                                                    for (int c = 0; c < 4; ++c) {
-                                                        std::swap(row[x * 4 + c], row[rx * 4 + c]);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        {
-                                            std::lock_guard<std::mutex> lock(m_frameMutex);
-                                            m_previewPixels = std::move(localPreview);
-                                            m_hasLiveFrame = true;
-                                        }
-                                    }
-                                }
-                                pPreviewConverter->Release();
-                            }
-                        }
-                        pScaler->Release();
                     }
                 }
                 pFrame->Release();
@@ -910,392 +886,297 @@ private:
                 uint8_t g = p[1];
                 uint8_t r = p[2];
 
-                uint8_t yVal = static_cast<uint8_t>(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
-                uint8_t uVal = static_cast<uint8_t>(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
-                uint8_t vVal = static_cast<uint8_t>(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
+                int y0 = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+                int u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+                int v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
 
-                size_t dIdx = x * 2;
-                dstRow[dIdx + 0] = yVal;
-                dstRow[dIdx + 1] = uVal;
-                dstRow[dIdx + 2] = yVal;
-                dstRow[dIdx + 3] = vVal;
+                uint32_t srcX2 = ((x + 1) * inW) / outW;
+                const uint8_t* p2 = srcRow + (srcX2 * 4);
+                int y1 = ((66 * p2[2] + 129 * p2[1] + 25 * p2[0] + 128) >> 8) + 16;
+
+                dstRow[x * 2 + 0] = static_cast<uint8_t>(std::clamp(y0, 0, 255));
+                dstRow[x * 2 + 1] = static_cast<uint8_t>(std::clamp(u, 0, 255));
+                dstRow[x * 2 + 2] = static_cast<uint8_t>(std::clamp(y1, 0, 255));
+                dstRow[x * 2 + 3] = static_cast<uint8_t>(std::clamp(v, 0, 255));
             }
         }
 
         if (m_sink.IsOpen()) {
-            if (m_sink.WriteFrame(m_yuy2Buffer.data(), m_yuy2Buffer.size())) {
-                m_state.shmFramesWritten++;
-            }
+            m_sink.PushFrame(m_yuy2Buffer.data(), m_yuy2Buffer.size(), EyeCam::PixelFormat::YUY2);
         }
     }
 
-    void EnsureRenderTarget() {
-        if (!m_pRenderTarget) {
-            RECT rc{};
-            GetClientRect(m_hwnd, &rc);
-            UINT32 w = (std::max)(1u, static_cast<UINT32>(rc.right - rc.left));
-            UINT32 h = (std::max)(1u, static_cast<UINT32>(rc.bottom - rc.top));
-            D2D1_SIZE_U size = D2D1::SizeU(w, h);
-
-            m_pD2DFactory->CreateHwndRenderTarget(
-                D2D1::RenderTargetProperties(),
-                D2D1::HwndRenderTargetProperties(m_hwnd, size),
-                &m_pRenderTarget
-            );
-
-            if (m_pRenderTarget) {
-                m_pRenderTarget->CreateSolidColorBrush(COL_TEXT_PRIMARY, &m_pBrush);
-
-                D2D1_BITMAP_PROPERTIES bmpProps = D2D1::BitmapProperties(
-                    D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE)
-                );
-                m_pRenderTarget->CreateBitmap(D2D1::SizeU(640, 360), nullptr, 0, bmpProps, &m_pPreviewBitmap);
-            }
-        }
-    }
-
-    void DrawRoundedCard(const UiRect& r, const D2D1_COLOR_F& fill, const D2D1_COLOR_F& border, float radius = 10.0f) {
-        D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(r.ToD2D(), radius, radius);
-        m_pBrush->SetColor(fill);
-        m_pRenderTarget->FillRoundedRectangle(rr, m_pBrush);
-        m_pBrush->SetColor(border);
-        m_pRenderTarget->DrawRoundedRectangle(rr, m_pBrush, 1.0f);
-    }
-
-    void DrawTextStr(const std::wstring& text, const UiRect& r, IDWriteTextFormat* fmt, const D2D1_COLOR_F& color,
-                     DWRITE_TEXT_ALIGNMENT align = DWRITE_TEXT_ALIGNMENT_LEADING) {
-        if (!fmt) return;
-        fmt->SetTextAlignment(align);
-        fmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-        m_pBrush->SetColor(color);
-        m_pRenderTarget->DrawText(
-            text.c_str(),
-            static_cast<UINT32>(text.size()),
-            fmt,
-            r.ToD2D(),
-            m_pBrush
-        );
-    }
-
-    // Малювання фірмової іконки ПК-застосунку (Рамка ноутбука + Око з бліком об'єктива) у шапці вікна
-    void DrawLaptopEyeLogo(float x, float y, float h) {
-        float cx = x + h * 0.55f;
-        float cy = y + h * 0.46f;
-
-        // 1. Рамка екрана ноутбука
-        UiRect screenRect{x + 2.0f, y + 4.0f, x + h * 1.10f - 2.0f, y + h - 8.0f};
-        DrawRoundedCard(screenRect, HexColor(0x0D131D), COL_CYAN, 4.0f);
-
-        // Нижня дека ноутбука
-        UiRect baseRect{x - 2.0f, y + h - 7.0f, x + h * 1.10f + 2.0f, y + h - 3.0f};
-        DrawRoundedCard(baseRect, COL_BG_CARD, COL_CYAN, 2.0f);
-
-        // 2. Зовнішній контур ока (Смарагдовий)
-        m_pBrush->SetColor(COL_EMERALD);
-        m_pRenderTarget->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 12.5f, 7.5f), m_pBrush, 1.8f);
-
-        // 3. Лінза об'єктива всередині ока
-        m_pBrush->SetColor(HexColor(0x0B2536));
-        m_pRenderTarget->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 6.2f, 6.2f), m_pBrush);
-        m_pBrush->SetColor(COL_CYAN);
-        m_pRenderTarget->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 6.2f, 6.2f), m_pBrush, 1.4f);
-
-        // Зіниця
-        m_pBrush->SetColor(HexColor(0x04070B));
-        m_pRenderTarget->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 3.0f, 3.0f), m_pBrush);
-
-        // 4. Блік як від об'єктиву (верхній лівий кут лінзи)
-        m_pBrush->SetColor(HexColor(0xFFFFFF, 0.95f));
-        m_pRenderTarget->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx - 2.2f, cy - 2.2f), 2.0f, 1.4f), m_pBrush);
-    }
-
-    void OnPaint() {
-        EnsureRenderTarget();
+    // ========================================================================
+    // Отрисовка інтерфейсу EyeCam Studio (Direct2D Win11 Fluent Dark)
+    // ========================================================================
+    void Render() {
         if (!m_pRenderTarget) return;
 
-        m_frameTick++;
         m_pRenderTarget->BeginDraw();
-        m_pRenderTarget->Clear(COL_BG_MAIN);
+        m_pRenderTarget->Clear(COL_BG_DARK);
 
-        D2D1_SIZE_F sz = m_pRenderTarget->GetSize();
-        float W = sz.width;
-        float H = sz.height;
+        RECT rcClient{};
+        GetClientRect(m_hWnd, &rcClient);
+        float width = static_cast<float>(rcClient.right);
+        float height = static_cast<float>(rcClient.bottom);
 
-        const float pad = 16.0f;
-        const float leftW = 305.0f;
-        const float rightW = 325.0f;
-        const float topBarH = 56.0f;
+        // 1. Верхній Fluent Header (Логотип, Заголовок, Статус драйвера віртуальної камери)
+        DrawHeader(width);
 
-        // ====================================================================
-        // 1. ВЕРХНІЙ ЗАГОЛОВОК СТУДІЇ (Header Bar з іконкою Ноутбук+Око)
-        // ====================================================================
-        UiRect headerRect{pad, pad, W - pad, pad + topBarH};
-        DrawRoundedCard(headerRect, COL_BG_PANEL, COL_BORDER, 12.0f);
+        // 2. Ліва колонка: Велике 16:9 вікно попереднього перегляду камери + Телеметрія потоку
+        DrawPreviewSection(24.0f, 68.0f, 650.0f, height - 88.0f);
 
-        DrawLaptopEyeLogo(pad + 16.0f, pad + 10.0f, 36.0f);
-        DrawTextStr(L"EYECAM STUDIO", {pad + 64, pad, pad + 290, pad + topBarH}, m_pFontTitle, COL_TEXT_PRIMARY);
-        DrawTextStr(L"4K UHD DirectShow & ADB/Wi-Fi Pro Camera Engine", {pad + 245, pad + 2, pad + 680, pad + topBarH}, m_pFontBody, COL_TEXT_SECOND);
+        // 3. Права колонка: Налаштування з'єднання, оптика (0.5x..10x), 4K резолюція, ISP та ефекти
+        DrawControlsPanel(694.0f, 68.0f, width - 24.0f, height - 24.0f);
 
-        // Індикатор статусу драйвера DirectShow у шапці
-        UiRect drvBadge{W - pad - 250, pad + 12, W - pad - 16, pad + topBarH - 12};
-        DrawRoundedCard(drvBadge, m_state.isDriverRegistered ? HexColor(0x092E20) : HexColor(0x332409),
-                        m_state.isDriverRegistered ? COL_EMERALD : COL_AMBER, 16.0f);
-        DrawTextStr(
-            m_state.isDriverRegistered ? L"● DirectShow Webcam: ACTIVE" : L"▲ DirectShow: НЕ ЗАРЕЄСТРОВАНО",
-            drvBadge, m_pFontMono, m_state.isDriverRegistered ? COL_EMERALD : COL_AMBER,
-            DWRITE_TEXT_ALIGNMENT_CENTER
-        );
-
-        float contentTop = headerRect.bottom + pad;
-        float contentBottom = H - pad;
-
-        // ====================================================================
-        // 2. ЛІВА ПАНЕЛЬ: Підключення (Wi-Fi LAN або Випадаючий список USB)
-        // ====================================================================
-        UiRect leftPanel{pad, contentTop, pad + leftW, contentBottom};
-        DrawRoundedCard(leftPanel, COL_BG_PANEL, COL_BORDER, 12.0f);
-
-        float lx = leftPanel.left + 16;
-        float rx = leftPanel.right - 16;
-        float cy = leftPanel.top + 16;
-
-        DrawTextStr(L"1. СПОСІБ ПІДКЛЮЧЕННЯ", {lx, cy, rx, cy + 24}, m_pFontSection, COL_TEXT_PRIMARY);
-        cy += 30;
-
-        // Лише 2 вкладки: Wi-Fi (LAN) та USB (Кабель) — без тест-потоку
-        float tabW = (rx - lx - 8.0f) * 0.5f;
-        const wchar_t* tabNames[2] = {L"Wi-Fi (LAN)", L"USB (Кабель)"};
-        for (int i = 0; i < 2; ++i) {
-            m_rcTransportTabs[i] = {lx + i * (tabW + 8.0f), cy, lx + i * (tabW + 8.0f) + tabW, cy + 36.0f};
-            bool active = (static_cast<int>(m_state.transport) == i);
-            DrawRoundedCard(m_rcTransportTabs[i], active ? COL_CYAN : COL_BG_CARD, active ? COL_CYAN : COL_BORDER, 8.0f);
-            DrawTextStr(tabNames[i], m_rcTransportTabs[i], m_pFontSection,
-                        active ? HexColor(0x05080D) : COL_TEXT_PRIMARY, DWRITE_TEXT_ALIGNMENT_CENTER);
-        }
-        cy += 48;
-
-        if (m_state.transport == TransportTab::WIFI_LAN) {
-            // У режимі Wi-Fi показуємо поле вводу IP-адреси смартфона
-            DrawTextStr(L"IP-адреса смартфона (див. у додатку):", {lx, cy, rx, cy + 20}, m_pFontBody, COL_TEXT_SECOND);
-            cy += 24;
-            m_rcIpInput = {lx, cy, rx, cy + 38};
-            m_rcUsbDropdown = {0, 0, 0, 0};
-            m_rcBtnRefreshUsb = {0, 0, 0, 0};
-
-            DrawRoundedCard(m_rcIpInput, HexColor(0x0D1117), m_state.ipInputFocused ? COL_CYAN : COL_BORDER, 8.0f);
-            std::wstring ipW(m_state.deviceIp.begin(), m_state.deviceIp.end());
-            if (m_state.ipInputFocused && ((m_frameTick / 15) % 2 == 0)) ipW += L"|";
-            DrawTextStr(L"  " + ipW, m_rcIpInput, m_pFontMono, COL_TEXT_PRIMARY);
-            cy += 46;
-
-            DrawTextStr(L"Порт синхронізації та відео (TCP): 8554", {lx, cy, rx, cy + 20}, m_pFontBody, COL_TEXT_DIM);
-            cy += 30;
-        } else {
-            // У режимі USB жодної IP-адреси не питаємо — показуємо випадаючий список USB пристроїв!
-            m_rcIpInput = {0, 0, 0, 0};
-            DrawTextStr(L"Виберіть смартфон, підключений по USB:", {lx, cy, rx, cy + 20}, m_pFontBody, COL_TEXT_SECOND);
-            cy += 24;
-
-            m_rcUsbDropdown = {lx, cy, rx, cy + 38};
-            DrawRoundedCard(m_rcUsbDropdown, HexColor(0x0D1117), m_state.usbDropdownOpen ? COL_CYAN : COL_BORDER, 8.0f);
-
-            std::wstring selectedUsbLabel = L"  Пристроїв USB не виявлено";
-            {
-                std::lock_guard<std::mutex> lock(m_usbMutex);
-                if (!m_state.usbDevices.empty()) {
-                    int idx = std::clamp(m_state.selectedUsbIdx, 0, static_cast<int>(m_state.usbDevices.size()) - 1);
-                    selectedUsbLabel = L"  " + m_state.usbDevices[idx].displayName;
-                }
-            }
-            DrawTextStr(selectedUsbLabel, {lx, cy, rx - 28, cy + 38}, m_pFontBody,
-                        m_state.usbDevices.empty() ? COL_AMBER : COL_EMERALD);
-            DrawTextStr(m_state.usbDropdownOpen ? L"▲" : L"▼", {rx - 28, cy, rx - 6, cy + 38}, m_pFontBody, COL_CYAN, DWRITE_TEXT_ALIGNMENT_CENTER);
-            cy += 44;
-
-            // Кнопка оновлення списку USB-пристроїв
-            m_rcBtnRefreshUsb = {lx, cy, rx, cy + 32};
-            DrawRoundedCard(m_rcBtnRefreshUsb, COL_BG_CARD, COL_BORDER, 8.0f);
-            DrawTextStr(L"↻  Оновити список USB-пристроїв", m_rcBtnRefreshUsb, m_pFontBody, COL_CYAN, DWRITE_TEXT_ALIGNMENT_CENTER);
-            cy += 40;
+        // 4. Оверлей випадного списку USB пристроїв, якщо він розгорнутий
+        if (m_state.usbDropdownOpen && m_state.transport == TransportTab::USB_ADB) {
+            DrawUsbDropdownOverlay();
         }
 
-        // Головна кнопка СТАРТ / СТОП трансляції
-        m_rcBtnStartStop = {lx, cy, rx, cy + 44};
+        m_pRenderTarget->EndDraw();
+    }
+
+    void DrawHeader(float width) {
+        m_pBrush->SetColor(COL_BG_CARD);
+        m_pRenderTarget->FillRectangle(D2D1::RectF(0.0f, 0.0f, width, 54.0f), m_pBrush);
+
+        m_pBrush->SetColor(COL_BORDER);
+        m_pRenderTarget->DrawLine(D2D1::Point2F(0.0f, 54.0f), D2D1::Point2F(width, 54.0f), m_pBrush, 1.0f);
+
+        // Логотип: синє стилізоване око з бліком
+        DrawLogoIcon(24.0f, 13.0f);
+
+        // Заголовок програми
+        DrawTextStr(L"EYECAM STUDIO", {62.0f, 10.0f, 260.0f, 32.0f}, m_pFontTitle, COL_TEXT_PRIMARY);
+        DrawTextStr(L"Win11 Fluent Dark • 4K UHD DirectShow Virtual Camera", {62.0f, 32.0f, 440.0f, 50.0f}, m_pFontMono, COL_TEXT_MUTED);
+
+        // Статус DirectShow фільтра віртуальної камери в системі
+        float btnW = 230.0f;
+        m_rcBtnRegisterDriver = {width - btnW - 24.0f, 12.0f, width - 24.0f, 42.0f};
+
+        bool reg = m_state.isDirectShowRegistered;
         DrawRoundedCard(
-            m_rcBtnStartStop,
-            m_state.isStreaming ? HexColor(0x3A121C) : COL_EMERALD,
-            m_state.isStreaming ? COL_CRIMSON : COL_EMERALD,
-            10.0f
+            m_rcBtnRegisterDriver,
+            reg ? HexColor(0x0E261D) : HexColor(0x2D1515),
+            reg ? COL_EMERALD : COL_RED,
+            6.0f
         );
+
+        std::wstring driverStatusText = reg ? L"✔ DirectShow Камера: АКТИВНА" : L"⚠ Зареєструвати драйвер камери";
         DrawTextStr(
-            m_state.isStreaming ? L"■  ЗУПИНИТИ ВІРТУАЛЬНУ КАМЕРУ" : L"▶  ЗАПУСТИТИ ТРАНСЛЯЦІЮ",
-            m_rcBtnStartStop, m_pFontSection,
-            m_state.isStreaming ? COL_CRIMSON : HexColor(0x06120C),
+            driverStatusText.c_str(),
+            m_rcBtnRegisterDriver,
+            m_pFontBody,
+            reg ? COL_EMERALD : HexColor(0xFCA5A5),
             DWRITE_TEXT_ALIGNMENT_CENTER
         );
-        cy += 58;
+    }
 
-        // Блок реєстрації системного драйвера DirectShow
-        DrawTextStr(L"2. СИСТЕМНИЙ ДРАЙВЕР КАМЕРИ", {lx, cy, rx, cy + 24}, m_pFontSection, COL_TEXT_PRIMARY);
-        cy += 28;
-
-        UiRect drvCard{lx, cy, rx, cy + 126};
-        DrawRoundedCard(drvCard, COL_BG_CARD, COL_BORDER, 10.0f);
-        DrawTextStr(L"Камера: EyeCam Virtual Camera", {lx + 12, cy + 8, rx - 12, cy + 30}, m_pFontBody, COL_TEXT_PRIMARY);
-        DrawTextStr(
-            m_state.isDriverRegistered
-                ? L"Статус: Зареєстровано в системі\nДоступна в OBS, Zoom, Discord, Teams"
-                : L"Статус: Потрібна реєстрація DLL\nНатисніть кнопку нижче (права Admin)",
-            {lx + 12, cy + 32, rx - 12, cy + 76}, m_pFontBody,
-            m_state.isDriverRegistered ? COL_EMERALD : COL_AMBER
+    void DrawLogoIcon(float x, float y) {
+        // Рамка ноутбука навколо ока
+        m_pBrush->SetColor(COL_BORDER);
+        m_pRenderTarget->DrawRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(x - 2.0f, y - 2.0f, x + 30.0f, y + 26.0f), 4.0f, 4.0f),
+            m_pBrush, 1.5f
         );
+        m_pRenderTarget->DrawLine(D2D1::Point2F(x + 2.0f, y + 29.0f), D2D1::Point2F(x + 26.0f, y + 29.0f), m_pBrush, 2.0f);
 
-        m_rcBtnRegisterDriver = {lx + 12, cy + 82, rx - 12, cy + 116};
-        DrawRoundedCard(m_rcBtnRegisterDriver, COL_BG_PANEL, COL_CYAN, 8.0f);
-        DrawTextStr(
-            m_state.isDriverRegistered ? L"↻ Перереєструвати драйвер (UAC)" : L"⚡ Зареєструвати камеру в системі",
-            m_rcBtnRegisterDriver, m_pFontBody, COL_CYAN, DWRITE_TEXT_ALIGNMENT_CENTER
-        );
+        // Зовнішній контур ока
+        m_pBrush->SetColor(COL_CYAN);
+        m_pRenderTarget->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x + 14.0f, y + 12.0f), 13.0f, 8.5f), m_pBrush);
 
-        // Якщо відкритий випадаючий список USB — малюємо його поверх лівої панелі
-        if (m_state.transport == TransportTab::USB_ADB && m_state.usbDropdownOpen) {
-            std::lock_guard<std::mutex> lock(m_usbMutex);
-            int count = static_cast<int>(m_state.usbDevices.size());
-            int rows = (count > 0) ? count : 1;
-            UiRect dropBox{m_rcUsbDropdown.left, m_rcUsbDropdown.bottom + 2, m_rcUsbDropdown.right, m_rcUsbDropdown.bottom + 2 + rows * 34.0f};
-            DrawRoundedCard(dropBox, COL_BG_DROPDOWN, COL_CYAN, 8.0f);
+        // Зіниця (об'єктив)
+        m_pBrush->SetColor(COL_BG_DARK);
+        m_pRenderTarget->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x + 14.0f, y + 12.0f), 5.5f, 5.5f), m_pBrush);
 
-            m_rcUsbItems.clear();
-            if (count == 0) {
-                DrawTextStr(L"  Немає активних USB ADB пристроїв", dropBox, m_pFontBody, COL_TEXT_SECOND);
-            } else {
-                for (int i = 0; i < count; ++i) {
-                    UiRect itemR{dropBox.left + 4, dropBox.top + i * 34.0f + 2, dropBox.right - 4, dropBox.top + (i + 1) * 34.0f - 2};
-                    m_rcUsbItems.push_back(itemR);
-                    if (i == m_state.selectedUsbIdx) {
-                        DrawRoundedCard(itemR, HexColor(0x162C3D), COL_CYAN, 6.0f);
-                    }
-                    DrawTextStr(L"  " + m_state.usbDevices[i].displayName, itemR, m_pFontBody, COL_TEXT_PRIMARY);
-                }
-            }
-        }
+        // Блік лінзи об'єктива
+        m_pBrush->SetColor(COL_TEXT_PRIMARY);
+        m_pRenderTarget->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x + 12.0f, y + 10.0f), 1.8f, 1.8f), m_pBrush);
+    }
 
-        // ====================================================================
-        // 3. ЦЕНТРАЛЬНИЙ В'ЮПОРТ (16:9 Live Video + Телеметрія)
-        // ====================================================================
-        UiRect centerPanel{leftPanel.right + pad, contentTop, W - pad - rightW - pad, contentBottom};
-        DrawRoundedCard(centerPanel, COL_BG_PANEL, COL_BORDER, 12.0f);
+    void DrawPreviewSection(float left, float top, float right, float bottom) {
+        float previewW = right - left;
+        float previewH = previewW * (9.0f / 16.0f); // 16:9 widescreen preview
 
-        float vpMargin = 16.0f;
-        float availW = centerPanel.Width() - vpMargin * 2;
-        float availH = centerPanel.Height() - vpMargin * 2 - 58.0f;
-        float videoW = availW;
-        float videoH = videoW * (9.0f / 16.0f);
-        if (videoH > availH) {
-            videoH = availH;
-            videoW = videoH * (16.0f / 9.0f);
-        }
-        float vx = centerPanel.left + (centerPanel.Width() - videoW) * 0.5f;
-        float vy = centerPanel.top + vpMargin + (availH - videoH) * 0.5f;
-        UiRect videoRect{vx, vy, vx + videoW, vy + videoH};
+        UiRect rcPreviewBox{left, top, right, top + previewH};
+        DrawRoundedCard(rcPreviewBox, HexColor(0x06080A), COL_BORDER, 10.0f);
 
-        bool hasFrame = false;
+        // Відмальовка живого кадру зі смартфона (WIC BGRA -> Direct2D Bitmap)
+        bool renderedLive = false;
         {
             std::lock_guard<std::mutex> lock(m_frameMutex);
-            hasFrame = m_hasLiveFrame && !m_previewPixels.empty();
-            if (hasFrame && m_pPreviewBitmap) {
-                D2D1_RECT_U copyRect = D2D1::RectU(0, 0, 640, 360);
-                m_pPreviewBitmap->CopyFromMemory(&copyRect, m_previewPixels.data(), 640 * 4);
+            if (m_hasLiveFrame && !m_previewPixels.empty()) {
+                const uint32_t pw = 640;
+                const uint32_t ph = 360;
+                if (!m_pPreviewBitmap) {
+                    D2D1_BITMAP_PROPERTIES props{};
+                    props.pixelFormat = D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED);
+                    m_pRenderTarget->CreateBitmap(D2D1::SizeU(pw, ph), props, &m_pPreviewBitmap);
+                }
+                if (m_pPreviewBitmap) {
+                    D2D1_RECT_U destRect{0, 0, pw, ph};
+                    m_pPreviewBitmap->CopyFromMemory(&destRect, m_previewPixels.data(), pw * 4);
+
+                    D2D1_RECT_F drawRect = D2D1::RectF(left + 2.0f, top + 2.0f, right - 2.0f, top + previewH - 2.0f);
+                    m_pRenderTarget->DrawBitmap(m_pPreviewBitmap, drawRect);
+                    renderedLive = true;
+                }
             }
         }
 
-        if (m_state.isStreaming && m_state.isPhoneConnected && hasFrame && m_pPreviewBitmap) {
-            m_pRenderTarget->DrawBitmap(m_pPreviewBitmap, videoRect.ToD2D(), 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        if (!renderedLive) {
+            // Заглушка, коли смартфон ще не транслює потік
+            std::wstring statusMsg = m_state.isStreaming
+                ? L"Очікування підключення смартфона EyeCam...\n(Перевірте, щоб додаток на телефоні був відкритий)"
+                : L"Трансляцію зупинено\nОберіть USB або Wi-Fi та натисніть «Запустити віртуальну камеру»";
+
+            DrawTextStr(statusMsg.c_str(), rcPreviewBox, m_pFontBody, COL_TEXT_DIM, DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
+
+        // Сітка візирного правила третин (якщо увімкнена)
+        if (m_state.showFramingGrid) {
+            m_pBrush->SetColor(HexColor(0xFFFFFF, 0.15f));
+            float gw = rcPreviewBox.Width();
+            float gh = rcPreviewBox.Height();
+            m_pRenderTarget->DrawLine(D2D1::Point2F(left + gw / 3.0f, top), D2D1::Point2F(left + gw / 3.0f, top + gh), m_pBrush, 1.0f);
+            m_pRenderTarget->DrawLine(D2D1::Point2F(left + 2.0f * gw / 3.0f, top), D2D1::Point2F(left + 2.0f * gw / 3.0f, top + gh), m_pBrush, 1.0f);
+            m_pRenderTarget->DrawLine(D2D1::Point2F(left, top + gh / 3.0f), D2D1::Point2F(right, top + gh / 3.0f), m_pBrush, 1.0f);
+            m_pRenderTarget->DrawLine(D2D1::Point2F(left, top + 2.0f * gh / 3.0f), D2D1::Point2F(right, top + 2.0f * gh / 3.0f), m_pBrush, 1.0f);
+        }
+
+        // Бейдж поточної роздільної здатності та FPS у кутку прев'ю
+        UiRect rcBadge{left + 12.0f, top + 12.0f, left + 200.0f, top + 36.0f};
+        DrawRoundedCard(rcBadge, HexColor(0x0C0E12, 0.85f), COL_BORDER, 6.0f);
+        wchar_t resBadgeStr[64]{};
+        swprintf_s(resBadgeStr, L"● %ux%u @ %u FPS", m_state.width, m_state.height, m_state.fps);
+        DrawTextStr(resBadgeStr, rcBadge, m_pFontMono, m_state.isPhoneConnected ? COL_EMERALD : COL_TEXT_MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        // Панель інструментів швидкої дії над прев'ю (Дзеркало, Сітка)
+        m_rcBtnMirror = {right - 140.0f, top + 12.0f, right - 76.0f, top + 36.0f};
+        DrawRoundedCard(m_rcBtnMirror, m_state.mirrorHorizontal ? HexColor(0x1B3028) : HexColor(0x0C0E12, 0.85f),
+                        m_state.mirrorHorizontal ? COL_EMERALD : COL_BORDER, 6.0f);
+        DrawTextStr(L"↔ Дзеркало", m_rcBtnMirror, m_pFontBody, m_state.mirrorHorizontal ? COL_EMERALD : COL_TEXT_MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        m_rcBtnGrid = {right - 68.0f, top + 12.0f, right - 12.0f, top + 36.0f};
+        DrawRoundedCard(m_rcBtnGrid, m_state.showFramingGrid ? HexColor(0x1B3028) : HexColor(0x0C0E12, 0.85f),
+                        m_state.showFramingGrid ? COL_EMERALD : COL_BORDER, 6.0f);
+        DrawTextStr(L"# Сітка", m_rcBtnGrid, m_pFontBody, m_state.showFramingGrid ? COL_EMERALD : COL_TEXT_MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        // Картка живої телеметрії потоку
+        float teleTop = top + previewH + 16.0f;
+        UiRect rcTeleCard{left, teleTop, right, bottom};
+        DrawRoundedCard(rcTeleCard, COL_BG_CARD, COL_BORDER, 10.0f);
+
+        DrawTextStr(L"ТЕЛЕМЕТРІЯ ТА СТАТУС ПІДКЛЮЧЕННЯ", {left + 18.0f, teleTop + 14.0f, right - 18.0f, teleTop + 32.0f}, m_pFontSection, COL_TEXT_PRIMARY);
+
+        // Рядок 1: Підключений телефон
+        std::wstring phoneStatus = L"Пристрій: " + m_state.connectedPhoneName;
+        DrawTextStr(phoneStatus.c_str(), {left + 18.0f, teleTop + 42.0f, right - 18.0f, teleTop + 62.0f}, m_pFontBody, COL_TEXT_MUTED);
+
+        // Рядок 2: Мережевий потік, бітрейт та реальний FPS
+        wchar_t netStat[160]{};
+        float mbTotal = static_cast<float>(m_state.rxBytes) / (1024.0f * 1024.0f);
+        swprintf_s(netStat, L"Бітрейт: %.1f Мбіт/с   •   Реальний FPS: %u   •   Отримано: %.1f МБ (%llu кадрів)",
+                   static_cast<float>(m_state.measuredBitrateKbps) / 1000.0f,
+                   m_state.measuredFps, mbTotal, m_state.rxFrames);
+        DrawTextStr(netStat, {left + 18.0f, teleTop + 68.0f, right - 18.0f, teleTop + 88.0f}, m_pFontMono, COL_CYAN);
+
+        // Рядок 3: Канал передачі
+        std::wstring chanStr = (m_state.transport == TransportTab::USB_ADB)
+            ? L"Канал: Високошвидкісний USB ADB (127.0.0.1:8554 • нульова затримка)"
+            : L"Канал: Бездротова мережа Wi-Fi LAN (" + Utf8ToWide(m_state.deviceIp) + L":8554)";
+        DrawTextStr(chanStr.c_str(), {left + 18.0f, teleTop + 94.0f, right - 18.0f, teleTop + 114.0f}, m_pFontBody, COL_TEXT_MUTED);
+    }
+
+    void DrawControlsPanel(float left, float top, float right, float bottom) {
+        UiRect rcCard{left, top, right, bottom};
+        DrawRoundedCard(rcCard, COL_BG_CARD, COL_BORDER, 10.0f);
+
+        float rlx = left + 18.0f;
+        float rrx = right - 18.0f;
+        float rcy = top + 18.0f;
+
+        // 1. Вкладки вибору транспорту (USB ADB проти Wi-Fi LAN)
+        DrawTextStr(L"1. ДЖЕРЕЛО З'ЄДНАННЯ З ТЕЛЕФОНОМ", {rlx, rcy, rrx, rcy + 22}, m_pFontSection, COL_TEXT_PRIMARY);
+        rcy += 28;
+
+        float tabW = (rrx - rlx - 8.0f) / 2.0f;
+        m_rcTransportTabs[0] = {rlx, rcy, rlx + tabW, rcy + 34.0f};
+        m_rcTransportTabs[1] = {rlx + tabW + 8.0f, rcy, rrx, rcy + 34.0f};
+
+        bool usbSel = (m_state.transport == TransportTab::USB_ADB);
+        DrawRoundedCard(m_rcTransportTabs[0], usbSel ? HexColor(0x133026) : COL_BG_DARK, usbSel ? COL_EMERALD : COL_BORDER, 6.0f);
+        DrawTextStr(L"🔌 USB ADB (Рекомендовано)", m_rcTransportTabs[0], m_pFontBody, usbSel ? COL_EMERALD : COL_TEXT_MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        DrawRoundedCard(m_rcTransportTabs[1], !usbSel ? HexColor(0x133026) : COL_BG_DARK, !usbSel ? COL_EMERALD : COL_BORDER, 6.0f);
+        DrawTextStr(L"📶 Wi-Fi Бездротовий LAN", m_rcTransportTabs[1], m_pFontBody, !usbSel ? COL_EMERALD : COL_TEXT_MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
+        rcy += 42;
+
+        if (m_state.transport == TransportTab::USB_ADB) {
+            // Випадаючий список виявлених USB пристроїв
+            DrawTextStr(L"Підключений USB-смартфон:", {rlx, rcy, rrx, rcy + 18}, m_pFontBody, COL_TEXT_MUTED);
+            rcy += 22;
+
+            float refreshBtnW = 110.0f;
+            m_rcUsbDropdown = {rlx, rcy, rrx - refreshBtnW - 8.0f, rcy + 34.0f};
+            m_rcBtnRefreshUsb = {rrx - refreshBtnW, rcy, rrx, rcy + 34.0f};
+
+            DrawRoundedCard(m_rcUsbDropdown, COL_BG_DARK, COL_BORDER, 6.0f);
+
+            std::wstring curDevStr = L"Пошук пристроїв...";
+            {
+                std::lock_guard<std::mutex> lock(m_usbMutex);
+                if (m_state.usbDevices.empty()) {
+                    curDevStr = m_usbScanInProgress ? L"⏳ Сканування USB шини..." : L"❌ Пристроїв не знайдено (увімкніть налагодження USB)";
+                } else if (m_state.selectedUsbIdx >= 0 && m_state.selectedUsbIdx < static_cast<int>(m_state.usbDevices.size())) {
+                    const auto& d = m_state.usbDevices[m_state.selectedUsbIdx];
+                    curDevStr = Utf8ToWide(d.model) + L" (" + Utf8ToWide(d.serial) + L")";
+                }
+            }
+
+            DrawTextStr(curDevStr.c_str(), {m_rcUsbDropdown.left + 12.0f, rcy + 8.0f, m_rcUsbDropdown.right - 28.0f, rcy + 28.0f}, m_pFontBody, COL_TEXT_PRIMARY);
+            DrawTextStr(L"▼", {m_rcUsbDropdown.right - 24.0f, rcy + 8.0f, m_rcUsbDropdown.right - 8.0f, rcy + 28.0f}, m_pFontBody, COL_TEXT_MUTED);
+
+            // Кнопка «Оновити USB»
+            DrawRoundedCard(m_rcBtnRefreshUsb, HexColor(0x1B2330), COL_BORDER, 6.0f);
+            DrawTextStr(L"🔄 Оновити", m_rcBtnRefreshUsb, m_pFontBody, COL_TEXT_PRIMARY, DWRITE_TEXT_ALIGNMENT_CENTER);
+            rcy += 44;
         } else {
-            DrawRoundedCard(videoRect, HexColor(0x070A0F), COL_BORDER, 8.0f);
+            // Введення IP адреси телефону
+            DrawTextStr(L"IP-адреса смартфона у локальній мережі:", {rlx, rcy, rrx, rcy + 18}, m_pFontBody, COL_TEXT_MUTED);
+            rcy += 22;
 
-            // Інформативний екран очікування підключення смартфона (без штучного тест-генератора)
-            float midY = (videoRect.top + videoRect.bottom) * 0.5f;
-            DrawLaptopEyeLogo((videoRect.left + videoRect.right) * 0.5f - 22.0f, midY - 68.0f, 40.0f);
-
-            if (!m_state.isStreaming) {
-                DrawTextStr(L"ТРАНСЛЯЦІЮ ПРИЗУПИНЕНО", {videoRect.left, midY - 12, videoRect.right, midY + 18},
-                            m_pFontTitle, COL_TEXT_DIM, DWRITE_TEXT_ALIGNMENT_CENTER);
-            } else if (m_state.transport == TransportTab::USB_ADB) {
-                DrawTextStr(L"ОЧІКУВАННЯ ВІДЕОПОТОКУ ПО USB (ADB)...", {videoRect.left, midY - 14, videoRect.right, midY + 14},
-                            m_pFontSection, COL_CYAN, DWRITE_TEXT_ALIGNMENT_CENTER);
-                DrawTextStr(
-                    L"1. Підключіть телефон кабелем USB та увімкніть «Налагодження по USB»\n"
-                    L"2. Відкрийте EyeCam на смартфоні — трансляція запуститься автоматично",
-                    {videoRect.left + 20, midY + 20, videoRect.right - 20, midY + 72},
-                    m_pFontBody, COL_TEXT_SECOND, DWRITE_TEXT_ALIGNMENT_CENTER
-                );
-            } else {
-                std::wstring waitWifi = L"ОЧІКУВАННЯ ПІДКЛЮЧЕННЯ ДО " + Utf8ToWide(m_state.deviceIp) + L":8554...";
-                DrawTextStr(waitWifi, {videoRect.left, midY - 14, videoRect.right, midY + 14},
-                            m_pFontSection, COL_CYAN, DWRITE_TEXT_ALIGNMENT_CENTER);
-                DrawTextStr(
-                    L"Перевірте IP-адресу у верхньому лівому куті додатку EyeCam на телефоні\n"
-                    L"та натисніть зелену кнопку Play у мобільному застосунку.",
-                    {videoRect.left + 20, midY + 20, videoRect.right - 20, midY + 72},
-                    m_pFontBody, COL_TEXT_SECOND, DWRITE_TEXT_ALIGNMENT_CENTER
-                );
-            }
+            m_rcIpInput = {rlx, rcy, rrx, rcy + 34.0f};
+            DrawRoundedCard(m_rcIpInput, COL_BG_DARK, m_state.ipInputFocused ? COL_CYAN : COL_BORDER, 6.0f);
+            std::wstring ipW = Utf8ToWide(m_state.deviceIp) + (m_state.ipInputFocused ? L"|" : L"");
+            DrawTextStr(ipW.c_str(), {rlx + 12.0f, rcy + 8.0f, rrx - 12.0f, rcy + 28.0f}, m_pFontMono, COL_TEXT_PRIMARY);
+            rcy += 44;
         }
 
-        // Сітка композиції (Rule of Thirds)
-        if (m_state.showGrid && m_state.isStreaming) {
-            m_pBrush->SetColor(HexColor(0xFFFFFF, 0.16f));
-            for (int i = 1; i <= 2; ++i) {
-                float gx = videoRect.left + (videoRect.Width() * i) / 3.0f;
-                float gy = videoRect.top + (videoRect.Height() * i) / 3.0f;
-                m_pRenderTarget->DrawLine(D2D1::Point2F(gx, videoRect.top), D2D1::Point2F(gx, videoRect.bottom), m_pBrush, 1.0f);
-                m_pRenderTarget->DrawLine(D2D1::Point2F(videoRect.left, gy), D2D1::Point2F(videoRect.right, gy), m_pBrush, 1.0f);
-            }
-        }
-
-        // Рамка в'юпорту
-        m_pBrush->SetColor(m_state.isPhoneConnected ? COL_EMERALD : COL_BORDER);
-        m_pRenderTarget->DrawRoundedRectangle(D2D1::RoundedRect(videoRect.ToD2D(), 6.0f, 6.0f), m_pBrush, 1.5f);
-
-        // Плаваючий бейдж формату та статусу поверх відео
-        wchar_t badgeBuf[160]{};
-        swprintf_s(
-            badgeBuf,
-            L" %s  •  %ux%u @ %u FPS  •  ЗУМ %.1fx ",
-            m_state.isPhoneConnected ? L"● ONLINE" : L"○ STANDBY",
-            m_state.width, m_state.height, m_state.fps, m_state.currentZoom
+        // 2. Головна кнопка запуску/зупинки віртуальної камери
+        m_rcBtnStartStop = {rlx, rcy, rrx, rcy + 42.0f};
+        bool isStr = m_state.isStreaming;
+        DrawRoundedCard(
+            m_rcBtnStartStop,
+            isStr ? HexColor(0x3B1515) : HexColor(0x0E3A28),
+            isStr ? COL_RED : COL_EMERALD,
+            8.0f
         );
-        UiRect hudBadge1{videoRect.left + 12, videoRect.top + 12, videoRect.left + 325, videoRect.top + 38};
-        DrawRoundedCard(hudBadge1, HexColor(0x0B0E14, 0.86f), m_state.isPhoneConnected ? COL_EMERALD : COL_BORDER, 6.0f);
-        DrawTextStr(badgeBuf, hudBadge1, m_pFontMono, m_state.isPhoneConnected ? COL_EMERALD : COL_TEXT_SECOND, DWRITE_TEXT_ALIGNMENT_CENTER);
-
-        // Нижній телеметричний бар під відео
-        float barY = centerPanel.bottom - 52.0f;
-        UiRect teleBar{centerPanel.left + 16, barY, centerPanel.right - 16, centerPanel.bottom - 14};
-        DrawRoundedCard(teleBar, COL_BG_CARD, COL_BORDER, 8.0f);
-
-        wchar_t teleStr[256]{};
-        swprintf_s(
-            teleStr,
-            L"  Пристрій: %ls   |   Бітрейт: %.1f Мбіт/с   |   Кадрів: %llu",
-            m_state.connectedPhoneName.c_str(),
-            m_state.measuredBitrateKbps.load() / 1000.0f,
-            static_cast<unsigned long long>(m_state.rxFrames.load())
+        std::wstring startStopLabel = isStr
+            ? L"⏹ ЗУПИНИТИ ТРАНСЛЯЦІЮ"
+            : L"▶ ЗАПУСТИТИ ВІРТУАЛЬНУ КАМЕРУ (DIRECTSHOW)";
+        DrawTextStr(
+            startStopLabel.c_str(),
+            m_rcBtnStartStop,
+            m_pFontSection,
+            isStr ? HexColor(0xFCA5A5) : HexColor(0xA7F3D0),
+            DWRITE_TEXT_ALIGNMENT_CENTER
         );
-        DrawTextStr(teleStr, teleBar, m_pFontMono, COL_TEXT_SECOND);
+        rcy += 54;
 
-        // ====================================================================
-        // 4. ПРАВА ПАНЕЛЬ: Оптика та Зум до 10x, 4K UHD, Повзунки ISP
-        // ====================================================================
-        UiRect rightPanel{W - pad - rightW, contentTop, W - pad, contentBottom};
-        DrawRoundedCard(rightPanel, COL_BG_PANEL, COL_BORDER, 12.0f);
-
-        float rlx = rightPanel.left + 16;
-        float rrx = rightPanel.right - 16;
-        float rcy = rightPanel.top + 16;
-
-        wchar_t lensTitle[128]{};
+        // 3. Оптика та Зум (0.5x..10x адаптивно)
+        wchar_t lensTitle[80]{};
         swprintf_s(lensTitle, L"3. ОПТИКА ТА ЗУМ (МАКС: %.0fx)", m_state.phoneMaxZoom);
         DrawTextStr(lensTitle, {rlx, rcy, rrx, rcy + 22}, m_pFontSection, COL_TEXT_PRIMARY);
         rcy += 26;
@@ -1378,125 +1259,166 @@ private:
         int shutterDenom = 30 + static_cast<int>(m_state.shutterNorm * 3970.0f);
         int wbKelvin = 2800 + static_cast<int>(m_state.wbNorm * 5700.0f);
 
-        wchar_t sBuf0[64], sBuf1[64], sBuf2[64], sBuf3[64];
-        swprintf_s(sBuf0, L"ISO Чутливість: %d", isoVal);
-        swprintf_s(sBuf1, L"Витримка (Shutter): 1/%d s", shutterDenom);
-        swprintf_s(sBuf2, L"Ручний фокус: %.2f dpt", m_state.focusNorm * 10.0f);
-        swprintf_s(sBuf3, L"Баланс білого: %d K", wbKelvin);
+        wchar_t ispLabels[4][64]{};
+        swprintf_s(ispLabels[0], L"ISO Чутливість: %d", isoVal);
+        swprintf_s(ispLabels[1], L"Витримка (Shutter): 1/%d с", shutterDenom);
+        swprintf_s(ispLabels[2], L"Фокус (Manual Focus): %.1f D", m_state.focusNorm * 10.0f);
+        swprintf_s(ispLabels[3], L"Баланс білого: %d K", wbKelvin);
 
-        const wchar_t* sliderTitles[4] = {sBuf0, sBuf1, sBuf2, sBuf3};
-        float sliderVals[4] = {m_state.isoNorm, m_state.shutterNorm, m_state.focusNorm, m_state.wbNorm};
+        float norms[4] = {m_state.isoNorm, m_state.shutterNorm, m_state.focusNorm, m_state.wbNorm};
 
-        for (int i = 0; i < 4; ++i) {
-            DrawTextStr(sliderTitles[i], {rlx, rcy, rrx, rcy + 16}, m_pFontBody,
+        for (int s = 0; s < 4; ++s) {
+            DrawTextStr(ispLabels[s], {rlx, rcy, rrx, rcy + 16}, m_pFontBody,
                         m_state.isProManual ? COL_TEXT_PRIMARY : COL_TEXT_DIM);
             rcy += 18;
-            m_rcSliders[i] = {rlx, rcy, rrx, rcy + 14};
 
-            UiRect track{rlx, rcy + 4, rrx, rcy + 10};
-            DrawRoundedCard(track, COL_BG_CARD, COL_BORDER, 3.0f);
+            m_rcSliders[s] = {rlx, rcy, rrx, rcy + 12};
+            UiRect track{rlx, rcy + 4, rrx, rcy + 8};
+            DrawRoundedCard(track, COL_BG_DARK, COL_BORDER, 2.0f);
 
-            float fillW = track.Width() * sliderVals[i];
-            UiRect fillRect{rlx, rcy + 4, rlx + fillW, rcy + 10};
-            DrawRoundedCard(fillRect, m_state.isProManual ? COL_CYAN : COL_TEXT_DIM,
-                            m_state.isProManual ? COL_CYAN : COL_TEXT_DIM, 3.0f);
-
-            m_pBrush->SetColor(m_state.isProManual ? COL_TEXT_PRIMARY : COL_TEXT_SECOND);
-            m_pRenderTarget->FillEllipse(D2D1::Ellipse(D2D1::Point2F(rlx + fillW, rcy + 7.0f), 6.5f, 6.5f), m_pBrush);
-
-            rcy += 22;
-        }
-
-        rcy += 6;
-        float halfW = (rrx - rlx - 8.0f) * 0.5f;
-        m_rcBtnMirror = {rlx, rcy, rlx + halfW, rcy + 32};
-        m_rcBtnGrid   = {rlx + halfW + 8.0f, rcy, rrx, rcy + 32};
-
-        DrawRoundedCard(m_rcBtnMirror, m_state.mirrorHorizontal ? HexColor(0x162C3D) : COL_BG_CARD,
-                        m_state.mirrorHorizontal ? COL_CYAN : COL_BORDER, 8.0f);
-        DrawTextStr(L"⇄ Дзеркало", m_rcBtnMirror, m_pFontBody,
-                    m_state.mirrorHorizontal ? COL_CYAN : COL_TEXT_SECOND, DWRITE_TEXT_ALIGNMENT_CENTER);
-
-        DrawRoundedCard(m_rcBtnGrid, m_state.showGrid ? HexColor(0x162C3D) : COL_BG_CARD,
-                        m_state.showGrid ? COL_CYAN : COL_BORDER, 8.0f);
-        DrawTextStr(L"# Сітка 3x3", m_rcBtnGrid, m_pFontBody,
-                    m_state.showGrid ? COL_CYAN : COL_TEXT_SECOND, DWRITE_TEXT_ALIGNMENT_CENTER);
-
-        HRESULT hr = m_pRenderTarget->EndDraw();
-        if (hr == D2DERR_RECREATE_TARGET) {
-            if (m_pPreviewBitmap) { m_pPreviewBitmap->Release(); m_pPreviewBitmap = nullptr; }
-            if (m_pBrush) { m_pBrush->Release(); m_pBrush = nullptr; }
-            if (m_pRenderTarget) { m_pRenderTarget->Release(); m_pRenderTarget = nullptr; }
+            if (m_state.isProManual) {
+                float fillW = track.Width() * norms[s];
+                DrawRoundedCard({rlx, rcy + 4, rlx + fillW, rcy + 8}, COL_CYAN, COL_CYAN, 2.0f);
+                m_pBrush->SetColor(COL_TEXT_PRIMARY);
+                m_pRenderTarget->FillEllipse(D2D1::Ellipse(D2D1::Point2F(rlx + fillW, rcy + 6.0f), 5.5f, 5.5f), m_pBrush);
+            }
+            rcy += 20;
         }
     }
 
-    void HandleMouseDown(float x, float y) {
-        // Якщо відкритий випадаючий список USB — спочатку перевіряємо вибір елемента списку
-        if (m_state.transport == TransportTab::USB_ADB && m_state.usbDropdownOpen) {
+    void DrawUsbDropdownOverlay() {
+        std::lock_guard<std::mutex> lock(m_usbMutex);
+        if (m_state.usbDevices.empty()) return;
+
+        float topY = m_rcUsbDropdown.bottom + 4.0f;
+        float itemH = 34.0f;
+        float totalH = static_cast<float>(m_state.usbDevices.size()) * itemH;
+
+        UiRect rcDropCard{m_rcUsbDropdown.left, topY, m_rcUsbDropdown.right, topY + totalH};
+        DrawRoundedCard(rcDropCard, HexColor(0x181D26), COL_CYAN, 6.0f);
+
+        m_rcUsbItems.resize(m_state.usbDevices.size());
+        for (size_t i = 0; i < m_state.usbDevices.size(); ++i) {
+            float iy = topY + i * itemH;
+            m_rcUsbItems[i] = {rcDropCard.left, iy, rcDropCard.right, iy + itemH};
+
+            bool sel = (m_state.selectedUsbIdx == static_cast<int>(i));
+            if (sel) {
+                DrawRoundedCard(m_rcUsbItems[i], HexColor(0x232C3A), HexColor(0x232C3A), 4.0f);
+            }
+            const auto& dev = m_state.usbDevices[i];
+            std::wstring dStr = Utf8ToWide(dev.model) + L"  [" + Utf8ToWide(dev.serial) + L"]";
+            DrawTextStr(dStr.c_str(), {m_rcUsbItems[i].left + 12.0f, iy + 8.0f, m_rcUsbItems[i].right - 12.0f, iy + 26.0f},
+                        m_pFontBody, sel ? COL_CYAN : COL_TEXT_PRIMARY);
+        }
+    }
+
+    void DrawRoundedCard(const UiRect& r, D2D1_COLOR_F fill, D2D1_COLOR_F border, float radius = 8.0f) {
+        D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(D2D1::RectF(r.left, r.top, r.right, r.bottom), radius, radius);
+        m_pBrush->SetColor(fill);
+        m_pRenderTarget->FillRoundedRectangle(rr, m_pBrush);
+        m_pBrush->SetColor(border);
+        m_pRenderTarget->DrawRoundedRectangle(rr, m_pBrush, 1.0f);
+    }
+
+    void DrawTextStr(const wchar_t* text, const UiRect& r, IDWriteTextFormat* format, D2D1_COLOR_F color,
+                     DWRITE_TEXT_ALIGNMENT align = DWRITE_TEXT_ALIGNMENT_LEADING) {
+        if (!text || !format) return;
+        format->SetTextAlignment(align);
+        format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        m_pBrush->SetColor(color);
+        m_pRenderTarget->DrawText(
+            text, static_cast<UINT32>(wcslen(text)), format,
+            D2D1::RectF(r.left, r.top, r.right, r.bottom),
+            m_pBrush
+        );
+    }
+
+    // ========================================================================
+    // Обробка взаємодії мишею (кліки, перетягування повзунків)
+    // ========================================================================
+    void OnLButtonDown(float x, float y) {
+        // Якщо розгорнутий випадний список USB — перевіряємо вибір елемента
+        if (m_state.usbDropdownOpen && m_state.transport == TransportTab::USB_ADB) {
             for (size_t i = 0; i < m_rcUsbItems.size(); ++i) {
                 if (m_rcUsbItems[i].Contains(x, y)) {
                     m_state.selectedUsbIdx = static_cast<int>(i);
                     m_state.usbDropdownOpen = false;
-                    RefreshUsbDevicesAsync();
-                    CloseActivePhoneSocket();
+                    InvalidateRect(m_hWnd, nullptr, FALSE);
                     return;
                 }
             }
-            if (!m_rcUsbDropdown.Contains(x, y)) {
-                m_state.usbDropdownOpen = false;
-            }
+            m_state.usbDropdownOpen = false;
+            InvalidateRect(m_hWnd, nullptr, FALSE);
+            return;
         }
 
-        m_state.ipInputFocused = (m_state.transport == TransportTab::WIFI_LAN) && m_rcIpInput.Contains(x, y);
-
-        // Вкладки транспорту: Wi-Fi (LAN) або USB (Кабель)
-        for (int i = 0; i < 2; ++i) {
-            if (m_rcTransportTabs[i].Contains(x, y)) {
-                m_state.transport = static_cast<TransportTab>(i);
-                m_state.usbDropdownOpen = false;
-                if (m_state.transport == TransportTab::USB_ADB) {
-                    RefreshUsbDevicesAsync();
-                }
-                CloseActivePhoneSocket();
-                return;
-            }
+        // Перемикач вкладок USB ADB / Wi-Fi
+        if (m_rcTransportTabs[0].Contains(x, y)) {
+            m_state.transport = TransportTab::USB_ADB;
+            m_state.ipInputFocused = false;
+            InvalidateRect(m_hWnd, nullptr, FALSE);
+            return;
+        }
+        if (m_rcTransportTabs[1].Contains(x, y)) {
+            m_state.transport = TransportTab::WIFI_LAN;
+            m_state.ipInputFocused = false;
+            InvalidateRect(m_hWnd, nullptr, FALSE);
+            return;
         }
 
-        // Клік по випадаючому списку USB пристроїв
+        // Розгортання списку USB
         if (m_state.transport == TransportTab::USB_ADB && m_rcUsbDropdown.Contains(x, y)) {
             m_state.usbDropdownOpen = !m_state.usbDropdownOpen;
-            if (m_state.usbDropdownOpen) {
-                RefreshUsbDevicesAsync();
-            }
+            InvalidateRect(m_hWnd, nullptr, FALSE);
             return;
         }
 
-        // Кнопка оновлення списку USB
+        // Кнопка оновлення USB
         if (m_state.transport == TransportTab::USB_ADB && m_rcBtnRefreshUsb.Contains(x, y)) {
-            RefreshUsbDevicesAsync();
-            CloseActivePhoneSocket();
+            RefreshUsbDeviceListAsync();
             return;
         }
 
-        // Старт / Стоп трансляції
-        if (m_rcBtnStartStop.Contains(x, y)) {
-            m_state.isStreaming = !m_state.isStreaming;
-            if (m_state.isStreaming) {
-                m_sink.Open(m_state.width, m_state.height, EyeCam::PixelFormat::YUY2, m_state.fps);
-            } else {
-                CloseActivePhoneSocket();
-                m_sink.Close();
-            }
+        // Фокус на поле вводу IP (для Wi-Fi)
+        if (m_state.transport == TransportTab::WIFI_LAN && m_rcIpInput.Contains(x, y)) {
+            m_state.ipInputFocused = true;
+            InvalidateRect(m_hWnd, nullptr, FALSE);
             return;
+        } else {
+            m_state.ipInputFocused = false;
         }
 
-        // Реєстрація драйвера DirectShow
+        // Кнопка реєстрації DirectShow драйвера
         if (m_rcBtnRegisterDriver.Contains(x, y)) {
-            m_state.isDriverRegistered = RegisterDirectShowDriver(m_hwnd);
+            RegisterDirectShowDriver();
+            m_state.isDirectShowRegistered = CheckDirectShowDriverRegistered();
+            InvalidateRect(m_hWnd, nullptr, FALSE);
             return;
         }
 
-        // Вибір пресету зуму / об'єктива (0.5x, 1x, 2x, 3x, 5x, 10x, Front)
+        // Кнопка Дзеркало
+        if (m_rcBtnMirror.Contains(x, y)) {
+            m_state.mirrorHorizontal = !m_state.mirrorHorizontal;
+            InvalidateRect(m_hWnd, nullptr, FALSE);
+            return;
+        }
+
+        // Кнопка Сітка
+        if (m_rcBtnGrid.Contains(x, y)) {
+            m_state.showFramingGrid = !m_state.showFramingGrid;
+            InvalidateRect(m_hWnd, nullptr, FALSE);
+            return;
+        }
+
+        // Головна кнопка START / STOP
+        if (m_rcBtnStartStop.Contains(x, y)) {
+            ToggleStreaming();
+            InvalidateRect(m_hWnd, nullptr, FALSE);
+            return;
+        }
+
+        // Кнопки вибору об'єктивів (0.5x, 1x, 2x, 3x, 5x, 10x, Front)
         const char* lensNames[7] = {"0.5x", "1.0x", "2.0x", "3.0x", "5.0x", "10.0x", "front"};
         const float lensZooms[7] = {0.5f, 1.0f, 2.0f, 3.0f, 5.0f, 10.0f, 1.0f};
         for (int i = 0; i < 7; ++i) {
@@ -1540,6 +1462,7 @@ private:
                 std::snprintf(json, sizeof(json), "{\"action\":\"SetResolution\",\"width\":%u,\"height\":%u,\"fps\":%u}",
                               m_state.width, m_state.height, m_state.fps);
                 SendControlJson(json);
+                InvalidateRect(m_hWnd, nullptr, FALSE);
                 return;
             }
         }
@@ -1559,25 +1482,28 @@ private:
             return;
         }
 
-        // Перемикачі Дзеркало та Сітка
-        if (m_rcBtnMirror.Contains(x, y)) {
-            m_state.mirrorHorizontal = !m_state.mirrorHorizontal;
-            return;
-        }
-        if (m_rcBtnGrid.Contains(x, y)) {
-            m_state.showGrid = !m_state.showGrid;
-            return;
-        }
-
-        // Перевірка натискання на повзунки ISP
-        for (int i = 0; i < 4; ++i) {
-            if (m_rcSliders[i].Contains(x, y)) {
-                m_state.isProManual = true;
-                m_activeSliderDrag = i;
-                UpdateSliderValue(i, x);
-                return;
+        // Повзунки ручного режиму (ISO, Shutter, Focus, WB)
+        if (m_state.isProManual) {
+            for (int s = 0; s < 4; ++s) {
+                if (m_rcSliders[s].Contains(x, y)) {
+                    m_activeSliderDrag = s;
+                    UpdateSliderValue(s, x);
+                    return;
+                }
             }
         }
+    }
+
+    void OnMouseMove(float x, float y) {
+        if (m_activeSliderDrag == 100) {
+            UpdateZoomSliderValue(x);
+        } else if (m_activeSliderDrag >= 0 && m_activeSliderDrag < 4) {
+            UpdateSliderValue(m_activeSliderDrag, x);
+        }
+    }
+
+    void OnLButtonUp() {
+        m_activeSliderDrag = -1;
     }
 
     void UpdateZoomSliderValue(float mouseX) {
@@ -1598,187 +1524,138 @@ private:
         const UiRect& r = m_rcSliders[idx];
         float norm = std::clamp((mouseX - r.left) / r.Width(), 0.0f, 1.0f);
 
-        char json[160]{};
         if (idx == 0) {
             m_state.isoNorm = norm;
-            int iso = 100 + static_cast<int>(norm * 3100.0f);
-            std::snprintf(json, sizeof(json), "{\"action\":\"SetISO\",\"auto\":false,\"iso\":%d}", iso);
+            int isoVal = 100 + static_cast<int>(norm * 3100.0f);
+            char json[96]{};
+            std::snprintf(json, sizeof(json), "{\"action\":\"SetISO\",\"auto\":false,\"iso\":%d}", isoVal);
+            SendControlJson(json);
         } else if (idx == 1) {
             m_state.shutterNorm = norm;
             int denom = 30 + static_cast<int>(norm * 3970.0f);
-            long long expNs = 1000000000LL / denom;
-            std::snprintf(json, sizeof(json), "{\"action\":\"SetShutter\",\"auto\":false,\"exposure_ns\":%lld}", expNs);
+            uint64_t ns = 1000000000ULL / denom;
+            char json[128]{};
+            std::snprintf(json, sizeof(json), "{\"action\":\"SetShutter\",\"auto\":false,\"exposure_ns\":%llu}", ns);
+            SendControlJson(json);
         } else if (idx == 2) {
             m_state.focusNorm = norm;
-            std::snprintf(json, sizeof(json), "{\"action\":\"SetFocus\",\"mode\":\"MANUAL\",\"distance_diopters\":%.2f}", norm * 10.0f);
+            float diopters = norm * 10.0f;
+            char json[96]{};
+            std::snprintf(json, sizeof(json), "{\"action\":\"SetFocus\",\"mode\":\"MANUAL\",\"distance_diopters\":%.2f}", diopters);
+            SendControlJson(json);
         } else if (idx == 3) {
             m_state.wbNorm = norm;
             int kelvin = 2800 + static_cast<int>(norm * 5700.0f);
+            char json[96]{};
             std::snprintf(json, sizeof(json), "{\"action\":\"SetWhiteBalance\",\"mode\":\"MANUAL_KELVIN\",\"kelvin\":%d}", kelvin);
+            SendControlJson(json);
         }
-        SendControlJson(json);
+        InvalidateRect(m_hWnd, nullptr, FALSE);
     }
 
-    static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-        EyeCamStudioWindow* self = nullptr;
-        if (msg == WM_NCCREATE) {
-            auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
-            self = static_cast<EyeCamStudioWindow*>(cs->lpCreateParams);
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
-        } else {
-            self = reinterpret_cast<EyeCamStudioWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    void OnChar(wchar_t ch) {
+        if (!m_state.ipInputFocused || m_state.transport != TransportTab::WIFI_LAN) return;
+
+        if (ch == VK_BACK) {
+            if (!m_state.deviceIp.empty()) {
+                m_state.deviceIp.pop_back();
+            }
+        } else if ((ch >= '0' && ch <= '9') || ch == '.') {
+            if (m_state.deviceIp.size() < 15) {
+                m_state.deviceIp.push_back(static_cast<char>(ch));
+            }
         }
+        InvalidateRect(m_hWnd, nullptr, FALSE);
+    }
 
-        if (!self) return DefWindowProcW(hwnd, msg, wParam, lParam);
-
-        switch (msg) {
-            case WM_ERASEBKGND:
-                return 1;
-
-            case WM_SIZE:
-                if (self->m_pRenderTarget) {
-                    UINT32 w = (std::max)(1u, static_cast<UINT32>(LOWORD(lParam)));
-                    UINT32 h = (std::max)(1u, static_cast<UINT32>(HIWORD(lParam)));
-                    self->m_pRenderTarget->Resize(D2D1::SizeU(w, h));
+    void ToggleStreaming() {
+        if (m_state.isStreaming) {
+            m_state.isStreaming = false;
+            CloseActivePhoneSocket();
+            if (m_sink.IsOpen()) {
+                m_sink.Close();
+            }
+        } else {
+            // Якщо використовується USB — гарантуємо прокидання порту ADB
+            if (m_state.transport == TransportTab::USB_ADB) {
+                std::string serial;
+                {
+                    std::lock_guard<std::mutex> lock(m_usbMutex);
+                    if (m_state.selectedUsbIdx >= 0 && m_state.selectedUsbIdx < static_cast<int>(m_state.usbDevices.size())) {
+                        serial = m_state.usbDevices[m_state.selectedUsbIdx].serial;
+                    }
                 }
-                return 0;
-
-            case WM_TIMER:
-                if (wParam == 2 && self->m_state.transport == TransportTab::USB_ADB) {
-                    self->RefreshUsbDevicesAsync();
-                }
-                InvalidateRect(hwnd, nullptr, FALSE);
-                return 0;
-
-            case WM_PAINT: {
-                PAINTSTRUCT ps{};
-                BeginPaint(hwnd, &ps);
-                self->OnPaint();
-                EndPaint(hwnd, &ps);
-                return 0;
+                ForwardAdbPort(serial, 8554);
             }
 
-            case WM_LBUTTONDOWN:
-                SetCapture(hwnd);
-                self->HandleMouseDown(
-                    static_cast<float>(GET_X_LPARAM(lParam)),
-                    static_cast<float>(GET_Y_LPARAM(lParam))
-                );
-                InvalidateRect(hwnd, nullptr, FALSE);
-                return 0;
-
-            case WM_MOUSEMOVE:
-                if (self->m_activeSliderDrag == 100 && (wParam & MK_LBUTTON)) {
-                    self->UpdateZoomSliderValue(static_cast<float>(GET_X_LPARAM(lParam)));
-                    InvalidateRect(hwnd, nullptr, FALSE);
-                } else if (self->m_activeSliderDrag >= 0 && (wParam & MK_LBUTTON)) {
-                    self->UpdateSliderValue(
-                        self->m_activeSliderDrag,
-                        static_cast<float>(GET_X_LPARAM(lParam))
-                    );
-                    InvalidateRect(hwnd, nullptr, FALSE);
-                }
-                return 0;
-
-            case WM_LBUTTONUP:
-                ReleaseCapture();
-                self->m_activeSliderDrag = -1;
-                return 0;
-
-            case WM_CHAR:
-                if (self->m_state.ipInputFocused) {
-                    wchar_t ch = static_cast<wchar_t>(wParam);
-                    if (ch == L'\b') {
-                        if (!self->m_state.deviceIp.empty()) self->m_state.deviceIp.pop_back();
-                    } else if ((ch >= L'0' && ch <= L'9') || ch == L'.') {
-                        if (self->m_state.deviceIp.size() < 15) {
-                            self->m_state.deviceIp.push_back(static_cast<char>(ch));
-                        }
-                    }
-                    CloseSocketAndReconnect(self);
-                    InvalidateRect(hwnd, nullptr, FALSE);
-                }
-                return 0;
-
-            case WM_DESTROY:
-                PostQuitMessage(0);
-                return 0;
+            // Відкриваємо системний DirectShow sink віртуальної камери
+            if (!m_sink.IsOpen()) {
+                m_sink.Open(L"EyeCam Virtual Camera");
+                m_sink.SetFormat(m_state.width, m_state.height, EyeCam::PixelFormat::YUY2, m_state.fps);
+            }
+            m_state.isStreaming = true;
         }
-        return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
 
-    static void CloseSocketAndReconnect(EyeCamStudioWindow* self) {
-        self->CloseActivePhoneSocket();
+    static LRESULT CALLBACK WndProcThunk(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+        EyeCamStudioWindow* pThis = nullptr;
+        if (msg == WM_NCCREATE) {
+            auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+            pThis = reinterpret_cast<EyeCamStudioWindow*>(cs->lpCreateParams);
+            SetWindowLongPtrW(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(pThis));
+        } else {
+            pThis = reinterpret_cast<EyeCamStudioWindow*>(GetWindowLongPtrW(hWnd, GWLP_USERDATA));
+        }
+
+        if (pThis) {
+            return pThis->HandleMessage(msg, wParam, lParam);
+        }
+        return DefWindowProcW(hWnd, msg, wParam, lParam);
     }
 
-private:
-    HWND m_hwnd = nullptr;
-    ID2D1Factory* m_pD2DFactory = nullptr;
-    IDWriteFactory* m_pDWriteFactory = nullptr;
-    ID2D1HwndRenderTarget* m_pRenderTarget = nullptr;
-    ID2D1SolidColorBrush* m_pBrush = nullptr;
-    ID2D1Bitmap* m_pPreviewBitmap = nullptr;
-
-    IDWriteTextFormat* m_pFontTitle = nullptr;
-    IDWriteTextFormat* m_pFontSection = nullptr;
-    IDWriteTextFormat* m_pFontBody = nullptr;
-    IDWriteTextFormat* m_pFontMono = nullptr;
-
-    StudioState m_state{};
-    EyeCam::WindowsDirectShowSink m_sink{};
-
-    std::atomic<bool> m_running{false};
-    std::atomic<bool> m_usbScanInProgress{false};
-    std::mutex m_socketMutex;
-    std::mutex m_usbMutex;
-    std::mutex m_frameMutex;
-    SOCKET m_phoneSocket = INVALID_SOCKET;
-    std::thread m_streamThread;
-
-    uint32_t m_frameTick = 0;
-    bool m_hasLiveFrame = false;
-    std::vector<uint8_t> m_previewPixels;
-    std::vector<uint8_t> m_yuy2Buffer;
-
-    // Інтерактивні зони UI
-    UiRect m_rcTransportTabs[2]{};
-    UiRect m_rcIpInput{};
-    UiRect m_rcUsbDropdown{};
-    UiRect m_rcBtnRefreshUsb{};
-    std::vector<UiRect> m_rcUsbItems;
-    UiRect m_rcBtnStartStop{};
-    UiRect m_rcBtnRegisterDriver{};
-    UiRect m_rcLensBtns[7]{};
-    UiRect m_rcZoomSlider{};
-    UiRect m_rcResBtns[4]{};
-    UiRect m_rcBtnModeToggle{};
-    UiRect m_rcBtnRefocus{};
-    UiRect m_rcSliders[4]{};
-    UiRect m_rcBtnMirror{};
-    UiRect m_rcBtnGrid{};
-    int m_activeSliderDrag = -1;
+    LRESULT HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
+        switch (msg) {
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            BeginPaint(m_hWnd, &ps);
+            Render();
+            EndPaint(m_hWnd, &ps);
+            return 0;
+        }
+        case WM_TIMER:
+            m_frameTick++;
+            InvalidateRect(m_hWnd, nullptr, FALSE);
+            return 0;
+        case WM_LBUTTONDOWN:
+            SetCapture(m_hWnd);
+            OnLButtonDown(static_cast<float>(LOWORD(lParam)), static_cast<float>(HIWORD(lParam)));
+            return 0;
+        case WM_MOUSEMOVE:
+            OnMouseMove(static_cast<float>(LOWORD(lParam)), static_cast<float>(HIWORD(lParam)));
+            return 0;
+        case WM_LBUTTONUP:
+            ReleaseCapture();
+            OnLButtonUp();
+            return 0;
+        case WM_CHAR:
+            OnChar(static_cast<wchar_t>(wParam));
+            return 0;
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
+        }
+        return DefWindowProcW(m_hWnd, msg, wParam, lParam);
+    }
 };
 
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
-    (void)hPrevInstance;
-    (void)pCmdLine;
-    SetProcessDPIAware();
-
+// ============================================================================
+// Головна функція WinMain
+// ============================================================================
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     EyeCamStudioWindow app;
     if (!app.Initialize(hInstance, nCmdShow)) {
+        MessageBoxW(nullptr, L"Помилка ініціалізації вікна EyeCam Studio (Direct2D/WIC)", L"EyeCam Error", MB_ICONERROR);
         return 1;
     }
     return app.RunMessageLoop();
 }
-
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
-    (void)hPrevInstance;
-    (void)lpCmdLine;
-    return wWinMain(hInstance, nullptr, GetCommandLineW(), nCmdShow);
-}
-
-int main() {
-    return wWinMain(GetModuleHandleW(nullptr), nullptr, GetCommandLineW(), SW_SHOWDEFAULT);
-}
-
-#endif // _WIN32

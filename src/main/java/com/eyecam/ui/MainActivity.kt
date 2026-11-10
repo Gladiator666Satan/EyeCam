@@ -1,9 +1,12 @@
 package com.eyecam.ui
 
 import android.Manifest
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
+import android.hardware.SensorManager
 import android.os.Build
 import android.os.Bundle
+import android.view.OrientationEventListener
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -25,8 +28,8 @@ import com.eyecam.ui.theme.OledPureBlack
 import com.eyecam.viewmodel.StreamViewModel
 
 /**
- * Головна Activity додатку EyeCam.
- * Відповідає за:
+ * Головна точка входу мобільного додатка EyeCam:
+ * - Постійна робота у фоні при заблокованому екрані (SHOW_WHEN_LOCKED, TURN_SCREEN_ON).
  * - Запит дозволів CAMERA, RECORD_AUDIO та POST_NOTIFICATIONS при запуску (запобігає падінню на Android 14/15/16).
  * - Повноекранний Immersive режим.
  * - Утримання екрана активним під час стрімінгу (FLAG_KEEP_SCREEN_ON).
@@ -34,6 +37,7 @@ import com.eyecam.viewmodel.StreamViewModel
 class MainActivity : ComponentActivity() {
 
     private val viewModel: StreamViewModel by viewModels()
+    private var orientationListener: OrientationEventListener? = null
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -62,6 +66,7 @@ class MainActivity : ComponentActivity() {
         }
         configureImmersiveMode()
         requestRequiredPermissionsIfNeeded()
+        setupOrientationListener()
 
         setContent {
             EyeCamTheme {
@@ -123,5 +128,33 @@ class MainActivity : ComponentActivity() {
     override fun onUserInteraction() {
         super.onUserInteraction()
         viewModel.onUserInteraction()
+    }
+
+    private fun setupOrientationListener() {
+        orientationListener = object : OrientationEventListener(this, SensorManager.SENSOR_DELAY_NORMAL) {
+            override fun onOrientationChanged(orientation: Int) {
+                if (orientation == ORIENTATION_UNKNOWN) return
+                // Автоматичне динамічне перемикання орієнтації (навіть при заблокованому автоповороті в системі)
+                val targetOrientation = when (orientation) {
+                    in 60..120 -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE
+                    in 240..300 -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                    in 330..360, in 0..30 -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                    in 150..210 -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT
+                    else -> null
+                }
+                if (targetOrientation != null && requestedOrientation != targetOrientation) {
+                    requestedOrientation = targetOrientation
+                }
+            }
+        }
+        if (orientationListener?.canDetectOrientation() == true) {
+            orientationListener?.enable()
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        orientationListener?.disable()
+        orientationListener = null
     }
 }
