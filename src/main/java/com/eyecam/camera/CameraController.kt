@@ -696,8 +696,7 @@ class CameraController(private val context: Context) {
         val cropH = (activeArray.height() / effZoom).toInt()
         val left = (activeArray.width() - cropW) / 2
         val top = (activeArray.height() - cropH) / 2
-        builder.set(CaptureRequest.SCALER_CROP_REGION, Rect(left, top, left + cropW, top + cropH))
-    }
+        builder.set(CaptureRequest.SCALER_CROP_REGION, Rect(left, top, left + cropW, top + cropH))\n    }
 
     fun switchCameraModule(targetCameraId: String, targetZoom: Float) {
         // Запобігаємо виклику openCamera для фізичних суб-камер, які заборонено відкривати напряму

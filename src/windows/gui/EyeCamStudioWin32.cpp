@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -1737,7 +1738,7 @@ private:
     UiRect m_rcBtnModeToggle{};
     UiRect m_rcBtnRefocus{};
     UiRect m_rcBtnMirror{};
-    UiRect m_rcBtnGrid{};
+    UiRect m_rcGrid{};
     UiRect m_rcSliders[4]{};
 };
 

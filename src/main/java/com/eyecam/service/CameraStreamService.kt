@@ -1,5 +1,6 @@
 package com.eyecam.service
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -7,67 +8,65 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
-import android.graphics.BitmapFactory
+import android.graphics.Color
+import android.os.BatteryManager
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import android.view.Surface
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import com.eyecam.R
 import com.eyecam.camera.CameraController
-import com.eyecam.hardware.PowerLockManager
-import com.eyecam.hardware.ThermalManager
 import com.eyecam.model.CameraSensorInfo
 import com.eyecam.model.ConnectionType
-import com.eyecam.model.SensorType
-import com.eyecam.model.StreamTelemetry
 import com.eyecam.model.StreamUiState
 import com.eyecam.model.ThermalState
 import com.eyecam.network.ControlServer
-import com.eyecam.ui.MainActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.net.Inet4Address
 import java.net.NetworkInterface
 
 /**
- * Ключовий Android Foreground Service додатку EyeCam.
- * Відповідає за:
- * - Захоплення відеопотоку через Camera2 (з підтримкою перемикання сенсорів 0.5x..10x та 60 FPS).
- * - Трансляцію на Windows Studio через вбудований ControlServer (порт 8554, USB ADB / Wi-Fi).
- * - Утримання WakeLock & WifiLock для запобігання засинанню при блокуванні екрана смартфону.
- * - Моніторинг теплового стану процесора (Thermal Throttling) та динамічну оптимізацію FPS.
- * - Постійне оновлення інтерактивного системного сповіщення з кнопками керування.
+ * Ongoing Foreground Service, що підтримує життєвий цикл захоплення Camera2,
+ * TCP/ADB сервера керування і трансляції (:8554) та моніторингу USB / Wi-Fi підключення.
  */
 class CameraStreamService : Service() {
 
-    private val binder = LocalBinder()
-    private val serviceScope = CoroutineScope(Dispatchers.Default + Job())
+    private val serviceJob = SupervisorJob()
+    private val serviceScope = CoroutineScope(Dispatchers.Default + serviceJob)
 
-    lateinit var cameraController: CameraController
-        private set
-    lateinit var controlServer: ControlServer
-        private set
+    private val binder = LocalBinder()
+
     private lateinit var powerLockManager: PowerLockManager
     private lateinit var thermalManager: ThermalManager
+    lateinit var cameraController: CameraController
+        private set
+    private lateinit var controlServer: ControlServer
+
+    private var currentPreviewSurface: Surface? = null
+    private var isPcConnected = false
+    private var isPcViaUsbAdb = false
 
     private val _uiState = MutableStateFlow(StreamUiState())
     val uiState: StateFlow<StreamUiState> = _uiState.asStateFlow()
 
-    private var currentPreviewSurface: Surface? = null
-    private var isPcConnected: Boolean = false
-    private var isPcViaUsbAdb: Boolean = false
-
     companion object {
         private const val TAG = "CameraStreamService"
-
         private const val NOTIFICATION_CHANNEL_ID = "eyecam_stream_channel"
         private const val NOTIFICATION_CHANNEL_NAME = "EyeCam Streaming Service"
         private const val NOTIFICATION_ID = 1001
@@ -140,54 +139,127 @@ class CameraStreamService : Service() {
 
         createNotificationChannel()
         refreshHardwareCapabilities()
-        refreshConnectionStatus()
+        startConnectionMonitorLoop()
     }
 
     fun refreshHardwareCapabilities() {
         val sensors = cameraController.discoverAvailableSensors()
+        val hasPerm = cameraController.hasCameraPermission()
+        val modelName = "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL}"
+
         _uiState.update { current ->
             current.copy(
+                hasCameraPermission = hasPerm,
+                activeSensor = sensors.firstOrNull(),
                 availableSensors = sensors,
-                activeSensor = sensors.find { it.id == cameraController.backCameraId } ?: sensors.firstOrNull(),
-                supportedZoomPresets = cameraController.supportedZoomPresets,
-                hasCameraPermission = cameraController.hasCameraPermission(),
                 minZoomRatio = cameraController.minZoomRatio,
-                maxZoomRatio = cameraController.maxZoomRatio
+                maxZoomRatio = cameraController.maxZoomRatio,
+                supportedZoomPresets = cameraController.supportedZoomPresets,
+                deviceModelName = modelName
             )
+        }
+
+        if (hasPerm && currentPreviewSurface != null) {
+            cameraController.updatePreviewSurface(currentPreviewSurface)
+        }
+    }
+
+    fun attachPreviewSurface(surface: Surface?) {
+        currentPreviewSurface = surface
+        if (surface != null && surface.isValid && cameraController.hasCameraPermission()) {
+            cameraController.updatePreviewSurface(surface)
+        } else if (surface == null) {
+            if (_uiState.value.isStreaming) {
+                // Утримуємо трансляцію активною у фоні та при заблокованому екрані
+                cameraController.updatePreviewSurface(null)
+            } else {
+                cameraController.release()
+            }
+        }
+    }
+
+    fun triggerAutoFocus() {
+        cameraController.triggerAutoFocus()
+    }
+
+    fun triggerFocusAtPoint(x: Float, y: Float) {
+        cameraController.triggerFocusAtPoint(x, y)
+    }
+
+    private fun startConnectionMonitorLoop() {
+        serviceScope.launch {
+            while (isActive) {
+                refreshConnectionStatus()
+                delay(3000L)
+            }
         }
     }
 
     private fun refreshConnectionStatus() {
-        val wifiIp = getLocalWifiIpAddress()
-        val connType = when {
-            isPcConnected && isPcViaUsbAdb -> ConnectionType.USB_ADB
-            isPcConnected -> ConnectionType.WIFI_LAN
-            wifiIp.isNotEmpty() -> ConnectionType.WIFI_LAN
-            else -> ConnectionType.DISCONNECTED
+        val usbConnected = isUsbCableConnected()
+        val localIp = getLocalWifiIpAddress()
+
+        val (connType, connDetails) = when {
+            isPcConnected && isPcViaUsbAdb -> {
+                ConnectionType.USB to "USB ADB • ПК ПІДКЛЮЧЕНО"
+            }
+            isPcConnected -> {
+                ConnectionType.WIFI to "WI-FI • ПК ПІДКЛЮЧЕНО"
+            }
+            usbConnected -> {
+                val ipSuffix = if (localIp.isNotEmpty()) " • IP: $localIp" else ""
+                ConnectionType.USB to "USB ПІДКЛЮЧЕНО$ipSuffix"
+            }
+            localIp.isNotEmpty() -> {
+                ConnectionType.WIFI to "WI-FI: $localIp"
+            }
+            else -> {
+                ConnectionType.NONE to "ОФЛАЙН (Підключіть USB або Wi-Fi)"
+            }
         }
 
         _uiState.update { current ->
             current.copy(
-                connectionType = connType,
-                deviceIpAddress = if (wifiIp.isNotEmpty()) wifiIp else "USB ADB (127.0.0.1:8554)"
+                hasCameraPermission = cameraController.hasCameraPermission(),
+                telemetry = current.telemetry.copy(
+                    connectionType = connType,
+                    connectionDetails = connDetails,
+                    isPcConnected = isPcConnected,
+                    localIpAddress = localIp
+                )
             )
         }
     }
 
+    private fun isUsbCableConnected(): Boolean {
+        try {
+            val usbState = registerReceiver(null, IntentFilter("android.hardware.usb.action.USB_STATE"))
+            if (usbState != null && (usbState.getBooleanExtra("connected", false) || usbState.getBooleanExtra("configured", false))) {
+                return true
+            }
+        } catch (_: Exception) {}
+
+        try {
+            val battIntent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val plugged = battIntent?.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1) ?: -1
+            if (plugged == BatteryManager.BATTERY_PLUGGED_USB) {
+                return true
+            }
+        } catch (_: Exception) {}
+
+        return false
+    }
+
     private fun getLocalWifiIpAddress(): String {
         try {
-            val interfaces = NetworkInterface.getNetworkInterfaces()
-            while (interfaces.hasMoreElements()) {
-                val intf = interfaces.nextElement()
-                if (intf.isLoopback || !intf.isUp) continue
-                val addrs = intf.inetAddresses
-                while (addrs.hasMoreElements()) {
-                    val addr = addrs.nextElement()
+            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return ""
+            for (intf in interfaces) {
+                if (!intf.isUp || intf.isLoopback) continue
+                val name = intf.name.lowercase()
+                if (!name.startsWith("wlan") && !name.startsWith("eth") && !name.startsWith("ap")) continue
+                for (addr in intf.inetAddresses) {
                     if (!addr.isLoopbackAddress && addr is Inet4Address) {
-                        val host = addr.hostAddress ?: ""
-                        if (host.startsWith("192.168.") || host.startsWith("10.") || host.startsWith("172.")) {
-                            return host
-                        }
+                        return addr.hostAddress ?: ""
                     }
                 }
             }
@@ -202,9 +274,9 @@ class CameraStreamService : Service() {
             ACTION_TOGGLE_MUTE -> toggleMicrophoneMute()
             ACTION_SWITCH_SENSOR -> {
                 val sensorId = intent.getStringExtra(EXTRA_SENSOR_ID)
-                if (sensorId != null) {
-                    val target = _uiState.value.availableSensors.find { it.id == sensorId }
-                    if (target != null) switchSensor(target)
+                sensorId?.let { id ->
+                    val targetSensor = _uiState.value.availableSensors.find { it.id == id }
+                    targetSensor?.let { switchSensor(it) }
                 }
             }
         }
@@ -213,32 +285,37 @@ class CameraStreamService : Service() {
 
     override fun onBind(intent: Intent?): IBinder = binder
 
-    fun attachPreviewSurface(surface: Surface?) {
-        this.currentPreviewSurface = surface
-        cameraController.updatePreviewSurface(surface)
-    }
-
     /**
-     * Повноцінний запуск Foreground Service з утриманням блокувань CPU/Wi-Fi
-     * та стартом потоку камери.
+     * Запуск трансляції: безпечне підняття Foreground Service з перевіркою дозволів Android 14/15/16.
      */
     fun startStreaming() {
         if (_uiState.value.isStreaming) return
-        Log.i(TAG, "Старт трансляції EyeCam...")
 
-        // Утримання WakeLock & WifiLock для запобігання засинанню
-        powerLockManager.acquireCpuWakeLock()
-        powerLockManager.acquireWifiHighPerfLock()
+        val hasCamPerm = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        if (!hasCamPerm) {
+            Log.w(TAG, "Неможливо запустити трансляцію: відсутній дозвіл CAMERA")
+            return
+        }
 
-        val notification = buildForegroundNotification()
+        Log.i(TAG, "Запуск потоку трансляції та підняття Foreground Service...")
 
+        powerLockManager.acquireWakeLock()
+        if (_uiState.value.telemetry.connectionType == ConnectionType.WIFI) {
+            powerLockManager.acquireWifiLock()
+        }
+
+        thermalManager.startMonitoring()
+
+        // Безпечний запуск Foreground Service для Android 14/15/16 (перевірка фактично наданих дозволів)
+        val notification = buildNotification()
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                var fgsTypes = ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    fgsTypes = fgsTypes or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                var foregroundTypes = ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+                val hasMicPerm = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                if (hasMicPerm) {
+                    foregroundTypes = foregroundTypes or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
                 }
-                startForeground(NOTIFICATION_ID, notification, fgsTypes)
+                startForeground(NOTIFICATION_ID, notification, foregroundTypes)
             } else {
                 startForeground(NOTIFICATION_ID, notification)
             }
@@ -353,14 +430,6 @@ class CameraStreamService : Service() {
         }
     }
 
-    fun triggerAutoFocus() {
-        cameraController.triggerAutoFocus()
-    }
-
-    fun triggerFocusAtPoint(xNorm: Float, yNorm: Float) {
-        cameraController.triggerFocusAtPoint(xNorm, yNorm)
-    }
-
     private fun onDesktopThermalThrottlingTriggered(
         thermalState: ThermalState,
         adjustedFps: Int,
@@ -386,9 +455,9 @@ class CameraStreamService : Service() {
         }
     }
 
-    private fun buildForegroundNotification(): Notification {
+    private fun buildNotification(): Notification {
         val state = _uiState.value
-        val openAppIntent = Intent(this, MainActivity::class.java).apply {
+        val openAppIntent = Intent(this, com.eyecam.ui.MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
         val pOpenApp = PendingIntent.getActivity(
@@ -412,9 +481,9 @@ class CameraStreamService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val connTitle = when (state.connectionType) {
-            ConnectionType.USB_ADB -> "🔌 USB ADB Підключено"
-            ConnectionType.WIFI_LAN -> "📶 Wi-Fi: ${state.deviceIpAddress}:8554"
+        val connTitle = when (state.telemetry.connectionType) {
+            ConnectionType.USB -> "🔌 USB ADB Підключено"
+            ConnectionType.WIFI -> "📶 Wi-Fi: ${state.telemetry.localIpAddress}:8554"
             else -> "Очікування підключення..."
         }
 
@@ -445,7 +514,7 @@ class CameraStreamService : Service() {
     private fun updateNotification() {
         if (!_uiState.value.isStreaming) return
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        manager.notify(NOTIFICATION_ID, buildForegroundNotification())
+        manager.notify(NOTIFICATION_ID, buildNotification())
     }
 
     override fun onDestroy() {
@@ -453,6 +522,8 @@ class CameraStreamService : Service() {
         stopStreaming()
         controlServer.stop()
         cameraController.release()
+        serviceScope.cancel()
+        serviceJob.cancel()
         Log.i(TAG, "CameraStreamService знищено.")
     }
 }
