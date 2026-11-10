@@ -1,4 +1,4 @@
-﻿package com.eyecam.camera
+package com.eyecam.camera
 
 import android.annotation.SuppressLint
 import android.content.Context
@@ -200,6 +200,10 @@ class CameraController(private val context: Context) {
         } catch (e: Exception) {
             Log.e(TAG, "Error starting repeating request", e)
         }
+    }
+
+    fun switchToSensor(physicalId: String) {
+        switchPhysicalCameraSeamless(physicalId)
     }
 
     fun switchPhysicalCameraSeamless(physicalId: String) {
