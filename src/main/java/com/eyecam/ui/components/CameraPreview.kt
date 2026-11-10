@@ -98,9 +98,6 @@ fun CameraPreview(
                 viewW = viewH * targetAspect
             }
 
-            val targetSurfaceW = if (isLandscape) streamWidth else streamHeight
-            val targetSurfaceH = if (isLandscape) streamHeight else streamWidth
-
             Box(
                 modifier = Modifier
                     .size(width = viewW, height = viewH)
@@ -123,10 +120,8 @@ fun CameraPreview(
                     factory = { context ->
                         SurfaceView(context).apply {
                             holder.setKeepScreenOn(true)
-                            holder.setFixedSize(targetSurfaceW, targetSurfaceH)
                             holder.addCallback(object : SurfaceHolder.Callback {
                                 override fun surfaceCreated(holder: SurfaceHolder) {
-                                    holder.setFixedSize(targetSurfaceW, targetSurfaceH)
                                     onSurfaceChanged(holder.surface)
                                 }
 
@@ -145,8 +140,8 @@ fun CameraPreview(
                             })
                         }
                     },
-                    update = { surfaceView ->
-                        surfaceView.holder.setFixedSize(targetSurfaceW, targetSurfaceH)
+                    update = { _ ->
+                        // Пропорції та розміри SurfaceView повністю контролюються Modifier.size(viewW, viewH)
                     },
                     modifier = Modifier.fillMaxSize()
                 )
@@ -200,33 +195,46 @@ fun CameraPreview(
                 }
             }
         } else {
-            Box(
-                modifier = Modifier.fillMaxSize(),
-                contentAlignment = Alignment.Center
+            // Екран запиту дозволів до камери
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(32.dp),
+                verticalArrangement = Arrangement.Center,
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                Icon(
+                    imageVector = Icons.Default.CenterFocusStrong,
+                    contentDescription = "Camera Permission",
+                    tint = StatusEmerald,
+                    modifier = Modifier.size(64.dp)
+                )
+                Text(
+                    text = "Потрібен доступ до камери",
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                    modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
+                )
+                Text(
+                    text = "Додатку потрібен дозвіл для захоплення відеопотоку та трансляції на ПК",
+                    fontSize = 13.sp,
+                    color = TextDimmed,
+                    modifier = Modifier.padding(bottom = 24.dp)
+                )
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(24.dp))
+                        .background(StatusEmerald)
+                        .clickable { onRequestPermissions() }
+                        .padding(horizontal = 24.dp, vertical = 12.dp)
                 ) {
                     Text(
-                        text = "Потрібен доступ до камери",
-                        color = TextDimmed,
-                        fontSize = 15.sp
+                        text = "Надати дозвіл",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.Black
                     )
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(20.dp))
-                            .background(StatusEmerald)
-                            .clickable { onRequestPermissions() }
-                            .padding(horizontal = 20.dp, vertical = 10.dp)
-                    ) {
-                        Text(
-                            text = "Надати дозвіл на камеру",
-                            color = Color.Black,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp
-                        )
-                    }
                 }
             }
         }

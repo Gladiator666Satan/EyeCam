@@ -8,6 +8,7 @@ import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
 import android.hardware.camera2.*
+import android.hardware.camera2.params.ColorSpaceTransform
 import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.RggbChannelVector
@@ -36,15 +37,16 @@ class CameraController(private val context: Context) {
     }
 
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-    private var cameraDevice: CameraDevice? = null
-    private var captureSession: CameraCaptureSession? = null
     private var cameraThread: HandlerThread? = null
     private var cameraHandler: Handler? = null
 
+    private var cameraDevice: CameraDevice? = null
+    private var captureSession: CameraCaptureSession? = null
+    private var previewRequestBuilder: CaptureRequest.Builder? = null
+    private var imageReader: ImageReader? = null
+
     private var previewSurface: Surface? = null
     private var encoderSurface: Surface? = null
-    private var imageReader: ImageReader? = null
-    private var previewRequestBuilder: CaptureRequest.Builder? = null
 
     var onJpegFrameAvailable: ((ByteArray, Int, Int) -> Unit)? = null
     var isNetworkStreamActive: Boolean = false
@@ -240,7 +242,7 @@ class CameraController(private val context: Context) {
             detectedMaxZoom = 10.0f
         }
 
-        minZoomRatio = if (detectedMinZoom <= 0.65f || foundUltraWide || ultraWideCameraId != null) 0.5f else 1.0f
+        minZoomRatio = if (detectedMinZoom <= 0.65f) 0.5f else 1.0f
         maxZoomRatio = detectedMaxZoom.coerceIn(1.0f, 10.0f)
 
         val candidatePresets = listOf(0.5f, 1.0f, 2.0f, 3.0f, 5.0f, 10.0f)
@@ -427,9 +429,9 @@ class CameraController(private val context: Context) {
             builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
             builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
             session.setRepeatingRequest(builder.build(), null, handler)
-            Log.i(TAG, "Tap-to-focus triggered at ($centerX, $centerY)")
+            Log.i(TAG, "Focus triggered at point: ($xNorm, $yNorm)")
         } catch (e: Exception) {
-            Log.e(TAG, "Error triggering tap-to-focus", e)
+            Log.e(TAG, "Error in tap-to-focus", e)
         }
     }
 
@@ -763,91 +765,86 @@ class CameraController(private val context: Context) {
                     if (isFrontCameraActive) switchFrontBack(false)
                     setZoomRatio(parsedZoom)
                 } else {
-                    val matchedSensor = _availableSensors.firstOrNull { it.id == moduleOrId }
-                    if (matchedSensor != null) {
-                        switchCameraModule(matchedSensor.id, 1.0f)
-                    }
+                    switchPhysicalCameraSeamless(moduleOrId)
                 }
             }
         }
     }
 
-    fun switchPhysicalCameraSeamless(targetId: String) {
-        val sensor = _availableSensors.firstOrNull { it.id == targetId }
-        val targetZoom = when (sensor?.sensorType) {
-            SensorType.ULTRA_WIDE -> 0.5f
-            SensorType.WIDE -> 1.0f
-            SensorType.TELEPHOTO -> {
-                val maxFocal = sensor.focalLengths.maxOrNull() ?: 0f
-                if (maxFocal > 12.0f) 5.0f else 3.0f
-            }
-            SensorType.FRONT -> 1.0f
-            else -> 1.0f
+    fun switchPhysicalCameraSeamless(physicalId: String) {
+        val targetSensor = _availableSensors.find { it.id == physicalId }
+        if (targetSensor?.sensorType == SensorType.FRONT) {
+            switchFrontBack(true)
+            return
         }
-        switchCameraModule(targetId, targetZoom)
-    }
-
-    fun setMode(mode: CameraMode) {
-        this.currentMode = mode
-        val session = captureSession ?: return
-        val builder = previewRequestBuilder ?: return
-        val handler = cameraHandler ?: return
-
-        try {
-            applyModeToBuilder(builder, mode)
-            session.setRepeatingRequest(builder.build(), null, handler)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error applying camera mode", e)
+        when (targetSensor?.sensorType) {
+            SensorType.ULTRA_WIDE -> switchToSensor("0.5x")
+            SensorType.WIDE -> switchToSensor("1.0x")
+            SensorType.TELEPHOTO -> {
+                val focal = targetSensor.focalLengths.maxOrNull() ?: 0f
+                if (focal > 12.0f) switchToSensor("5.0x") else switchToSensor("3.0x")
+            }
+            else -> {
+                if (cameraManager.cameraIdList.contains(physicalId)) {
+                    switchCameraModule(physicalId, 1.0f)
+                } else {
+                    switchToSensor("1.0x")
+                }
+            }
         }
     }
 
     fun updateManualIso(iso: Int) {
-        if (currentMode is CameraMode.Manual) {
-            setMode((currentMode as CameraMode.Manual).copy(iso = iso))
-        } else {
-            setMode(CameraMode.Manual(iso = iso))
-        }
+        val oldMode = currentMode as? CameraMode.Manual ?: CameraMode.Manual()
+        setMode(oldMode.copy(iso = iso))
     }
 
     fun updateManualExposure(exposureTimeNs: Long) {
-        if (currentMode is CameraMode.Manual) {
-            setMode((currentMode as CameraMode.Manual).copy(exposureTimeNs = exposureTimeNs))
-        } else {
-            setMode(CameraMode.Manual(exposureTimeNs = exposureTimeNs))
-        }
+        val oldMode = currentMode as? CameraMode.Manual ?: CameraMode.Manual()
+        setMode(oldMode.copy(exposureTimeNs = exposureTimeNs))
     }
 
-    fun updateManualFocus(focusDistance: Float) {
-        if (currentMode is CameraMode.Manual) {
-            setMode((currentMode as CameraMode.Manual).copy(focusDistance = focusDistance))
-        } else {
-            setMode(CameraMode.Manual(focusDistance = focusDistance))
-        }
+    fun updateManualFocus(distance: Float) {
+        val oldMode = currentMode as? CameraMode.Manual ?: CameraMode.Manual()
+        setMode(oldMode.copy(focusDistance = distance))
     }
 
     fun updateManualWhiteBalance(kelvin: Int) {
-        if (currentMode is CameraMode.Manual) {
-            setMode((currentMode as CameraMode.Manual).copy(whiteBalanceKelvin = kelvin))
-        } else {
-            setMode(CameraMode.Manual(whiteBalanceKelvin = kelvin))
+        val oldMode = currentMode as? CameraMode.Manual ?: CameraMode.Manual()
+        setMode(oldMode.copy(whiteBalanceKelvin = kelvin))
+    }
+
+    fun setMode(mode: CameraMode) {
+        this.currentMode = mode
+        val builder = previewRequestBuilder ?: return
+        val session = captureSession ?: return
+        val handler = cameraHandler ?: return
+
+        applyModeToBuilder(builder, mode)
+        try {
+            session.setRepeatingRequest(builder.build(), null, handler)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error updating mode", e)
         }
     }
 
     private fun applyModeToBuilder(builder: CaptureRequest.Builder, mode: CameraMode) {
         val chars = currentSensorCharacteristics
+
         when (mode) {
             is CameraMode.Auto -> {
                 builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-                builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
                 builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
                 builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
             }
             is CameraMode.Manual -> {
                 builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
 
-                if (mode.focusDistance >= 0.0f) {
+                val minFocusDist = chars?.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 10.0f
+                if (mode.focusDistance > 0.0f) {
                     builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
-                    builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, mode.focusDistance)
+                    builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, CameraUtils.clampFocusDistance(mode.focusDistance, minFocusDist))
                 } else {
                     builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
                 }
@@ -862,47 +859,23 @@ class CameraController(private val context: Context) {
                 } else if (mode.iso > 0) {
                     builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
                     builder.set(CaptureRequest.SENSOR_SENSITIVITY, CameraUtils.clampIso(mode.iso, isoRange))
-                    val defaultExp = 20_000_000L
-                    builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, CameraUtils.clampExposureTime(defaultExp, expRange))
                 } else if (mode.exposureTimeNs > 0L) {
                     builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
                     builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, CameraUtils.clampExposureTime(mode.exposureTimeNs, expRange))
-                    val defaultIso = 100
-                    builder.set(CaptureRequest.SENSOR_SENSITIVITY, CameraUtils.clampIso(defaultIso, isoRange))
                 } else {
                     builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
                 }
 
                 if (mode.whiteBalanceKelvin > 0) {
-                    val rggbVector: RggbChannelVector = CameraUtils.kelvinToRggbChannelVector(mode.whiteBalanceKelvin)
                     builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
-                    builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_FAST)
-                    builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, rggbVector)
+                    builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
+                    val rggb = CameraUtils.kelvinToRggbChannelVector(mode.whiteBalanceKelvin)
+                    builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, rggb)
                 } else {
                     builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
                 }
             }
         }
-    }
-
-    @Synchronized
-    fun closeCamera() {
-        isSessionActive.set(false)
-        try { captureSession?.close() } catch (_: Exception) {}
-        try { cameraDevice?.close() } catch (_: Exception) {}
-        try { imageReader?.close() } catch (_: Exception) {}
-        captureSession = null
-        cameraDevice = null
-        imageReader = null
-        previewRequestBuilder = null
-        // Важливо: НЕ зупиняємо backgroundThread тут, щоб не ламати асинхронні виклики openCamera при перемиканні сенсорів
-    }
-
-    @Synchronized
-    fun release() {
-        closeCamera()
-        stopBackgroundThread()
-        encodeExecutor.shutdown()
     }
 
     private fun startBackgroundThread() {
@@ -916,7 +889,41 @@ class CameraController(private val context: Context) {
 
     private fun stopBackgroundThread() {
         cameraThread?.quitSafely()
-        cameraThread = null
-        cameraHandler = null
+        try {
+            cameraThread?.join(500)
+            cameraThread = null
+            cameraHandler = null
+        } catch (e: InterruptedException) {
+            Log.e(TAG, "Error stopping background thread", e)
+        }
+    }
+
+    fun closeCamera() {
+        try {
+            captureSession?.stopRepeating()
+        } catch (_: Exception) {}
+        try {
+            captureSession?.close()
+        } catch (_: Exception) {}
+        captureSession = null
+
+        try {
+            cameraDevice?.close()
+        } catch (_: Exception) {}
+        cameraDevice = null
+
+        try {
+            imageReader?.close()
+        } catch (_: Exception) {}
+        imageReader = null
+
+        isSessionActive.set(false)
+        // thread не зупиняємо тут для миттєвого перезапуску без лагів
+    }
+
+    fun release() {
+        closeCamera()
+        stopBackgroundThread()
+        encodeExecutor.shutdown()
     }
 }

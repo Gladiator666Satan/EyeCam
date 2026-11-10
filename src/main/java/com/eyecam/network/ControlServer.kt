@@ -318,7 +318,7 @@ class ControlServer(
                     when (param) {
                         "iso" -> cameraController.updateManualIso(value.toInt())
                         "shutter" -> {
-                            val expNs = if (value > 0) (1_000_000_000.0 / value).toLong() else 0L
+                            val expNs = (value * 1_000_000_000L).toLong()
                             cameraController.updateManualExposure(expNs)
                         }
                         "focus" -> cameraController.updateManualFocus(value.toFloat())
@@ -327,64 +327,67 @@ class ControlServer(
                 }
 
                 else -> {
+                    Log.w(TAG, "Unknown action received: $action")
                     success = false
-                    errorMessage = "Unknown command: $action"
-                    Log.w(TAG, "Unknown JSON command received: $action")
+                    errorMessage = "Unknown action: $action"
                 }
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error executing action $action", e)
+            success = false
+            errorMessage = e.message ?: "Execution error"
+        }
 
-            val resp = JSONObject().apply {
-                put("type", "COMMAND_ACK")
+        // Відправляємо підтвердження виконання команди (ACK)
+        try {
+            val ack = JSONObject().apply {
+                put("type", "ack")
                 put("action", action)
                 put("success", success)
                 if (!success) put("error", errorMessage)
             }
-            sendFrame(MSG_TYPE_JSON_COMMAND, resp.toString().toByteArray(StandardCharsets.UTF_8))
-        } catch (e: Exception) {
-            Log.e(TAG, "Error executing JSON command", e)
-        }
+            sendFrame(MSG_TYPE_JSON_COMMAND, ack.toString().toByteArray(StandardCharsets.UTF_8))
+        } catch (_: Exception) {}
     }
 
     private fun sendTelemetryState() {
-        val modelName = "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL}"
-        val stateObj = JSONObject().apply {
-            put("type", "telemetry")
-            put("device_name", modelName)
-            put("min_zoom", cameraController.minZoomRatio.toDouble())
-            put("max_zoom", cameraController.maxZoomRatio.toDouble())
-            put("supports_4k", cameraController.supports4K)
-            put("state", JSONObject().apply {
-                put("battery_level", 85.0)
-                put("thermal_temp_c", 36.5)
-                put("measured_fps", 60)
-                put("measured_bitrate_kbps", 18000)
-            })
-        }
-        sendFrame(MSG_TYPE_JSON_COMMAND, stateObj.toString().toByteArray(StandardCharsets.UTF_8))
+        try {
+            val telemetry = JSONObject().apply {
+                put("type", "telemetry")
+                put("fps", 60)
+                put("is_front", cameraController.isFrontCameraActive)
+                put("width", cameraController.streamWidth)
+                put("height", cameraController.streamHeight)
+            }
+            sendFrame(MSG_TYPE_JSON_COMMAND, telemetry.toString().toByteArray(StandardCharsets.UTF_8))
+        } catch (_: Exception) {}
     }
 
-    @Synchronized
     private fun sendFrame(msgType: Short, payload: ByteArray) {
         val out = outStream ?: return
+        val sock = activeSocket ?: return
+        if (sock.isClosed) return
+
         try {
-            out.writeShort(CONTROL_MAGIC.toInt())
-            out.writeShort(msgType.toInt())
-            out.writeInt(payload.size)
-            out.write(payload)
-            out.flush()
+            synchronized(out) {
+                out.writeShort(CONTROL_MAGIC.toInt())
+                out.writeShort(msgType.toInt())
+                out.writeInt(payload.size)
+                out.write(payload)
+                out.flush()
+            }
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to send frame type=$msgType", e)
+            Log.w(TAG, "Failed to send frame $msgType: ${e.message}")
         }
     }
 
     fun stop() {
-        acceptJob?.cancel()
         telemetryJob?.cancel()
+        acceptJob?.cancel()
         try { activeSocket?.close() } catch (_: Exception) {}
         try { serverSocket?.close() } catch (_: Exception) {}
-        serverSocket = null
         activeSocket = null
+        serverSocket = null
         outStream = null
-        Log.i(TAG, "ControlServer stopped.")
     }
 }

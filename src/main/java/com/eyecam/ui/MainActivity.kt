@@ -28,8 +28,8 @@ import com.eyecam.ui.theme.OledPureBlack
 import com.eyecam.viewmodel.StreamViewModel
 
 /**
- * Головна точка входу мобільного додатка EyeCam:
- * - Постійна робота у фоні при заблокованому екрані (SHOW_WHEN_LOCKED, TURN_SCREEN_ON).
+ * Головна Activity додатку EyeCam.
+ * Відповідає за:
  * - Запит дозволів CAMERA, RECORD_AUDIO та POST_NOTIFICATIONS при запуску (запобігає падінню на Android 14/15/16).
  * - Повноекранний Immersive режим.
  * - Утримання екрана активним під час стрімінгу (FLAG_KEEP_SCREEN_ON).

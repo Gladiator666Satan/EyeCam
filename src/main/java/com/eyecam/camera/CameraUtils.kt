@@ -56,16 +56,11 @@ object CameraUtils {
         } else {
             1.9f - (k - 5500f) / 4500f * 0.7f
         }
-        return RggbChannelVector(rGain, 1.0f, 1.0f, bGain)
+
+        return RggbChannelVector(rGain.coerceIn(1.0f, 4.0f), 1.0f, 1.0f, bGain.coerceIn(1.0f, 4.0f))
     }
 
-    fun clampIso(iso: Int, range: Range<Int>?): Int {
-        if (range == null) return iso.coerceIn(50, 3200)
-        return iso.coerceIn(range.lower, range.upper)
-    }
-
-    fun clampExposureTime(exposureNs: Long, range: Range<Long>?): Long {
-        if (range == null) return exposureNs.coerceIn(100_000L, 1_000_000_000L)
-        return exposureNs.coerceIn(range.lower, range.upper)
-    }
+    fun clampIso(iso: Int, isoRange: Range<Int>?): Int = isoRange?.clamp(iso) ?: iso
+    fun clampExposureTime(exposureTimeNs: Long, rangeNs: Range<Long>?): Long = rangeNs?.clamp(exposureTimeNs) ?: exposureTimeNs
+    fun clampFocusDistance(distance: Float, minDistance: Float): Float = distance.coerceIn(0.0f, minDistance)
 }
