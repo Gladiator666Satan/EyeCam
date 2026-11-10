@@ -18,6 +18,7 @@ local.properties
 .cxx/
 captures/
 *.keystore
+!keystore/debug.keystore
 *.jks
 *.hprof
 lint/
