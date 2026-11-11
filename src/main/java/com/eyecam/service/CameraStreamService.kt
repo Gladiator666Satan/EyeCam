@@ -5,7 +5,6 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
-import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -20,6 +19,7 @@ import android.util.Log
 import android.view.Surface
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.LifecycleService
 import com.eyecam.R
 import com.eyecam.camera.CameraController
 import com.eyecam.model.CameraSensorInfo
@@ -42,10 +42,10 @@ import java.net.Inet4Address
 import java.net.NetworkInterface
 
 /**
- * Ongoing Foreground Service, що підтримує життєвий цикл захоплення Camera2,
- * TCP/ADB сервера керування і трансляції (:8554) та моніторингу USB / Wi-Fi підключення.
+ * Ongoing Foreground LifecycleService, що підтримує життєвий цикл захоплення CameraX,
+ * апаратного H.264 кодування, TCP/ADB сервера керування і трансляції (:8554) та моніторингу USB / Wi-Fi.
  */
-class CameraStreamService : Service() {
+class CameraStreamService : LifecycleService() {
 
     private val serviceJob = SupervisorJob()
     private val serviceScope = CoroutineScope(Dispatchers.Default + serviceJob)
@@ -59,6 +59,9 @@ class CameraStreamService : Service() {
     private lateinit var controlServer: ControlServer
 
     private var currentPreviewSurface: Surface? = null
+    private var currentPreviewWidth: Int = 0
+    private var currentPreviewHeight: Int = 0
+    private var currentDisplayRotation: Int = Surface.ROTATION_0
     private var isPcConnected = false
     private var isPcViaUsbAdb = false
 
@@ -92,20 +95,51 @@ class CameraStreamService : Service() {
         }
 
         cameraController = CameraController(this)
-        cameraController.onJpegFrameAvailable = { jpegBytes, _, _ ->
+        cameraController.attachLifecycleOwner(this)
+        cameraController.onH264FrameAvailable = { annexBBytes, isKeyFrame, _ ->
             if (_uiState.value.isStreaming) {
-                controlServer.sendVideoFrame(jpegBytes)
+                controlServer.sendH264Frame(annexBBytes, isKeyFrame)
+            }
+        }
+        cameraController.onTelemetryMeasured = { fps, bitrateKbps ->
+            _uiState.update { current ->
+                current.copy(
+                    telemetry = current.telemetry.copy(
+                        fps = if (_uiState.value.isStreaming) fps.toInt() else 0,
+                        bitrateKbps = if (_uiState.value.isStreaming) bitrateKbps else 0,
+                        batteryPercentage = readBatteryPercent().toInt(),
+                        batteryTemperatureC = readBatteryTempC()
+                    )
+                )
+            }
+        }
+        cameraController.onStateChanged = {
+            _uiState.update { current ->
+                current.copy(
+                    currentZoomRatio = cameraController.currentZoomRatio,
+                    isFrontCamera = cameraController.isFrontCameraActive,
+                    minZoomRatio = cameraController.minZoomRatio,
+                    maxZoomRatio = cameraController.maxZoomRatio,
+                    supportedZoomPresets = cameraController.supportedZoomPresets.toList(),
+                    telemetry = current.telemetry.copy(
+                        resolutionWidth = cameraController.streamWidth,
+                        resolutionHeight = cameraController.streamHeight,
+                        targetFps = cameraController.streamFps
+                    )
+                )
+            }
+            if (controlServer.isClientConnected) {
+                controlServer.sendTelemetryState()
             }
         }
 
         controlServer = ControlServer(
             port = 8554,
             cameraController = cameraController,
-            onKeyframeRequested = {},
+            onKeyframeRequested = { cameraController.requestKeyFrame() },
             onClientConnectionChanged = { connected, viaUsb, remoteIp ->
                 isPcConnected = connected
                 isPcViaUsbAdb = viaUsb
-                // Якщо ПК підключився — автоматично активуємо передачу кадрів
                 if (connected && !_uiState.value.isStreaming && cameraController.hasCameraPermission()) {
                     serviceScope.launch(Dispatchers.Main) {
                         startStreaming()
@@ -114,16 +148,16 @@ class CameraStreamService : Service() {
                 refreshConnectionStatus()
                 Log.i(TAG, "PC Client connection changed: connected=$connected, viaUsb=$viaUsb, ip=$remoteIp")
             },
-            onZoomUpdatedFromPc = { zoom, isFront ->
+            onZoomUpdatedFromPc = { _, _ ->
                 _uiState.update {
                     it.copy(
-                        currentZoomRatio = zoom,
-                        isFrontCamera = isFront
+                        currentZoomRatio = cameraController.currentZoomRatio,
+                        isFrontCamera = cameraController.isFrontCameraActive
                     )
                 }
+                updateNotification()
             },
             onResolutionUpdatedFromPc = { w, h, fps ->
-                cameraController.setResolution(w, h, fps)
                 _uiState.update { current ->
                     current.copy(
                         telemetry = current.telemetry.copy(
@@ -133,7 +167,9 @@ class CameraStreamService : Service() {
                         )
                     )
                 }
-            }
+            },
+            batteryLevelProvider = { readBatteryPercent() },
+            thermalTempProvider = { readBatteryTempC() }
         )
         controlServer.start()
 
@@ -160,20 +196,41 @@ class CameraStreamService : Service() {
         }
 
         if (hasPerm && currentPreviewSurface != null) {
-            cameraController.updatePreviewSurface(currentPreviewSurface)
+            cameraController.updatePreviewSurface(
+                currentPreviewSurface,
+                currentPreviewWidth,
+                currentPreviewHeight,
+                currentDisplayRotation
+            )
+            if (!cameraController.isCameraRunning()) {
+                cameraController.openCamera(previewSurface = currentPreviewSurface)
+            }
         }
     }
 
-    fun attachPreviewSurface(surface: Surface?) {
+    fun attachPreviewSurface(
+        surface: Surface?,
+        width: Int = 0,
+        height: Int = 0,
+        displayRotation: Int = Surface.ROTATION_0
+    ) {
         currentPreviewSurface = surface
+        if (width > 0 && height > 0) {
+            currentPreviewWidth = width
+            currentPreviewHeight = height
+        }
+        currentDisplayRotation = displayRotation
+
         if (surface != null && surface.isValid && cameraController.hasCameraPermission()) {
-            cameraController.updatePreviewSurface(surface)
+            cameraController.updatePreviewSurface(surface, currentPreviewWidth, currentPreviewHeight, displayRotation)
+            if (!cameraController.isCameraRunning()) {
+                cameraController.openCamera(previewSurface = surface)
+            }
         } else if (surface == null) {
-            if (_uiState.value.isStreaming) {
-                // Утримуємо трансляцію активною у фоні та при заблокованому екрані
-                cameraController.updatePreviewSurface(null)
-            } else {
-                cameraController.release()
+            // Detach UI surface ONLY — keep CameraX + HardwareEncoder running seamlessly!
+            cameraController.updatePreviewSurface(null, 0, 0, displayRotation)
+            if (!_uiState.value.isStreaming) {
+                cameraController.closeCamera()
             }
         }
     }
@@ -268,6 +325,7 @@ class CameraStreamService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        super.onStartCommand(intent, flags, startId)
         when (intent?.action) {
             ACTION_START_STREAM -> startStreaming()
             ACTION_STOP_STREAM -> stopStreaming()
@@ -283,7 +341,10 @@ class CameraStreamService : Service() {
         return START_STICKY
     }
 
-    override fun onBind(intent: Intent?): IBinder = binder
+    override fun onBind(intent: Intent): IBinder? {
+        super.onBind(intent)
+        return binder
+    }
 
     /**
      * Запуск трансляції: безпечне підняття Foreground Service з перевіркою дозволів Android 14/15/16.
@@ -379,7 +440,24 @@ class CameraStreamService : Service() {
         cameraController.setZoomRatio(zoom)
         _uiState.update {
             it.copy(
-                currentZoomRatio = zoom.coerceIn(cameraController.minZoomRatio, cameraController.maxZoomRatio)
+                currentZoomRatio = cameraController.currentZoomRatio
+            )
+        }
+        updateNotification()
+    }
+
+    /**
+     * Перемикання на тиловий пресет зуму / об'єктиву (наприклад 0.5x, 1x, 2x, 3x, 5x, 10x).
+     * Автоматично виходить із фронтальної камери, якщо вона була активною.
+     */
+    fun selectLensPreset(zoom: Float) {
+        cameraController.switchToSensor("${zoom}x")
+        _uiState.update {
+            it.copy(
+                isFrontCamera = cameraController.isFrontCameraActive,
+                currentZoomRatio = cameraController.currentZoomRatio,
+                minZoomRatio = cameraController.minZoomRatio,
+                maxZoomRatio = cameraController.maxZoomRatio
             )
         }
         updateNotification()
@@ -390,7 +468,9 @@ class CameraStreamService : Service() {
         _uiState.update {
             it.copy(
                 isFrontCamera = useFront,
-                currentZoomRatio = 1.0f
+                currentZoomRatio = 1.0f,
+                minZoomRatio = cameraController.minZoomRatio,
+                maxZoomRatio = cameraController.maxZoomRatio
             )
         }
         updateNotification()
@@ -506,6 +586,27 @@ class CameraStreamService : Service() {
             }
             val manager = getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(channel)
+        }
+    }
+
+    private fun readBatteryPercent(): Float {
+        return try {
+            val intent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+            val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
+            if (level >= 0 && scale > 0) (level * 100f) / scale else 100f
+        } catch (_: Exception) {
+            100f
+        }
+    }
+
+    private fun readBatteryTempC(): Float {
+        return try {
+            val intent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val tenths = intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 350) ?: 350
+            tenths / 10.0f
+        } catch (_: Exception) {
+            35.0f
         }
     }
 

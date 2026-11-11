@@ -90,6 +90,11 @@ if (WIN32)
         dwrite.lib
         dwmapi.lib
         windowscodecs.lib
+        mfplat.lib
+        mf.lib
+        mfuuid.lib
+        wmcodecdspuuid.lib
+        strmiids.lib
         ws2_32.lib
         shell32.lib
         ole32.lib

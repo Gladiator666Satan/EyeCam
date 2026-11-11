@@ -35,6 +35,9 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     private var streamService: CameraStreamService? = null
     private var isBound = false
     private var pendingPreviewSurface: Surface? = null
+    private var pendingPreviewWidth: Int = 0
+    private var pendingPreviewHeight: Int = 0
+    private var pendingDisplayRotation: Int = Surface.ROTATION_0
 
     private var inactivityTimerJob: Job? = null
     private val INACTIVITY_TIMEOUT_MS = 15_000L
@@ -52,7 +55,12 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
 
             streamService?.refreshHardwareCapabilities()
             pendingPreviewSurface?.let { surface ->
-                streamService?.attachPreviewSurface(surface)
+                streamService?.attachPreviewSurface(
+                    surface,
+                    pendingPreviewWidth,
+                    pendingPreviewHeight,
+                    pendingDisplayRotation
+                )
             }
 
             viewModelScope.launch {
@@ -84,13 +92,28 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     fun onPermissionsGranted() {
         streamService?.refreshHardwareCapabilities()
         pendingPreviewSurface?.let { surface ->
-            streamService?.attachPreviewSurface(surface)
+            streamService?.attachPreviewSurface(
+                surface,
+                pendingPreviewWidth,
+                pendingPreviewHeight,
+                pendingDisplayRotation
+            )
         }
     }
 
-    fun attachPreviewSurface(surface: Surface?) {
+    fun attachPreviewSurface(
+        surface: Surface?,
+        width: Int = 0,
+        height: Int = 0,
+        displayRotation: Int = Surface.ROTATION_0
+    ) {
         pendingPreviewSurface = surface
-        streamService?.attachPreviewSurface(surface)
+        if (width > 0 && height > 0) {
+            pendingPreviewWidth = width
+            pendingPreviewHeight = height
+        }
+        pendingDisplayRotation = displayRotation
+        streamService?.attachPreviewSurface(surface, width, height, displayRotation)
     }
 
     /**
@@ -127,6 +150,11 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     fun setZoomRatio(zoom: Float) {
         onUserInteraction()
         streamService?.setZoomRatio(zoom)
+    }
+
+    fun selectLensPreset(zoom: Float) {
+        onUserInteraction()
+        streamService?.selectLensPreset(zoom)
     }
 
     fun setFrontCamera(useFront: Boolean) {

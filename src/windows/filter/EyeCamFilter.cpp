@@ -108,6 +108,12 @@ struct FormatPreset {
 };
 
 static const FormatPreset g_Presets[] = {
+    { 3840, 2160, 30, MEDIASUBTYPE_YUY2 },
+    { 3840, 2160, 60, MEDIASUBTYPE_YUY2 },
+    { 3840, 2160, 30, MEDIASUBTYPE_RGB24 },
+    { 2560, 1440, 60, MEDIASUBTYPE_YUY2 },
+    { 2560, 1440, 30, MEDIASUBTYPE_YUY2 },
+    { 2560, 1440, 60, MEDIASUBTYPE_RGB24 },
     { 1920, 1080, 60, MEDIASUBTYPE_YUY2 },
     { 1920, 1080, 30, MEDIASUBTYPE_YUY2 },
     { 1920, 1080, 60, MEDIASUBTYPE_RGB24 },
@@ -637,11 +643,76 @@ void EyeCamOutputPin::FillBuffer(BYTE* pBuffer, size_t bufferSize) {
             DWORD waitRes = WaitForSingleObject(m_hMutex, 20);
             if (waitRes == WAIT_OBJECT_0) {
                 auto* header = reinterpret_cast<const SharedMemoryHeader*>(m_pSharedBuf);
-                if (header->isConnected == 1 && header->dataSize > 0) {
+                if (header->isConnected == 1 && header->dataSize > 0 &&
+                    header->width > 0 && header->height > 0) {
                     const uint8_t* srcData = reinterpret_cast<const uint8_t*>(m_pSharedBuf) + sizeof(SharedMemoryHeader);
-                    size_t copyBytes = (header->dataSize < bufferSize) ? header->dataSize : bufferSize;
-                    std::memcpy(pBuffer, srcData, copyBytes);
-                    frameRendered = true;
+                    VIDEOINFOHEADER* pVih = (m_mediaType.formattype == FORMAT_VideoInfo && m_mediaType.pbFormat)
+                        ? reinterpret_cast<VIDEOINFOHEADER*>(m_mediaType.pbFormat)
+                        : nullptr;
+                    const uint32_t dstW = pVih ? static_cast<uint32_t>(std::abs(pVih->bmiHeader.biWidth)) : header->width;
+                    const uint32_t dstH = pVih ? static_cast<uint32_t>(std::abs(pVih->bmiHeader.biHeight)) : header->height;
+                    const uint32_t srcW = header->width;
+                    const uint32_t srcH = header->height;
+                    const bool srcIsYuy2 = (header->pixelFormat == static_cast<uint32_t>(PixelFormat::YUY2));
+                    const bool dstIsYuy2 = (m_mediaType.subtype == MEDIASUBTYPE_YUY2);
+
+                    if (srcW == dstW && srcH == dstH &&
+                        ((srcIsYuy2 && dstIsYuy2) || (!srcIsYuy2 && !dstIsYuy2))) {
+                        size_t copyBytes = (header->dataSize < bufferSize) ? header->dataSize : bufferSize;
+                        std::memcpy(pBuffer, srcData, copyBytes);
+                        frameRendered = true;
+                    } else if (srcIsYuy2 && dstIsYuy2 && dstW >= 2 && dstH >= 2 &&
+                               header->dataSize >= static_cast<size_t>(srcW) * srcH * 2 &&
+                               bufferSize >= static_cast<size_t>(dstW) * dstH * 2) {
+                        for (uint32_t y = 0; y < dstH; ++y) {
+                            const uint32_t sy = (static_cast<uint64_t>(y) * srcH) / dstH;
+                            const uint8_t* srcRow = srcData + (static_cast<size_t>(sy) * srcW * 2);
+                            BYTE* dstRow = pBuffer + (static_cast<size_t>(y) * dstW * 2);
+                            for (uint32_t x = 0; x + 1 < dstW; x += 2) {
+                                uint32_t sxPair = ((static_cast<uint64_t>(x) * srcW) / dstW) & ~1u;
+                                if (sxPair + 1 >= srcW) sxPair = (srcW >= 2) ? (srcW - 2) : 0;
+                                const uint8_t* sp = srcRow + (static_cast<size_t>(sxPair) * 2);
+                                dstRow[x * 2 + 0] = sp[0];
+                                dstRow[x * 2 + 1] = sp[1];
+                                dstRow[x * 2 + 2] = sp[2];
+                                dstRow[x * 2 + 3] = sp[3];
+                            }
+                        }
+                        frameRendered = true;
+                    } else if (srcIsYuy2 && m_mediaType.subtype == MEDIASUBTYPE_RGB24 &&
+                               header->dataSize >= static_cast<size_t>(srcW) * srcH * 2 &&
+                               bufferSize >= static_cast<size_t>(dstW) * dstH * 3) {
+                        const bool bottomUp = !(pVih && pVih->bmiHeader.biHeight < 0);
+                        auto clampByte = [](int v) -> uint8_t {
+                            return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+                        };
+                        for (uint32_t y = 0; y < dstH; ++y) {
+                            const uint32_t sy = (static_cast<uint64_t>(y) * srcH) / dstH;
+                            const uint8_t* srcRow = srcData + (static_cast<size_t>(sy) * srcW * 2);
+                            const uint32_t dy = bottomUp ? (dstH - 1 - y) : y;
+                            BYTE* dstRow = pBuffer + (static_cast<size_t>(dy) * dstW * 3);
+                            for (uint32_t x = 0; x < dstW; ++x) {
+                                const uint32_t sx = (static_cast<uint64_t>(x) * srcW) / dstW;
+                                const uint32_t sxEven = sx & ~1u;
+                                const uint8_t* sp = srcRow + (static_cast<size_t>(sxEven) * 2);
+                                int Y = ((sx & 1u) == 0 ? sp[0] : sp[2]) - 16;
+                                int U = sp[1] - 128;
+                                int V = sp[3] - 128;
+                                int c298 = 298 * Y;
+                                int r = (c298 + 409 * V + 128) >> 8;
+                                int g = (c298 - 100 * U - 208 * V + 128) >> 8;
+                                int b = (c298 + 516 * U + 128) >> 8;
+                                dstRow[x * 3 + 0] = clampByte(b);
+                                dstRow[x * 3 + 1] = clampByte(g);
+                                dstRow[x * 3 + 2] = clampByte(r);
+                            }
+                        }
+                        frameRendered = true;
+                    } else {
+                        size_t copyBytes = (header->dataSize < bufferSize) ? header->dataSize : bufferSize;
+                        std::memcpy(pBuffer, srcData, copyBytes);
+                        frameRendered = true;
+                    }
                 }
                 ReleaseMutex(m_hMutex);
             }

@@ -24,13 +24,22 @@
 #include <wincodec.h>
 #include <dxgiformat.h>
 
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mftransform.h>
+#include <mferror.h>
+#include <codecapi.h>
+#include <wmcodecdsp.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -44,6 +53,11 @@
 #pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "mfplat.lib")
+#pragma comment(lib, "mf.lib")
+#pragma comment(lib, "mfuuid.lib")
+#pragma comment(lib, "wmcodecdspuuid.lib")
+#pragma comment(lib, "strmiids.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -126,6 +140,7 @@ struct StudioState {
 
     // Випадаючий список USB пристроїв (ADB)
     std::vector<UsbDeviceEntry> usbDevices;
+    std::string selectedUsbSerial;
     int selectedUsbIdx = 0;
     bool usbDropdownOpen = false;
 
@@ -134,6 +149,12 @@ struct StudioState {
     float phoneMinZoom = 0.5f;
     float phoneMaxZoom = 10.0f;
     bool phoneSupports4K = true;
+    std::vector<float> phoneZoomPresets = {0.5f, 1.0f, 2.0f, 3.0f, 5.0f, 10.0f};
+    int streamRotationDeg = -1; // -1 = Авто, 0, 90, 180, 270
+    float phoneThermalC = 0.0f;
+    int phoneBatteryPct = 0;
+    int phoneMeasuredFps = 0;
+    int phoneMeasuredBitrateKbps = 0;
 
     // Параметри відеопотоку (включаючи 4K UHD та 2K QHD)
     int resPresetIdx = 2; // 0: 4K UHD (3840x2160), 1: 2K QHD (2560x1440), 2: 1080p 60, 3: 720p 60
@@ -254,7 +275,7 @@ std::string RunHiddenCommandOutput(const std::wstring& cmdLine) {
 }
 
 // Сканування підключених по USB смартфонів через `adb devices -l`
-std::vector<UsbDeviceEntry> ScanConnectedUsbDevices() {
+std::vector<UsbDeviceEntry> ScanConnectedUsbDevices(const std::string& preferredSerial = "") {
     std::vector<UsbDeviceEntry> list;
     std::wstring adbPath = ResolveAdbExecutablePath();
     std::string out = RunHiddenCommandOutput(L"\"" + adbPath + L"\" devices -l");
@@ -305,13 +326,27 @@ std::vector<UsbDeviceEntry> ScanConnectedUsbDevices() {
         list.push_back(entry);
     }
 
-    // Якщо є авторизований пристрій — автоматично прокидаємо порт TCP 8554 для нього
-    for (const auto& dev : list) {
-        if (dev.authorized) {
-            std::wstring wSer = Utf8ToWide(dev.serial);
-            RunHiddenCommandOutput(L"\"" + adbPath + L"\" -s " + wSer + L" forward tcp:8554 tcp:8554");
-            break;
+    // Прокидаємо порт TCP 8554 для обраного авторизованого пристрою (або першого доступного)
+    const UsbDeviceEntry* targetDev = nullptr;
+    if (!preferredSerial.empty()) {
+        for (const auto& dev : list) {
+            if (dev.authorized && dev.serial == preferredSerial) {
+                targetDev = &dev;
+                break;
+            }
         }
+    }
+    if (!targetDev) {
+        for (const auto& dev : list) {
+            if (dev.authorized) {
+                targetDev = &dev;
+                break;
+            }
+        }
+    }
+    if (targetDev) {
+        std::wstring wSer = Utf8ToWide(targetDev->serial);
+        RunHiddenCommandOutput(L"\"" + adbPath + L"\" -s " + wSer + L" forward tcp:8554 tcp:8554");
     }
     return list;
 }
@@ -385,9 +420,405 @@ bool ExtractJsonFloat(const std::string& json, const char* key, float& outVal) {
     size_t p = json.find(pattern);
     if (p == std::string::npos) return false;
     size_t start = p + pattern.size();
+    while (start < json.size() && (json[start] == ' ' || json[start] == '\t')) ++start;
+    if (start >= json.size()) return false;
     outVal = static_cast<float>(std::atof(json.c_str() + start));
     return true;
 }
+
+bool ExtractJsonInt(const std::string& json, const char* key, int& outVal) {
+    std::string pattern = std::string("\"") + key + "\":";
+    size_t p = json.find(pattern);
+    if (p == std::string::npos) return false;
+    size_t start = p + pattern.size();
+    while (start < json.size() && (json[start] == ' ' || json[start] == '\t')) ++start;
+    if (start >= json.size()) return false;
+    outVal = std::atoi(json.c_str() + start);
+    return true;
+}
+
+bool ExtractJsonBool(const std::string& json, const char* key, bool& outVal) {
+    std::string pattern = std::string("\"") + key + "\":";
+    size_t p = json.find(pattern);
+    if (p == std::string::npos) return false;
+    size_t start = p + pattern.size();
+    while (start < json.size() && (json[start] == ' ' || json[start] == '\t')) ++start;
+    if (json.compare(start, 4, "true") == 0) { outVal = true; return true; }
+    if (json.compare(start, 5, "false") == 0) { outVal = false; return true; }
+    return false;
+}
+
+bool ExtractJsonFloatArray(const std::string& json, const char* key, std::vector<float>& outArr) {
+    std::string pattern = std::string("\"") + key + "\":[";
+    size_t p = json.find(pattern);
+    if (p == std::string::npos) return false;
+    size_t start = p + pattern.size();
+    size_t end = json.find(']', start);
+    if (end == std::string::npos) return false;
+    std::string slice = json.substr(start, end - start);
+    outArr.clear();
+    size_t cur = 0;
+    while (cur < slice.size()) {
+        size_t comma = slice.find(',', cur);
+        std::string item = slice.substr(cur, (comma == std::string::npos) ? std::string::npos : (comma - cur));
+        if (!item.empty()) {
+            outArr.push_back(static_cast<float>(std::atof(item.c_str())));
+        }
+        if (comma == std::string::npos) break;
+        cur = comma + 1;
+    }
+    return !outArr.empty();
+}
+
+bool IsH264KeyFrameAnnexB(const uint8_t* data, size_t len) {
+    if (!data || len < 5) return false;
+    for (size_t i = 0; i + 4 < len; ++i) {
+        if (data[i] == 0x00 && data[i + 1] == 0x00) {
+            size_t hdr = 0;
+            if (data[i + 2] == 0x01) {
+                hdr = i + 3;
+            } else if (data[i + 2] == 0x00 && i + 4 < len && data[i + 3] == 0x01) {
+                hdr = i + 4;
+            }
+            if (hdr > 0 && hdr < len) {
+                uint8_t nalType = data[hdr] & 0x1F;
+                if (nalType == 5) return true;
+                i = hdr;
+            }
+        }
+    }
+    return false;
+}
+
+struct OutboundControlPacket {
+    uint16_t msgType = 1;
+    std::string payload;
+    std::string coalesceKey;
+};
+
+struct IncomingVideoPacket {
+    enum class Kind { H264, JPEG, FLUSH };
+    Kind kind = Kind::H264;
+    bool isKeyFrame = false;
+    std::vector<uint8_t> data;
+};
+
+// ============================================================================
+// Апаратний / системний декодер H.264 Annex-B на базі Windows Media Foundation
+// ============================================================================
+class MfH264Decoder {
+public:
+    ~MfH264Decoder() {
+        Shutdown();
+    }
+
+    bool Initialize(UINT32 hintW = 1920, UINT32 hintH = 1080) {
+        Shutdown();
+
+        HRESULT hr = CoCreateInstance(
+            CLSID_CMSH264DecoderMFT,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&m_decoder)
+        );
+        if (FAILED(hr) || !m_decoder) {
+            return false;
+        }
+
+        // Низька затримка (без буферизації B-кадрів / реордерингу)
+        ICodecAPI* pCodecApi = nullptr;
+        if (SUCCEEDED(m_decoder->QueryInterface(IID_PPV_ARGS(&pCodecApi))) && pCodecApi) {
+            const GUID lowLatencyGuid = __uuidof(CODECAPI_AVLowLatencyMode);
+            VARIANT var{};
+            VariantInit(&var);
+            var.vt = VT_UI4;
+            var.ulVal = 1;
+            if (FAILED(pCodecApi->SetValue(&lowLatencyGuid, &var))) {
+                VariantClear(&var);
+                var.vt = VT_BOOL;
+                var.boolVal = VARIANT_TRUE;
+                pCodecApi->SetValue(&lowLatencyGuid, &var);
+            }
+            VariantClear(&var);
+            pCodecApi->Release();
+        }
+
+        IMFMediaType* pInType = nullptr;
+        hr = MFCreateMediaType(&pInType);
+        if (FAILED(hr) || !pInType) {
+            Shutdown();
+            return false;
+        }
+        pInType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        pInType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+        pInType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        MFSetAttributeSize(pInType, MF_MT_FRAME_SIZE, (std::max)(16u, hintW), (std::max)(16u, hintH));
+        hr = m_decoder->SetInputType(0, pInType, 0);
+        pInType->Release();
+        if (FAILED(hr)) {
+            Shutdown();
+            return false;
+        }
+
+        if (!ConfigureOutputType()) {
+            Shutdown();
+            return false;
+        }
+
+        m_decoder->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+        m_decoder->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+        m_sampleTime100ns = 0;
+        m_initialized = true;
+        return true;
+    }
+
+    void Flush() {
+        if (m_decoder) {
+            m_decoder->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+        }
+    }
+
+    void Shutdown() {
+        ReleaseReusableSample();
+        if (m_decoder) {
+            m_decoder->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+            m_decoder->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+            m_decoder->Release();
+            m_decoder = nullptr;
+        }
+        m_initialized = false;
+        m_outInfoValid = false;
+        m_mftProvidesSamples = false;
+    }
+
+    template <typename OnNv12Frame>
+    bool DecodeAccessUnit(const uint8_t* data, size_t len, OnNv12Frame&& onFrame) {
+        if (!data || len == 0) return false;
+        if (!m_initialized && !Initialize()) return false;
+
+        IMFMediaBuffer* pInBuf = nullptr;
+        HRESULT hr = MFCreateMemoryBuffer(static_cast<DWORD>(len), &pInBuf);
+        if (FAILED(hr) || !pInBuf) return false;
+
+        BYTE* pDst = nullptr;
+        if (SUCCEEDED(pInBuf->Lock(&pDst, nullptr, nullptr)) && pDst) {
+            std::memcpy(pDst, data, len);
+            pInBuf->Unlock();
+            pInBuf->SetCurrentLength(static_cast<DWORD>(len));
+        } else {
+            pInBuf->Release();
+            return false;
+        }
+
+        IMFSample* pInSample = nullptr;
+        hr = MFCreateSample(&pInSample);
+        if (FAILED(hr) || !pInSample) {
+            pInBuf->Release();
+            return false;
+        }
+        pInSample->AddBuffer(pInBuf);
+        pInSample->SetSampleTime(m_sampleTime100ns);
+        pInSample->SetSampleDuration(166667);
+        m_sampleTime100ns += 166667;
+        pInBuf->Release();
+
+        bool emitted = false;
+        hr = m_decoder->ProcessInput(0, pInSample, 0);
+        if (hr == MF_E_NOTACCEPTING) {
+            emitted = DrainOutputs(onFrame) || emitted;
+            hr = m_decoder->ProcessInput(0, pInSample, 0);
+        }
+        pInSample->Release();
+
+        if (FAILED(hr)) {
+            return emitted;
+        }
+        return DrainOutputs(onFrame) || emitted;
+    }
+
+private:
+    void ReleaseReusableSample() {
+        if (m_reusableOutSample) {
+            m_reusableOutSample->Release();
+            m_reusableOutSample = nullptr;
+        }
+        m_reusableOutBufBytes = 0;
+    }
+
+    bool ConfigureOutputType() {
+        if (!m_decoder) return false;
+        for (DWORD idx = 0;; ++idx) {
+            IMFMediaType* pOutType = nullptr;
+            HRESULT hr = m_decoder->GetOutputAvailableType(0, idx, &pOutType);
+            if (FAILED(hr) || !pOutType) break;
+
+            GUID subtype{};
+            if (SUCCEEDED(pOutType->GetGUID(MF_MT_SUBTYPE, &subtype)) && subtype == MFVideoFormat_NV12) {
+                hr = m_decoder->SetOutputType(0, pOutType, 0);
+                if (SUCCEEDED(hr)) {
+                    UINT32 cw = 1920, ch = 1080;
+                    if (SUCCEEDED(MFGetAttributeSize(pOutType, MF_MT_FRAME_SIZE, &cw, &ch)) && cw > 0 && ch > 0) {
+                        m_codedW = cw;
+                        m_codedH = ch;
+                    }
+                    UINT32 defStrideU = m_codedW;
+                    if (SUCCEEDED(pOutType->GetUINT32(MF_MT_DEFAULT_STRIDE, &defStrideU)) && defStrideU != 0) {
+                        m_defaultStride = static_cast<LONG>(static_cast<INT32>(defStrideU));
+                    } else {
+                        m_defaultStride = static_cast<LONG>(m_codedW);
+                    }
+
+                    m_visX = 0;
+                    m_visY = 0;
+                    m_visW = m_codedW;
+                    m_visH = m_codedH;
+
+                    MFVideoArea area{};
+                    UINT32 blobSz = 0;
+                    if (SUCCEEDED(pOutType->GetBlob(MF_MT_MINIMUM_DISPLAY_APERTURE,
+                                                    reinterpret_cast<UINT8*>(&area),
+                                                    sizeof(area), &blobSz)) &&
+                        blobSz == sizeof(MFVideoArea) && area.Area.cx > 0 && area.Area.cy > 0) {
+                        m_visX = (area.OffsetX.value >= 0) ? static_cast<UINT32>(area.OffsetX.value) : 0u;
+                        m_visY = (area.OffsetY.value >= 0) ? static_cast<UINT32>(area.OffsetY.value) : 0u;
+                        m_visW = static_cast<UINT32>(area.Area.cx);
+                        m_visH = static_cast<UINT32>(area.Area.cy);
+                    }
+
+                    m_outInfoValid = false;
+                    ReleaseReusableSample();
+                    pOutType->Release();
+                    return true;
+                }
+            }
+            pOutType->Release();
+        }
+        return false;
+    }
+
+    bool EnsureReusableSample(DWORD requiredBytes) {
+        if (m_reusableOutSample && m_reusableOutBufBytes >= requiredBytes) {
+            IMFMediaBuffer* pBuf = nullptr;
+            if (SUCCEEDED(m_reusableOutSample->GetBufferByIndex(0, &pBuf)) && pBuf) {
+                pBuf->SetCurrentLength(0);
+                pBuf->Release();
+                return true;
+            }
+        }
+        ReleaseReusableSample();
+
+        IMFMediaBuffer* pBuf = nullptr;
+        if (FAILED(MFCreateMemoryBuffer(requiredBytes, &pBuf)) || !pBuf) return false;
+        IMFSample* pSample = nullptr;
+        if (FAILED(MFCreateSample(&pSample)) || !pSample) {
+            pBuf->Release();
+            return false;
+        }
+        pSample->AddBuffer(pBuf);
+        pBuf->Release();
+        m_reusableOutSample = pSample;
+        m_reusableOutBufBytes = requiredBytes;
+        return true;
+    }
+
+    template <typename OnNv12Frame>
+    bool DrainOutputs(OnNv12Frame&& onFrame) {
+        bool emitted = false;
+        for (int iter = 0; iter < 16; ++iter) {
+            if (!m_outInfoValid) {
+                MFT_OUTPUT_STREAM_INFO outInfo{};
+                if (FAILED(m_decoder->GetOutputStreamInfo(0, &outInfo))) break;
+                m_mftProvidesSamples = (outInfo.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) != 0;
+                DWORD nv12Min = static_cast<DWORD>(m_codedW * m_codedH * 3 / 2 + 4096);
+                m_requiredOutBytes = (std::max)(outInfo.cbSize, nv12Min);
+                m_outInfoValid = true;
+            }
+
+            MFT_OUTPUT_DATA_BUFFER outData{};
+            outData.dwStreamID = 0;
+            if (!m_mftProvidesSamples) {
+                if (!EnsureReusableSample(m_requiredOutBytes)) break;
+                outData.pSample = m_reusableOutSample;
+            }
+
+            DWORD status = 0;
+            HRESULT hr = m_decoder->ProcessOutput(0, 1, &outData, &status);
+            if (outData.pEvents) {
+                outData.pEvents->Release();
+                outData.pEvents = nullptr;
+            }
+
+            if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+                if (m_mftProvidesSamples && outData.pSample) {
+                    outData.pSample->Release();
+                }
+                if (!ConfigureOutputType()) break;
+                continue;
+            }
+            if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT || FAILED(hr)) {
+                if (m_mftProvidesSamples && outData.pSample) {
+                    outData.pSample->Release();
+                }
+                break;
+            }
+
+            if (outData.pSample) {
+                IMFMediaBuffer* pOutBuf = nullptr;
+                if (SUCCEEDED(outData.pSample->GetBufferByIndex(0, &pOutBuf)) && pOutBuf) {
+                    UINT32 visX = (std::min)(m_visX, m_codedW > 0 ? m_codedW - 1 : 0u);
+                    UINT32 visY = (std::min)(m_visY, m_codedH > 0 ? m_codedH - 1 : 0u);
+                    UINT32 visW = (std::min)(m_visW, m_codedW - visX);
+                    UINT32 visH = (std::min)(m_visH, m_codedH - visY);
+
+                    IMF2DBuffer* p2D = nullptr;
+                    if (SUCCEEDED(pOutBuf->QueryInterface(IID_PPV_ARGS(&p2D))) && p2D) {
+                        BYTE* pScan0 = nullptr;
+                        LONG stride = 0;
+                        if (SUCCEEDED(p2D->Lock2D(&pScan0, &stride)) && pScan0 && visW >= 2 && visH >= 2) {
+                            onFrame(pScan0, stride, m_codedW, m_codedH, visX, visY, visW, visH);
+                            emitted = true;
+                            p2D->Unlock2D();
+                        }
+                        p2D->Release();
+                    } else {
+                        BYTE* pData = nullptr;
+                        DWORD cbLen = 0;
+                        if (SUCCEEDED(pOutBuf->Lock(&pData, nullptr, &cbLen)) && pData && visW >= 2 && visH >= 2) {
+                            LONG stride = (m_defaultStride > 0) ? m_defaultStride : static_cast<LONG>(m_codedW);
+                            size_t needed = static_cast<size_t>(stride) * m_codedH * 3 / 2;
+                            if (cbLen >= needed) {
+                                onFrame(pData, stride, m_codedW, m_codedH, visX, visY, visW, visH);
+                                emitted = true;
+                            }
+                            pOutBuf->Unlock();
+                        }
+                    }
+                    pOutBuf->Release();
+                }
+                if (m_mftProvidesSamples) {
+                    outData.pSample->Release();
+                }
+            }
+        }
+        return emitted;
+    }
+
+    IMFTransform* m_decoder = nullptr;
+    IMFSample* m_reusableOutSample = nullptr;
+    DWORD m_reusableOutBufBytes = 0;
+    DWORD m_requiredOutBytes = 0;
+    bool m_mftProvidesSamples = false;
+    bool m_outInfoValid = false;
+    bool m_initialized = false;
+    UINT32 m_codedW = 1920;
+    UINT32 m_codedH = 1080;
+    LONG m_defaultStride = 1920;
+    UINT32 m_visX = 0;
+    UINT32 m_visY = 0;
+    UINT32 m_visW = 1920;
+    UINT32 m_visH = 1080;
+    LONGLONG m_sampleTime100ns = 0;
+};
 
 } // namespace
 
@@ -473,14 +904,22 @@ public:
             }
         }
 
+        // Ініціалізація Media Foundation для апаратного / системного H.264 декодера
+        m_mfStarted = SUCCEEDED(MFStartup(MF_VERSION));
+
         // Початкове сканування USB ADB пристроїв у фоновому потоці
         RefreshUsbDevicesAsync();
 
         // Запуск каналу спільної пам'яті DirectShow віртуальної камери
-        m_sink.Open(m_state.width, m_state.height, EyeCam::PixelFormat::YUY2, m_state.fps);
+        {
+            std::lock_guard<std::mutex> lock(m_sinkMutex);
+            m_sink.Open(m_state.width, m_state.height, EyeCam::PixelFormat::YUY2, m_state.fps);
+        }
 
-        // Запуск фонового потоку підключення до смартфона (TCP :8554 — відео + керування)
+        // Запуск фонових потоків: мережевий приймач TCP :8554, асинхронний декодер H.264/JPEG і серіалізований відправник команд
         m_running = true;
+        m_sendThread = std::thread(&EyeCamStudioWindow::ControlSenderLoop, this);
+        m_decodeThread = std::thread(&EyeCamStudioWindow::DecodeWorkerLoop, this);
         m_streamThread = std::thread(&EyeCamStudioWindow::PhoneStreamClientLoop, this);
 
         SetTimer(m_hwnd, 1, 16, nullptr);   // 60 FPS плавне апаратне оновлення Direct2D
@@ -526,11 +965,22 @@ private:
 
     void Shutdown() {
         m_running = false;
+        m_decodeCv.notify_all();
+        m_sendCv.notify_all();
         CloseActivePhoneSocket();
         if (m_streamThread.joinable()) {
             m_streamThread.join();
         }
-        m_sink.Close();
+        if (m_decodeThread.joinable()) {
+            m_decodeThread.join();
+        }
+        if (m_sendThread.joinable()) {
+            m_sendThread.join();
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_sinkMutex);
+            m_sink.Close();
+        }
 
         if (m_pPreviewBitmap) { m_pPreviewBitmap->Release(); m_pPreviewBitmap = nullptr; }
         if (m_pBrush) { m_pBrush->Release(); m_pBrush = nullptr; }
@@ -541,6 +991,10 @@ private:
         if (m_pFontMono) { m_pFontMono->Release(); m_pFontMono = nullptr; }
         if (m_pDWriteFactory) { m_pDWriteFactory->Release(); m_pDWriteFactory = nullptr; }
         if (m_pD2DFactory) { m_pD2DFactory->Release(); m_pD2DFactory = nullptr; }
+        if (m_mfStarted) {
+            MFShutdown();
+            m_mfStarted = false;
+        }
         CoUninitialize();
         WSACleanup();
     }
@@ -582,12 +1036,31 @@ private:
 
     void RefreshUsbDevicesAsync() {
         if (m_usbScanInProgress.exchange(true)) return;
-        std::thread([this]() {
-            auto found = ScanConnectedUsbDevices();
+        std::string preferredSerial;
+        {
+            std::lock_guard<std::mutex> lock(m_usbMutex);
+            preferredSerial = m_state.selectedUsbSerial;
+        }
+        std::thread([this, preferredSerial]() {
+            auto found = ScanConnectedUsbDevices(preferredSerial);
             {
                 std::lock_guard<std::mutex> lock(m_usbMutex);
                 m_state.usbDevices = std::move(found);
-                if (m_state.selectedUsbIdx >= static_cast<int>(m_state.usbDevices.size())) {
+                int matchedIdx = -1;
+                if (!m_state.selectedUsbSerial.empty()) {
+                    for (size_t i = 0; i < m_state.usbDevices.size(); ++i) {
+                        if (m_state.usbDevices[i].serial == m_state.selectedUsbSerial) {
+                            matchedIdx = static_cast<int>(i);
+                            break;
+                        }
+                    }
+                }
+                if (matchedIdx >= 0) {
+                    m_state.selectedUsbIdx = matchedIdx;
+                } else if (!m_state.usbDevices.empty()) {
+                    m_state.selectedUsbIdx = 0;
+                    m_state.selectedUsbSerial = m_state.usbDevices[0].serial;
+                } else {
                     m_state.selectedUsbIdx = 0;
                 }
             }
@@ -596,26 +1069,84 @@ private:
         }).detach();
     }
 
-    // Надсилання JSON-команди керування смартфону по активному або новому сокету
-    void SendControlJson(const std::string& jsonPayload) {
-        std::thread([this, jsonPayload]() {
-            uint8_t header[8];
-            header[0] = 0x43; // 'C'
-            header[1] = 0x50; // 'P'
-            header[2] = 0x00;
-            header[3] = 0x01; // MSG_TYPE_JSON_COMMAND = 1
-            uint32_t len = static_cast<uint32_t>(jsonPayload.size());
-            header[4] = static_cast<uint8_t>((len >> 24) & 0xFF);
-            header[5] = static_cast<uint8_t>((len >> 16) & 0xFF);
-            header[6] = static_cast<uint8_t>((len >> 8) & 0xFF);
-            header[7] = static_cast<uint8_t>(len & 0xFF);
-
-            std::lock_guard<std::mutex> lock(m_socketMutex);
-            if (m_phoneSocket != INVALID_SOCKET) {
-                send(m_phoneSocket, reinterpret_cast<const char*>(header), 8, 0);
-                send(m_phoneSocket, jsonPayload.data(), static_cast<int>(jsonPayload.size()), 0);
+    void EnqueueControlPacket(uint16_t msgType, std::string payload, const std::string& coalesceKey = "") {
+        {
+            std::lock_guard<std::mutex> lock(m_sendMutex);
+            if (!coalesceKey.empty()) {
+                for (auto it = m_sendQueue.begin(); it != m_sendQueue.end();) {
+                    if (it->coalesceKey == coalesceKey) {
+                        it = m_sendQueue.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
             }
-        }).detach();
+            if (m_sendQueue.size() >= 64) {
+                m_sendQueue.pop_front();
+            }
+            m_sendQueue.push_back(OutboundControlPacket{msgType, std::move(payload), coalesceKey});
+        }
+        m_sendCv.notify_one();
+    }
+
+    // Надсилання JSON-команди керування смартфону через виділений потік відправки
+    void SendControlJson(const std::string& jsonPayload, const std::string& coalesceKey = "") {
+        EnqueueControlPacket(1, jsonPayload, coalesceKey);
+    }
+
+    void SendKeyframeRequest() {
+        auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()
+        ).count();
+        long long prev = m_lastKeyframeReqMs.load();
+        if (nowMs - prev < 350) return;
+        m_lastKeyframeReqMs.store(nowMs);
+        EnqueueControlPacket(5, "", "IDR_REQ");
+    }
+
+    void ControlSenderLoop() {
+        std::vector<uint8_t> packetBuf;
+        while (m_running) {
+            OutboundControlPacket pkt;
+            {
+                std::unique_lock<std::mutex> lock(m_sendMutex);
+                m_sendCv.wait(lock, [this]() {
+                    return !m_running || !m_sendQueue.empty();
+                });
+                if (!m_running) break;
+                pkt = std::move(m_sendQueue.front());
+                m_sendQueue.pop_front();
+            }
+
+            uint32_t len = static_cast<uint32_t>(pkt.payload.size());
+            packetBuf.resize(8 + len);
+            packetBuf[0] = 0x43; // 'C'
+            packetBuf[1] = 0x50; // 'P'
+            packetBuf[2] = static_cast<uint8_t>((pkt.msgType >> 8) & 0xFF);
+            packetBuf[3] = static_cast<uint8_t>(pkt.msgType & 0xFF);
+            packetBuf[4] = static_cast<uint8_t>((len >> 24) & 0xFF);
+            packetBuf[5] = static_cast<uint8_t>((len >> 16) & 0xFF);
+            packetBuf[6] = static_cast<uint8_t>((len >> 8) & 0xFF);
+            packetBuf[7] = static_cast<uint8_t>(len & 0xFF);
+            if (len > 0) {
+                std::memcpy(packetBuf.data() + 8, pkt.payload.data(), len);
+            }
+
+            std::lock_guard<std::mutex> sockLock(m_socketMutex);
+            if (m_phoneSocket != INVALID_SOCKET) {
+                size_t sentTotal = 0;
+                while (sentTotal < packetBuf.size()) {
+                    int n = send(
+                        m_phoneSocket,
+                        reinterpret_cast<const char*>(packetBuf.data() + sentTotal),
+                        static_cast<int>(packetBuf.size() - sentTotal),
+                        0
+                    );
+                    if (n <= 0) break;
+                    sentTotal += static_cast<size_t>(n);
+                }
+            }
+        }
     }
 
     static bool RecvExact(SOCKET s, uint8_t* buf, int len) {
@@ -628,25 +1159,26 @@ private:
         return true;
     }
 
-    // Постійний клієнтський потік прийому живого відео та метаданих зі смартфона (USB ADB або Wi-Fi LAN)
-    void PhoneStreamClientLoop() {
-        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        IWICImagingFactory* pWicFactory = nullptr;
-        CoCreateInstance(
-            CLSID_WICImagingFactory,
-            nullptr,
-            CLSCTX_INPROC_SERVER,
-            IID_PPV_ARGS(&pWicFactory)
-        );
+    void EnqueueFlushDecoder() {
+        {
+            std::lock_guard<std::mutex> lock(m_decodeMutex);
+            m_decodeQueue.clear();
+            m_decodeQueue.push_back(IncomingVideoPacket{IncomingVideoPacket::Kind::FLUSH, true, {}});
+        }
+        m_decodeCv.notify_one();
+    }
 
+    // Постійний клієнтський потік прийому живого відео (H.264 або JPEG) та метаданих зі смартфона
+    void PhoneStreamClientLoop() {
         auto lastStatTime = std::chrono::steady_clock::now();
         uint64_t bytesWindow = 0;
-        uint32_t framesWindow = 0;
 
         while (m_running) {
             if (!m_state.isStreaming) {
                 m_state.isPhoneConnected = false;
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                m_state.measuredBitrateKbps = 0;
+                m_state.measuredFps = 0;
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
                 continue;
             }
 
@@ -654,7 +1186,7 @@ private:
 
             SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (sock == INVALID_SOCKET) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                std::this_thread::sleep_for(std::chrono::milliseconds(400));
                 continue;
             }
 
@@ -667,7 +1199,7 @@ private:
             addr.sin_port = htons(8554);
             if (inet_pton(AF_INET, targetIp.c_str(), &addr.sin_addr) <= 0) {
                 closesocket(sock);
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                std::this_thread::sleep_for(std::chrono::milliseconds(400));
                 continue;
             }
 
@@ -680,7 +1212,7 @@ private:
             if (select(0, nullptr, &writeSet, nullptr, &tv) <= 0) {
                 closesocket(sock);
                 m_state.isPhoneConnected = false;
-                std::this_thread::sleep_for(std::chrono::milliseconds(600));
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 continue;
             }
 
@@ -690,16 +1222,23 @@ private:
             setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&rcvTimeout), sizeof(rcvTimeout));
             int nodelay = 1;
             setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
-            int rcvBufSize = 4 * 1024 * 1024; // 4MB буфер для надплавної передачі 60 FPS без затримок
+            int rcvBufSize = 4 * 1024 * 1024;
             setsockopt(sock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvBufSize), sizeof(rcvBufSize));
 
             {
                 std::lock_guard<std::mutex> lock(m_socketMutex);
                 m_phoneSocket = sock;
             }
+            {
+                std::lock_guard<std::mutex> lock(m_sendMutex);
+                m_sendQueue.clear();
+            }
             m_state.isPhoneConnected = true;
 
-            // Запитуємо можливості камери підключеного телефону
+            EnqueueFlushDecoder();
+            bool waitForKeyframeEnqueue = true;
+
+            // Запитуємо можливості камери та ключовий IDR-кадр
             SendControlJson("{\"action\":\"GetCapabilities\"}");
 
             std::vector<uint8_t> payload;
@@ -722,11 +1261,54 @@ private:
                 bytesWindow += (8 + len);
                 m_state.rxBytes += (8 + len);
 
-                if (msgType == 7 && !payload.empty()) {
-                    // MSG_TYPE_VIDEO_FRAME = 7 (Живий JPEG-кадр із камери смартфона)
-                    DecodeIncomingJpegFrame(pWicFactory, payload.data(), payload.size());
-                    m_state.rxFrames++;
-                    framesWindow++;
+                if (msgType == 8 && !payload.empty()) {
+                    // MSG_TYPE_H264_FRAME = 8 (Апаратний H.264 Annex-B Access Unit)
+                    bool isKey = IsH264KeyFrameAnnexB(payload.data(), payload.size());
+                    bool needIdr = false;
+                    {
+                        std::lock_guard<std::mutex> lock(m_decodeMutex);
+                        if (isKey) {
+                            // Залишаємо лише можливий FLUSH на початку та замінюємо стару чергу новим IDR
+                            bool hadFlush = (!m_decodeQueue.empty() &&
+                                             m_decodeQueue.front().kind == IncomingVideoPacket::Kind::FLUSH);
+                            m_decodeQueue.clear();
+                            if (hadFlush) {
+                                m_decodeQueue.push_back(IncomingVideoPacket{IncomingVideoPacket::Kind::FLUSH, true, {}});
+                            }
+                            waitForKeyframeEnqueue = false;
+                            m_decodeQueue.push_back(IncomingVideoPacket{IncomingVideoPacket::Kind::H264, true, std::move(payload)});
+                            m_decodeCv.notify_one();
+                        } else if (waitForKeyframeEnqueue) {
+                            needIdr = true;
+                        } else if (m_decodeQueue.size() >= 6) {
+                            bool hadFlush = (!m_decodeQueue.empty() &&
+                                             m_decodeQueue.front().kind == IncomingVideoPacket::Kind::FLUSH);
+                            m_decodeQueue.clear();
+                            if (hadFlush) {
+                                m_decodeQueue.push_back(IncomingVideoPacket{IncomingVideoPacket::Kind::FLUSH, true, {}});
+                            }
+                            waitForKeyframeEnqueue = true;
+                            needIdr = true;
+                        } else {
+                            m_decodeQueue.push_back(IncomingVideoPacket{IncomingVideoPacket::Kind::H264, false, std::move(payload)});
+                            m_decodeCv.notify_one();
+                        }
+                    }
+                    if (needIdr) {
+                        SendKeyframeRequest();
+                    }
+                } else if (msgType == 7 && !payload.empty()) {
+                    // MSG_TYPE_VIDEO_FRAME = 7 (Legacy JPEG fallback)
+                    std::lock_guard<std::mutex> lock(m_decodeMutex);
+                    for (auto it = m_decodeQueue.begin(); it != m_decodeQueue.end();) {
+                        if (it->kind == IncomingVideoPacket::Kind::JPEG) {
+                            it = m_decodeQueue.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                    m_decodeQueue.push_back(IncomingVideoPacket{IncomingVideoPacket::Kind::JPEG, true, std::move(payload)});
+                    m_decodeCv.notify_one();
                 } else if (msgType == 1 && !payload.empty()) {
                     // MSG_TYPE_JSON_COMMAND = 1 (Профіль можливостей телефону або телеметрія)
                     std::string jsonStr(reinterpret_cast<const char*>(payload.data()), payload.size());
@@ -737,19 +1319,91 @@ private:
                 auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastStatTime).count();
                 if (elapsedMs >= 1000) {
                     m_state.measuredBitrateKbps = static_cast<uint32_t>((bytesWindow * 8) / static_cast<uint64_t>(elapsedMs));
-                    m_state.measuredFps = static_cast<uint32_t>((static_cast<uint64_t>(framesWindow) * 1000) / static_cast<uint64_t>(elapsedMs));
                     bytesWindow = 0;
-                    framesWindow = 0;
                     lastStatTime = now;
                 }
             }
 
             CloseActivePhoneSocket();
+            EnqueueFlushDecoder();
             m_state.isPhoneConnected = false;
             m_state.measuredBitrateKbps = 0;
             m_state.measuredFps = 0;
         }
+    }
 
+    // Виділений асинхронний потік декодування H.264 (MF MFT -> NV12) та JPEG (WIC) без блокування TCP recv()
+    void DecodeWorkerLoop() {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        IWICImagingFactory* pWicFactory = nullptr;
+        CoCreateInstance(
+            CLSID_WICImagingFactory,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&pWicFactory)
+        );
+
+        MfH264Decoder h264Decoder;
+        bool needIdrAfterFlush = true;
+        uint32_t decodedWindow = 0;
+        auto lastFpsTime = std::chrono::steady_clock::now();
+
+        while (m_running) {
+            IncomingVideoPacket pkt;
+            {
+                std::unique_lock<std::mutex> lock(m_decodeMutex);
+                m_decodeCv.wait(lock, [this]() {
+                    return !m_running || !m_decodeQueue.empty();
+                });
+                if (!m_running) break;
+                pkt = std::move(m_decodeQueue.front());
+                m_decodeQueue.pop_front();
+            }
+
+            if (pkt.kind == IncomingVideoPacket::Kind::FLUSH) {
+                h264Decoder.Flush();
+                needIdrAfterFlush = true;
+                decodedWindow = 0;
+                lastFpsTime = std::chrono::steady_clock::now();
+                continue;
+            }
+
+            if (pkt.kind == IncomingVideoPacket::Kind::H264) {
+                if (needIdrAfterFlush && !pkt.isKeyFrame) {
+                    SendKeyframeRequest();
+                    continue;
+                }
+                if (pkt.isKeyFrame) {
+                    needIdrAfterFlush = false;
+                }
+                h264Decoder.DecodeAccessUnit(
+                    pkt.data.data(),
+                    pkt.data.size(),
+                    [this, &decodedWindow](const uint8_t* pNv12, LONG stride, uint32_t codedW, uint32_t codedH,
+                                           uint32_t visX, uint32_t visY, uint32_t visW, uint32_t visH) {
+                        PushNv12ToDirectShowAndPreview(pNv12, stride, codedW, codedH, visX, visY, visW, visH);
+                        m_state.rxFrames++;
+                        decodedWindow++;
+                    }
+                );
+            } else if (pkt.kind == IncomingVideoPacket::Kind::JPEG) {
+                DecodeIncomingJpegFrame(pWicFactory, pkt.data.data(), pkt.data.size());
+                m_state.rxFrames++;
+                decodedWindow++;
+            }
+
+            auto now = std::chrono::steady_clock::now();
+            auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastFpsTime).count();
+            if (elapsedMs >= 1000) {
+                m_state.measuredFps = static_cast<uint32_t>(
+                    (static_cast<uint64_t>(decodedWindow) * 1000) / static_cast<uint64_t>(elapsedMs)
+                );
+                decodedWindow = 0;
+                lastFpsTime = now;
+            }
+        }
+
+        h264Decoder.Shutdown();
         if (pWicFactory) {
             pWicFactory->Release();
         }
@@ -769,6 +1423,210 @@ private:
         float maxZ = 0.0f;
         if (ExtractJsonFloat(json, "max_zoom", maxZ) && maxZ >= 1.0f) {
             m_state.phoneMaxZoom = maxZ;
+        }
+        bool sup4k = true;
+        if (ExtractJsonBool(json, "supports_4k", sup4k)) {
+            m_state.phoneSupports4K = sup4k;
+        }
+        std::vector<float> presets;
+        if (ExtractJsonFloatArray(json, "zoom_presets", presets)) {
+            m_state.phoneZoomPresets = std::move(presets);
+        }
+
+        bool isFront = false;
+        bool hasFront = ExtractJsonBool(json, "is_front", isFront);
+        float curZ = 0.0f;
+        bool hasCurZ = ExtractJsonFloat(json, "current_zoom", curZ);
+        if (m_activeSliderDrag.load() != 100) {
+            if (hasCurZ && curZ >= 0.1f) {
+                m_state.currentZoom = curZ;
+                float span = (std::max)(0.1f, m_state.phoneMaxZoom - m_state.phoneMinZoom);
+                m_state.zoomSliderNorm = std::clamp((curZ - m_state.phoneMinZoom) / span, 0.0f, 1.0f);
+            }
+            if (hasFront && isFront) {
+                m_state.activeLensIdx = 6;
+            } else if (hasCurZ) {
+                const float lensZooms[6] = {0.5f, 1.0f, 2.0f, 3.0f, 5.0f, 10.0f};
+                int bestIdx = -1;
+                float bestDiff = 0.25f;
+                for (int i = 0; i < 6; ++i) {
+                    float d = std::fabs(curZ - lensZooms[i]);
+                    if (d < bestDiff) {
+                        bestDiff = d;
+                        bestIdx = i;
+                    }
+                }
+                if (bestIdx >= 0) {
+                    m_state.activeLensIdx = bestIdx;
+                }
+            }
+        }
+
+        int rotDeg = -1;
+        if (ExtractJsonInt(json, "rotation_deg", rotDeg)) {
+            if (rotDeg == -1 || rotDeg == 0 || rotDeg == 90 || rotDeg == 180 || rotDeg == 270) {
+                m_state.streamRotationDeg = rotDeg;
+            }
+        }
+
+        int sw = 0, sh = 0, sfps = 0;
+        if (ExtractJsonInt(json, "stream_width", sw) && ExtractJsonInt(json, "stream_height", sh) && sw > 0 && sh > 0) {
+            ExtractJsonInt(json, "stream_fps", sfps);
+            uint32_t newW = static_cast<uint32_t>(sw);
+            uint32_t newH = static_cast<uint32_t>(sh);
+            uint32_t newFps = (sfps > 0) ? static_cast<uint32_t>(sfps) : m_state.fps;
+            std::lock_guard<std::mutex> lock(m_sinkMutex);
+            if (m_state.width != newW || m_state.height != newH || m_state.fps != newFps) {
+                m_state.width = newW;
+                m_state.height = newH;
+                m_state.fps = newFps;
+                if (newW >= 3840) m_state.resPresetIdx = 0;
+                else if (newW >= 2560) m_state.resPresetIdx = 1;
+                else if (newW >= 1920) m_state.resPresetIdx = 2;
+                else m_state.resPresetIdx = 3;
+                if (m_sink.IsOpen()) {
+                    m_sink.SetFormat(m_state.width, m_state.height, EyeCam::PixelFormat::YUY2, m_state.fps);
+                }
+            }
+        }
+
+        float therm = 0.0f;
+        if (ExtractJsonFloat(json, "thermal_temp_c", therm) && therm > 0.0f) {
+            m_state.phoneThermalC = therm;
+        }
+        float batt = 0.0f;
+        if (ExtractJsonFloat(json, "battery_level", batt) && batt > 0.0f) {
+            m_state.phoneBatteryPct = static_cast<int>(batt + 0.5f);
+        }
+        int phoneFps = 0;
+        if (ExtractJsonInt(json, "measured_fps", phoneFps) && phoneFps >= 0) {
+            m_state.phoneMeasuredFps = phoneFps;
+        }
+        int phoneKbps = 0;
+        if (ExtractJsonInt(json, "measured_bitrate_kbps", phoneKbps) && phoneKbps >= 0) {
+            m_state.phoneMeasuredBitrateKbps = phoneKbps;
+        }
+    }
+
+    // Пряма високошвидкісна конвертація NV12 -> DirectShow YUY2 та 640x360 BGRA прев'ю без зайвого BGRA-буфера 4K
+    void PushNv12ToDirectShowAndPreview(
+        const uint8_t* pScan0,
+        LONG stride,
+        uint32_t codedW,
+        uint32_t codedH,
+        uint32_t visX,
+        uint32_t visY,
+        uint32_t visW,
+        uint32_t visH
+    ) {
+        (void)codedW;
+        if (!pScan0 || visW < 2 || visH < 2) return;
+
+        uint32_t outW = 1920;
+        uint32_t outH = 1080;
+        {
+            std::lock_guard<std::mutex> lock(m_sinkMutex);
+            outW = m_state.width;
+            outH = m_state.height;
+        }
+        if (outW < 2 || outH < 2) return;
+        const bool mirror = m_state.mirrorHorizontal;
+
+        const uint8_t* pUVBase = pScan0 + static_cast<ptrdiff_t>(codedH) * stride;
+        size_t expectedYuy2 = EyeCam::CalculateFrameSize(outW, outH, EyeCam::PixelFormat::YUY2);
+        if (m_yuy2Buffer.size() != expectedYuy2) {
+            m_yuy2Buffer.resize(expectedYuy2);
+        }
+
+        if (visW == outW && visH == outH && !mirror && (visX & 1u) == 0 && (visY & 1u) == 0) {
+            for (uint32_t y = 0; y < outH; ++y) {
+                const uint8_t* yRow = pScan0 + static_cast<ptrdiff_t>(visY + y) * stride + visX;
+                const uint8_t* uvRow = pUVBase + static_cast<ptrdiff_t>((visY >> 1) + (y >> 1)) * stride + visX;
+                uint8_t* dstRow = m_yuy2Buffer.data() + static_cast<size_t>(y) * outW * 2;
+                for (uint32_t x = 0; x < outW; x += 2) {
+                    size_t dIdx = static_cast<size_t>(x) * 2;
+                    dstRow[dIdx + 0] = yRow[x];
+                    dstRow[dIdx + 1] = uvRow[x];
+                    dstRow[dIdx + 2] = yRow[x + 1];
+                    dstRow[dIdx + 3] = uvRow[x + 1];
+                }
+            }
+        } else {
+            for (uint32_t y = 0; y < outH; ++y) {
+                uint32_t sy = visY + static_cast<uint32_t>((static_cast<uint64_t>(y) * visH) / outH);
+                const uint8_t* yRow = pScan0 + static_cast<ptrdiff_t>(sy) * stride;
+                const uint8_t* uvRow = pUVBase + static_cast<ptrdiff_t>(sy >> 1) * stride;
+                uint8_t* dstRow = m_yuy2Buffer.data() + static_cast<size_t>(y) * outW * 2;
+                for (uint32_t x = 0; x < outW; x += 2) {
+                    uint32_t dx0 = mirror ? (outW - 1 - x) : x;
+                    uint32_t dx1 = mirror ? (outW - 2 - x) : (x + 1);
+                    uint32_t sx0 = visX + static_cast<uint32_t>((static_cast<uint64_t>(dx0) * visW) / outW);
+                    uint32_t sx1 = visX + static_cast<uint32_t>((static_cast<uint64_t>(dx1) * visW) / outW);
+                    uint32_t uvPair = (sx0 & ~1u);
+                    size_t dIdx = static_cast<size_t>(x) * 2;
+                    dstRow[dIdx + 0] = yRow[sx0];
+                    dstRow[dIdx + 1] = uvRow[uvPair];
+                    dstRow[dIdx + 2] = yRow[sx1];
+                    dstRow[dIdx + 3] = uvRow[uvPair + 1];
+                }
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_sinkMutex);
+            if (m_sink.IsOpen() && outW == m_state.width && outH == m_state.height) {
+                if (m_sink.WriteFrame(m_yuy2Buffer.data(), m_yuy2Buffer.size())) {
+                    m_state.shmFramesWritten++;
+                }
+            }
+        }
+
+        // Даунсемплінг у 640x360 BGRA прев'ю безпосередньо з NV12
+        const uint32_t pw = 640;
+        const uint32_t ph = 360;
+        const size_t previewSize = static_cast<size_t>(pw) * ph * 4;
+        if (m_cachedPreviewBuffer.size() != previewSize) {
+            m_cachedPreviewBuffer.resize(previewSize);
+        }
+
+        auto clamp8 = [](int v) -> uint8_t {
+            return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+        };
+
+        for (uint32_t y = 0; y < ph; ++y) {
+            uint32_t sy = visY + static_cast<uint32_t>((static_cast<uint64_t>(y) * visH) / ph);
+            const uint8_t* yRow = pScan0 + static_cast<ptrdiff_t>(sy) * stride;
+            const uint8_t* uvRow = pUVBase + static_cast<ptrdiff_t>(sy >> 1) * stride;
+            uint8_t* dstRow = m_cachedPreviewBuffer.data() + static_cast<size_t>(y) * pw * 4;
+
+            for (uint32_t x = 0; x < pw; ++x) {
+                uint32_t dx = mirror ? (pw - 1 - x) : x;
+                uint32_t sx = visX + static_cast<uint32_t>((static_cast<uint64_t>(dx) * visW) / pw);
+                uint32_t uvPair = (sx & ~1u);
+
+                int cVal = static_cast<int>(yRow[sx]) - 16;
+                int dVal = static_cast<int>(uvRow[uvPair]) - 128;
+                int eVal = static_cast<int>(uvRow[uvPair + 1]) - 128;
+
+                int r = (298 * cVal + 409 * eVal + 128) >> 8;
+                int g = (298 * cVal - 100 * dVal - 208 * eVal + 128) >> 8;
+                int b = (298 * cVal + 516 * dVal + 128) >> 8;
+
+                size_t dIdx = static_cast<size_t>(x) * 4;
+                dstRow[dIdx + 0] = clamp8(b);
+                dstRow[dIdx + 1] = clamp8(g);
+                dstRow[dIdx + 2] = clamp8(r);
+                dstRow[dIdx + 3] = 255;
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_frameMutex);
+            m_previewPixels = m_cachedPreviewBuffer;
+            m_hasLiveFrame = true;
+        }
+        if (m_hwnd) {
+            InvalidateRect(m_hwnd, nullptr, FALSE);
         }
     }
 
@@ -882,8 +1740,13 @@ private:
     void PushFrameToDirectShow(const uint8_t* srcBgra, uint32_t inW, uint32_t inH) {
         if (!srcBgra || inW == 0 || inH == 0) return;
 
-        const uint32_t outW = m_state.width;
-        const uint32_t outH = m_state.height;
+        uint32_t outW = 1920;
+        uint32_t outH = 1080;
+        {
+            std::lock_guard<std::mutex> lock(m_sinkMutex);
+            outW = m_state.width;
+            outH = m_state.height;
+        }
         size_t expectedYuy2 = EyeCam::CalculateFrameSize(outW, outH, EyeCam::PixelFormat::YUY2);
         if (m_yuy2Buffer.size() != expectedYuy2) {
             m_yuy2Buffer.resize(expectedYuy2);
@@ -951,9 +1814,12 @@ private:
             }
         }
 
-        if (m_sink.IsOpen()) {
-            if (m_sink.WriteFrame(m_yuy2Buffer.data(), m_yuy2Buffer.size())) {
-                m_state.shmFramesWritten++;
+        {
+            std::lock_guard<std::mutex> lock(m_sinkMutex);
+            if (m_sink.IsOpen() && outW == m_state.width && outH == m_state.height) {
+                if (m_sink.WriteFrame(m_yuy2Buffer.data(), m_yuy2Buffer.size())) {
+                    m_state.shmFramesWritten++;
+                }
             }
         }
     }
@@ -1288,12 +2154,15 @@ private:
         m_pRenderTarget->DrawRoundedRectangle(D2D1::RoundedRect(videoRect.ToD2D(), 6.0f, 6.0f), m_pBrush, 1.5f);
 
         // Плаваючий бейдж формату та статусу поверх відео
+        uint32_t liveFps = m_state.measuredFps.load();
         wchar_t badgeBuf[160]{};
         swprintf_s(
             badgeBuf,
             L" %s  •  %ux%u @ %u FPS  •  ЗУМ %.1fx ",
             m_state.isPhoneConnected ? L"● ONLINE" : L"○ STANDBY",
-            m_state.width, m_state.height, m_state.fps, m_state.currentZoom
+            m_state.width, m_state.height,
+            (m_state.isPhoneConnected && liveFps > 0) ? liveFps : m_state.fps,
+            m_state.currentZoom
         );
         UiRect hudBadge1{videoRect.left + 12, videoRect.top + 12, videoRect.left + 325, videoRect.top + 38};
         DrawRoundedCard(hudBadge1, HexColor(0x0B0E14, 0.86f), m_state.isPhoneConnected ? COL_EMERALD : COL_BORDER, 6.0f);
@@ -1304,14 +2173,33 @@ private:
         UiRect teleBar{centerPanel.left + 16, barY, centerPanel.right - 16, centerPanel.bottom - 14};
         DrawRoundedCard(teleBar, COL_BG_CARD, COL_BORDER, 8.0f);
 
-        wchar_t teleStr[256]{};
-        swprintf_s(
-            teleStr,
-            L"  Пристрій: %ls   |   Бітрейт: %.1f Мбіт/с   |   Кадрів: %llu",
-            m_state.connectedPhoneName.c_str(),
-            m_state.measuredBitrateKbps.load() / 1000.0f,
-            static_cast<unsigned long long>(m_state.rxFrames.load())
-        );
+        std::wstring phoneNameCopy;
+        {
+            std::lock_guard<std::mutex> lock(m_frameMutex);
+            phoneNameCopy = m_state.connectedPhoneName;
+        }
+        wchar_t teleStr[280]{};
+        if (m_state.isPhoneConnected && m_state.phoneThermalC > 1.0f) {
+            swprintf_s(
+                teleStr,
+                L"  %ls   |   %u FPS   |   %.1f Мбіт/с   |   %.0f°C • %d%%   |   Кадрів: %llu",
+                phoneNameCopy.c_str(),
+                liveFps,
+                m_state.measuredBitrateKbps.load() / 1000.0f,
+                m_state.phoneThermalC,
+                m_state.phoneBatteryPct,
+                static_cast<unsigned long long>(m_state.rxFrames.load())
+            );
+        } else {
+            swprintf_s(
+                teleStr,
+                L"  Пристрій: %ls   |   %u FPS   |   %.1f Мбіт/с   |   Кадрів: %llu",
+                phoneNameCopy.c_str(),
+                liveFps,
+                m_state.measuredBitrateKbps.load() / 1000.0f,
+                static_cast<unsigned long long>(m_state.rxFrames.load())
+            );
+        }
         DrawTextStr(teleStr, teleBar, m_pFontMono, COL_TEXT_SECOND);
 
         // ====================================================================
@@ -1376,10 +2264,13 @@ private:
         float resW = (rrx - rlx - 18.0f) / 4.0f;
         for (int i = 0; i < 4; ++i) {
             m_rcResBtns[i] = {rlx + i * (resW + 6.0f), rcy, rlx + i * (resW + 6.0f) + resW, rcy + 32.0f};
-            bool sel = (m_state.resPresetIdx == i);
-            DrawRoundedCard(m_rcResBtns[i], sel ? COL_CYAN : COL_BG_CARD, sel ? COL_CYAN : COL_BORDER, 8.0f);
-            DrawTextStr(resLabels[i], m_rcResBtns[i], m_pFontBody,
-                        sel ? HexColor(0x05080D) : COL_TEXT_PRIMARY, DWRITE_TEXT_ALIGNMENT_CENTER);
+            bool resSupported = (i != 0) || m_state.phoneSupports4K;
+            bool sel = resSupported && (m_state.resPresetIdx == i);
+            D2D1_COLOR_F fillCol = !resSupported ? HexColor(0x10141C) : (sel ? COL_CYAN : COL_BG_CARD);
+            D2D1_COLOR_F brdCol  = !resSupported ? HexColor(0x1C222E) : (sel ? COL_CYAN : COL_BORDER);
+            D2D1_COLOR_F txtCol  = !resSupported ? COL_TEXT_DIM : (sel ? HexColor(0x05080D) : COL_TEXT_PRIMARY);
+            DrawRoundedCard(m_rcResBtns[i], fillCol, brdCol, 8.0f);
+            DrawTextStr(resLabels[i], m_rcResBtns[i], m_pFontBody, txtCol, DWRITE_TEXT_ALIGNMENT_CENTER);
         }
         rcy += 42;
 
@@ -1437,9 +2328,10 @@ private:
         }
 
         rcy += 6;
-        float halfW = (rrx - rlx - 8.0f) * 0.5f;
-        m_rcBtnMirror = {rlx, rcy, rlx + halfW, rcy + 32};
-        m_rcBtnGrid   = {rlx + halfW + 8.0f, rcy, rrx, rcy + 32};
+        float btnW3 = (rrx - rlx - 12.0f) / 3.0f;
+        m_rcBtnMirror = {rlx, rcy, rlx + btnW3, rcy + 32};
+        m_rcBtnGrid   = {rlx + btnW3 + 6.0f, rcy, rlx + 2.0f * btnW3 + 6.0f, rcy + 32};
+        m_rcBtnRotate = {rlx + 2.0f * (btnW3 + 6.0f), rcy, rrx, rcy + 32};
 
         DrawRoundedCard(m_rcBtnMirror, m_state.mirrorHorizontal ? HexColor(0x162C3D) : COL_BG_CARD,
                         m_state.mirrorHorizontal ? COL_CYAN : COL_BORDER, 8.0f);
@@ -1450,6 +2342,18 @@ private:
                         m_state.showGrid ? COL_CYAN : COL_BORDER, 8.0f);
         DrawTextStr(L"# Сітка 3x3", m_rcBtnGrid, m_pFontBody,
                     m_state.showGrid ? COL_CYAN : COL_TEXT_SECOND, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        wchar_t rotLabel[24]{};
+        if (m_state.streamRotationDeg < 0) {
+            swprintf_s(rotLabel, L"↻ Авто");
+        } else {
+            swprintf_s(rotLabel, L"↻ %d°", m_state.streamRotationDeg);
+        }
+        bool rotManual = (m_state.streamRotationDeg >= 0);
+        DrawRoundedCard(m_rcBtnRotate, rotManual ? HexColor(0x162C3D) : COL_BG_CARD,
+                        rotManual ? COL_CYAN : COL_BORDER, 8.0f);
+        DrawTextStr(rotLabel, m_rcBtnRotate, m_pFontBody,
+                    rotManual ? COL_CYAN : COL_TEXT_SECOND, DWRITE_TEXT_ALIGNMENT_CENTER);
 
         HRESULT hr = m_pRenderTarget->EndDraw();
         if (hr == D2DERR_RECREATE_TARGET) {
@@ -1464,7 +2368,13 @@ private:
         if (m_state.transport == TransportTab::USB_ADB && m_state.usbDropdownOpen) {
             for (size_t i = 0; i < m_rcUsbItems.size(); ++i) {
                 if (m_rcUsbItems[i].Contains(x, y)) {
-                    m_state.selectedUsbIdx = static_cast<int>(i);
+                    {
+                        std::lock_guard<std::mutex> lock(m_usbMutex);
+                        if (i < m_state.usbDevices.size()) {
+                            m_state.selectedUsbIdx = static_cast<int>(i);
+                            m_state.selectedUsbSerial = m_state.usbDevices[i].serial;
+                        }
+                    }
                     m_state.usbDropdownOpen = false;
                     RefreshUsbDevicesAsync();
                     CloseActivePhoneSocket();
@@ -1511,9 +2421,11 @@ private:
         if (m_rcBtnStartStop.Contains(x, y)) {
             m_state.isStreaming = !m_state.isStreaming;
             if (m_state.isStreaming) {
+                std::lock_guard<std::mutex> lock(m_sinkMutex);
                 m_sink.Open(m_state.width, m_state.height, EyeCam::PixelFormat::YUY2, m_state.fps);
             } else {
                 CloseActivePhoneSocket();
+                std::lock_guard<std::mutex> lock(m_sinkMutex);
                 m_sink.Close();
             }
             return;
@@ -1555,19 +2467,27 @@ private:
         // Вибір роздільної здатності (включаючи 4K UHD та 2K QHD)
         for (int i = 0; i < 4; ++i) {
             if (m_rcResBtns[i].Contains(x, y)) {
-                m_state.resPresetIdx = i;
-                if (i == 0)      { m_state.width = 3840; m_state.height = 2160; m_state.fps = 30; } // 4K UHD
-                else if (i == 1) { m_state.width = 2560; m_state.height = 1440; m_state.fps = 60; } // 2K QHD
-                else if (i == 2) { m_state.width = 1920; m_state.height = 1080; m_state.fps = 60; } // 1080p 60
-                else             { m_state.width = 1280; m_state.height = 720;  m_state.fps = 60; } // 720p 60
+                if (i == 0 && !m_state.phoneSupports4K) return;
 
-                if (m_sink.IsOpen()) {
-                    m_sink.SetFormat(m_state.width, m_state.height, EyeCam::PixelFormat::YUY2, m_state.fps);
+                uint32_t targetW = 1280, targetH = 720, targetFps = 60;
+                if (i == 0)      { targetW = 3840; targetH = 2160; targetFps = 30; } // 4K UHD
+                else if (i == 1) { targetW = 2560; targetH = 1440; targetFps = 60; } // 2K QHD
+                else if (i == 2) { targetW = 1920; targetH = 1080; targetFps = 60; } // 1080p 60
+
+                {
+                    std::lock_guard<std::mutex> lock(m_sinkMutex);
+                    m_state.resPresetIdx = i;
+                    m_state.width = targetW;
+                    m_state.height = targetH;
+                    m_state.fps = targetFps;
+                    if (m_sink.IsOpen()) {
+                        m_sink.SetFormat(m_state.width, m_state.height, EyeCam::PixelFormat::YUY2, m_state.fps);
+                    }
                 }
 
                 char json[160]{};
                 std::snprintf(json, sizeof(json), "{\"action\":\"SetResolution\",\"width\":%u,\"height\":%u,\"fps\":%u}",
-                              m_state.width, m_state.height, m_state.fps);
+                              targetW, targetH, targetFps);
                 SendControlJson(json);
                 return;
             }
@@ -1588,13 +2508,27 @@ private:
             return;
         }
 
-        // Перемикачі Дзеркало та Сітка
+        // Перемикачі Дзеркало, Сітка та Поворот
         if (m_rcBtnMirror.Contains(x, y)) {
             m_state.mirrorHorizontal = !m_state.mirrorHorizontal;
             return;
         }
         if (m_rcBtnGrid.Contains(x, y)) {
             m_state.showGrid = !m_state.showGrid;
+            return;
+        }
+        if (m_rcBtnRotate.Contains(x, y)) {
+            int nextDeg = 0;
+            if (m_state.streamRotationDeg < 0) nextDeg = 0;
+            else if (m_state.streamRotationDeg == 0) nextDeg = 90;
+            else if (m_state.streamRotationDeg == 90) nextDeg = 180;
+            else if (m_state.streamRotationDeg == 180) nextDeg = 270;
+            else nextDeg = -1;
+
+            m_state.streamRotationDeg = nextDeg;
+            char json[96]{};
+            std::snprintf(json, sizeof(json), "{\"action\":\"SetRotation\",\"degrees\":%d}", nextDeg);
+            SendControlJson(json, "SetRotation");
             return;
         }
 
@@ -1619,7 +2553,7 @@ private:
 
         char json[128]{};
         std::snprintf(json, sizeof(json), "{\"action\":\"SetZoom\",\"zoom\":%.2f}", m_state.currentZoom);
-        SendControlJson(json);
+        SendControlJson(json, "SetZoom");
     }
 
     void UpdateSliderValue(int idx, float mouseX) {
@@ -1628,24 +2562,29 @@ private:
         float norm = std::clamp((mouseX - r.left) / r.Width(), 0.0f, 1.0f);
 
         char json[160]{};
+        const char* coalesceKey = "";
         if (idx == 0) {
             m_state.isoNorm = norm;
             int iso = 100 + static_cast<int>(norm * 3100.0f);
             std::snprintf(json, sizeof(json), "{\"action\":\"SetISO\",\"auto\":false,\"iso\":%d}", iso);
+            coalesceKey = "SetISO";
         } else if (idx == 1) {
             m_state.shutterNorm = norm;
             int denom = 30 + static_cast<int>(norm * 3970.0f);
             long long expNs = 1000000000LL / denom;
             std::snprintf(json, sizeof(json), "{\"action\":\"SetShutter\",\"auto\":false,\"exposure_ns\":%lld}", expNs);
+            coalesceKey = "SetShutter";
         } else if (idx == 2) {
             m_state.focusNorm = norm;
             std::snprintf(json, sizeof(json), "{\"action\":\"SetFocus\",\"mode\":\"MANUAL\",\"distance_diopters\":%.2f}", norm * 10.0f);
+            coalesceKey = "SetFocus";
         } else if (idx == 3) {
             m_state.wbNorm = norm;
             int kelvin = 2800 + static_cast<int>(norm * 5700.0f);
             std::snprintf(json, sizeof(json), "{\"action\":\"SetWhiteBalance\",\"mode\":\"MANUAL_KELVIN\",\"kelvin\":%d}", kelvin);
+            coalesceKey = "SetWhiteBalance";
         }
-        SendControlJson(json);
+        SendControlJson(json, coalesceKey);
     }
 
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1696,18 +2635,20 @@ private:
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
 
-            case WM_MOUSEMOVE:
-                if (self->m_activeSliderDrag == 100 && (wParam & MK_LBUTTON)) {
+            case WM_MOUSEMOVE: {
+                int dragId = self->m_activeSliderDrag.load();
+                if (dragId == 100 && (wParam & MK_LBUTTON)) {
                     self->UpdateZoomSliderValue(static_cast<float>(GET_X_LPARAM(lParam)));
                     InvalidateRect(hwnd, nullptr, FALSE);
-                } else if (self->m_activeSliderDrag >= 0 && (wParam & MK_LBUTTON)) {
+                } else if (dragId >= 0 && (wParam & MK_LBUTTON)) {
                     self->UpdateSliderValue(
-                        self->m_activeSliderDrag,
+                        dragId,
                         static_cast<float>(GET_X_LPARAM(lParam))
                     );
                     InvalidateRect(hwnd, nullptr, FALSE);
                 }
                 return 0;
+            }
 
             case WM_LBUTTONUP:
                 ReleaseCapture();
@@ -1757,12 +2698,23 @@ private:
     EyeCam::WindowsDirectShowSink m_sink{};
 
     std::atomic<bool> m_running{false};
+    bool m_mfStarted = false;
     std::atomic<bool> m_usbScanInProgress{false};
+    std::atomic<long long> m_lastKeyframeReqMs{0};
     std::mutex m_socketMutex;
     std::mutex m_usbMutex;
     std::mutex m_frameMutex;
+    std::mutex m_sinkMutex;
+    std::mutex m_decodeMutex;
+    std::condition_variable m_decodeCv;
+    std::deque<IncomingVideoPacket> m_decodeQueue;
+    std::mutex m_sendMutex;
+    std::condition_variable m_sendCv;
+    std::deque<OutboundControlPacket> m_sendQueue;
     SOCKET m_phoneSocket = INVALID_SOCKET;
     std::thread m_streamThread;
+    std::thread m_decodeThread;
+    std::thread m_sendThread;
 
     uint32_t m_frameTick = 0;
     bool m_hasLiveFrame = false;
@@ -1787,7 +2739,8 @@ private:
     UiRect m_rcSliders[4]{};
     UiRect m_rcBtnMirror{};
     UiRect m_rcBtnGrid{};
-    int m_activeSliderDrag = -1;
+    UiRect m_rcBtnRotate{};
+    std::atomic<int> m_activeSliderDrag{-1};
 };
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {

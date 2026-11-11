@@ -238,7 +238,7 @@ private fun DynamicZoomSelectorBar(
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         supportedZooms.forEach { zoom ->
-            val isSelected = !isFrontCamera && abs(currentZoom - zoom) < 0.15f
+            val isSelected = !isFrontCamera && (abs(currentZoom - zoom) < 0.16f || (zoom < 0.7f && currentZoom < 0.85f))
             val label = if (zoom < 1.0f) {
                 "0.5x"
             } else {

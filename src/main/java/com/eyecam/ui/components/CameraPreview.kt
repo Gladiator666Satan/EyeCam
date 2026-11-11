@@ -1,11 +1,10 @@
 package com.eyecam.ui.components
 
+import android.content.Context
+import android.graphics.SurfaceTexture
+import android.hardware.display.DisplayManager
 import android.view.Surface
-import android.view.SurfaceHolder
-import android.view.SurfaceView
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
+import android.view.TextureView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -25,6 +24,7 @@ import androidx.compose.material.icons.filled.CenterFocusStrong
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -36,6 +36,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
@@ -51,12 +52,10 @@ import com.eyecam.ui.theme.TextDimmed
 import kotlinx.coroutines.delay
 
 /**
- * Професійний в'юпорт попереднього перегляду камери (Camera2 SurfaceView):
- * - Суворе дотримання пропорцій сенсора без розтягування зображення у вертикальному та горизонтальному режимах.
- * - Фіксація точного розміру буфера через SurfaceHolder.setFixedSize.
- * - Утримання SurfaceView активним у дереві Compose для безперервної фонової роботи та захисту від сну.
- * - Сенсорний фокус (Tap-to-Focus) з візуальною міткою наведення різкості.
- * - Рамка візирного кадру та бейдж поточної орієнтації (16:9 / 9:16).
+ * Професійний в'юпорт попереднього перегляду камери на базі TextureView + OpenGL ES Tee:
+ * - Нульове розтягування в портретному та ландшафтному режимах незалежно від автоповороту.
+ * - Миттєва реакція на зміну кута дисплея (0/90/180/270), включно зі швидким переворотом на 180°.
+ * - Безпечне від'єднання лише UI-поверхні при блокуванні екрана — стрім у сервісі не переривається.
  */
 @Composable
 fun CameraPreview(
@@ -65,17 +64,41 @@ fun CameraPreview(
     isDisplayProtectionActive: Boolean = false,
     streamWidth: Int = 1920,
     streamHeight: Int = 1080,
-    onSurfaceChanged: (Surface?) -> Unit = {},
+    onSurfaceChanged: (surface: Surface?, width: Int, height: Int, displayRotation: Int) -> Unit = { _, _, _, _ -> },
     onFocusPointTapped: ((Float, Float) -> Unit)? = null,
     onRequestPermissions: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
     var tapFocusPoint by remember { mutableStateOf<Offset?>(null) }
+    var activeTextureView by remember { mutableStateOf<TextureView?>(null) }
+    var activeSurface by remember { mutableStateOf<Surface?>(null) }
 
     LaunchedEffect(tapFocusPoint) {
         if (tapFocusPoint != null) {
             delay(1200L)
             tapFocusPoint = null
+        }
+    }
+
+    // Track 180-degree display flips where View width/height remain identical
+    DisposableEffect(context) {
+        val dm = context.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+        val listener = object : DisplayManager.DisplayListener {
+            override fun onDisplayAdded(displayId: Int) {}
+            override fun onDisplayRemoved(displayId: Int) {}
+            override fun onDisplayChanged(displayId: Int) {
+                val tv = activeTextureView ?: return
+                val surf = activeSurface ?: return
+                if (tv.isAvailable && surf.isValid && tv.width > 0 && tv.height > 0) {
+                    val rot = tv.display?.rotation ?: Surface.ROTATION_0
+                    onSurfaceChanged(surf, tv.width, tv.height, rot)
+                }
+            }
+        }
+        dm?.registerDisplayListener(listener, null)
+        onDispose {
+            dm?.unregisterDisplayListener(listener)
         }
     }
 
@@ -87,8 +110,6 @@ fun CameraPreview(
     ) {
         if (hasCameraPermission) {
             val isLandscape = maxWidth > maxHeight
-
-            // Точний розрахунок пропорцій для усунення розтягування (Aspect Fit з Letterboxing)
             val streamAspect = if (streamHeight > 0) streamWidth.toFloat() / streamHeight.toFloat() else (16f / 9f)
             val targetAspect = if (isLandscape) streamAspect else (1.0f / streamAspect)
 
@@ -98,9 +119,6 @@ fun CameraPreview(
                 viewH = maxHeight
                 viewW = viewH * targetAspect
             }
-
-            val bufW = if (isLandscape) streamWidth else streamHeight
-            val bufH = if (isLandscape) streamHeight else streamWidth
 
             Box(
                 modifier = Modifier
@@ -118,41 +136,43 @@ fun CameraPreview(
                     },
                 contentAlignment = Alignment.Center
             ) {
-                // SurfaceView ЗАВЖДИ утримується в ієрархії Compose, що гарантує
-                // безперебійну роботу камери у фоні та при заблокованому екрані
                 AndroidView(
-                    factory = { context ->
-                        SurfaceView(context).apply {
-                            holder.setKeepScreenOn(true)
-                            holder.setFixedSize(bufW, bufH)
-                            holder.addCallback(object : SurfaceHolder.Callback {
-                                override fun surfaceCreated(holder: SurfaceHolder) {
-                                    holder.setFixedSize(bufW, bufH)
-                                    onSurfaceChanged(holder.surface)
+                    factory = { ctx ->
+                        TextureView(ctx).apply {
+                            keepScreenOn = true
+                            isOpaque = true
+                            activeTextureView = this
+                            surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                                override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
+                                    activeSurface?.release()
+                                    val surf = Surface(st)
+                                    activeSurface = surf
+                                    val rot = display?.rotation ?: Surface.ROTATION_0
+                                    onSurfaceChanged(surf, width, height, rot)
                                 }
 
-                                override fun surfaceChanged(
-                                    holder: SurfaceHolder,
-                                    format: Int,
-                                    width: Int,
-                                    height: Int
-                                ) {
-                                    onSurfaceChanged(holder.surface)
+                                override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
+                                    val rot = display?.rotation ?: Surface.ROTATION_0
+                                    onSurfaceChanged(activeSurface, width, height, rot)
                                 }
 
-                                override fun surfaceDestroyed(holder: SurfaceHolder) {
-                                    onSurfaceChanged(null)
+                                override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                                    onSurfaceChanged(null, 0, 0, Surface.ROTATION_0)
+                                    activeSurface?.release()
+                                    activeSurface = null
+                                    return true
                                 }
-                            })
+
+                                override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+                            }
                         }
                     },
-                    update = { surfaceView ->
-                        surfaceView.holder.setFixedSize(bufW, bufH)
+                    update = { tv ->
+                        activeTextureView = tv
                     },
                     modifier = Modifier.fillMaxSize()
                 )
 
-                // Візирна рамка та індикатор формату зйомки
                 if (!isDisplayProtectionActive) {
                     Box(
                         modifier = Modifier
@@ -160,7 +180,6 @@ fun CameraPreview(
                             .border(1.dp, OledBorder.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
                     )
 
-                    // Бейдж співвідношення сторін кадру
                     Box(
                         modifier = Modifier
                             .align(Alignment.TopStart)
@@ -172,7 +191,7 @@ fun CameraPreview(
                     ) {
                         val resLabel = "${streamWidth}x${streamHeight}"
                         Text(
-                            text = if (isLandscape) "📷 16:9 ВЕБ-КАМЕРА [$resLabel]" else "📷 9:16 ВЕРТИКАЛЬНО [$resLabel]",
+                            text = if (isLandscape) "📷 16:9 ВЕБ-КАМЕРА [$resLabel]" else "📷 9:16 ПОРТРЕТ [$resLabel]",
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
                             color = StatusCyan,
@@ -180,14 +199,13 @@ fun CameraPreview(
                         )
                     }
 
-                    // Анімація мітки перефокусування при тапі по екрану
                     tapFocusPoint?.let { pt ->
                         Box(
                             modifier = Modifier
                                 .offset { IntOffset((pt.x - 24.dp.toPx()).toInt(), (pt.y - 24.dp.toPx()).toInt()) }
-                            .size(48.dp)
-                            .clip(CircleShape)
-                            .border(2.dp, StatusCyan, CircleShape),
+                                .size(48.dp)
+                                .clip(CircleShape)
+                                .border(2.dp, StatusCyan, CircleShape),
                             contentAlignment = Alignment.Center
                         ) {
                             Icon(

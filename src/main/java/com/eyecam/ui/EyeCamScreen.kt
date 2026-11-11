@@ -41,14 +41,14 @@ fun EyeCamScreen(
                 }
             }
     ) {
-        // Шар 1: Живе прев'ю камери з підключенням SurfaceHolder до CameraController
+        // Шар 1: Живе прев'ю камери з підключенням TextureView до EglVideoTee
         CameraPreview(
             isStreaming = uiState.isStreaming,
             hasCameraPermission = uiState.hasCameraPermission,
             isDisplayProtectionActive = uiState.isDisplayProtectionActive,
             streamWidth = uiState.telemetry.resolutionWidth,
             streamHeight = uiState.telemetry.resolutionHeight,
-            onSurfaceChanged = { surface -> viewModel.attachPreviewSurface(surface) },
+            onSurfaceChanged = { surface, w, h, rot -> viewModel.attachPreviewSurface(surface, w, h, rot) },
             onFocusPointTapped = { x, y -> viewModel.triggerFocusAtPoint(x, y) },
             onRequestPermissions = onRequestPermissions
         )
@@ -60,7 +60,7 @@ fun EyeCamScreen(
                 onToggleStream = { viewModel.toggleStreaming(onPermissionMissing = onRequestPermissions) },
                 onToggleMicMute = { viewModel.toggleMicMute() },
                 onSelectZoom = { zoom ->
-                    viewModel.setZoomRatio(zoom)
+                    viewModel.selectLensPreset(zoom)
                 },
                 onSelectFrontCamera = { viewModel.setFrontCamera(true) },
                 onTriggerAutoFocus = { viewModel.triggerAutoFocus() },

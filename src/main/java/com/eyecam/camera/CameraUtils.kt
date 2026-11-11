@@ -1,6 +1,7 @@
 package com.eyecam.camera
 
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.params.ColorSpaceTransform
 import android.hardware.camera2.params.RggbChannelVector
 import android.util.Range
 import com.eyecam.model.SensorType
@@ -58,6 +59,41 @@ object CameraUtils {
         }
 
         return RggbChannelVector(rGain.coerceIn(1.0f, 4.0f), 1.0f, 1.0f, bGain.coerceIn(1.0f, 4.0f))
+    }
+
+    /**
+     * Scales a captured neutral Bayer [baseGains] (from live AWB) by the requested [kelvin]
+     * temperature relative to daylight (5500K), avoiding the strong green cast that occurs when
+     * raw hardcoded gains override sensor-specific G channel calibration.
+     */
+    fun kelvinToRggbChannelVector(kelvin: Int, baseGains: RggbChannelVector?): RggbChannelVector {
+        if (baseGains == null) return kelvinToRggbChannelVector(kelvin)
+        val ref = kelvinToRggbChannelVector(5500)
+        val target = kelvinToRggbChannelVector(kelvin)
+        val rScale = target.red / ref.red
+        val bScale = target.blue / ref.blue
+        val gEven = baseGains.greenEven.coerceAtLeast(0.5f)
+        val gOdd = baseGains.greenOdd.coerceAtLeast(0.5f)
+        return RggbChannelVector(
+            (baseGains.red * rScale).coerceIn(0.8f, 6.0f),
+            gEven,
+            gOdd,
+            (baseGains.blue * bScale).coerceIn(0.8f, 6.0f)
+        )
+    }
+
+    /**
+     * Calibrated fallback sRGB color correction matrix (row sums equal 1.0 to preserve neutral grays)
+     * used only if no live CCM has been captured from Auto AWB yet.
+     */
+    fun defaultColorCorrectionTransform(): ColorSpaceTransform {
+        return ColorSpaceTransform(
+            intArrayOf(
+                140, 100,  -25, 100,  -15, 100,
+                -15, 100,  130, 100,  -15, 100,
+                 -5, 100,  -25, 100,  130, 100
+            )
+        )
     }
 
     fun clampIso(iso: Int, isoRange: Range<Int>?): Int = isoRange?.clamp(iso) ?: iso

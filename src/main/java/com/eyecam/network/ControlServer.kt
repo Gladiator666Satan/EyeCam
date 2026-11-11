@@ -8,26 +8,31 @@ import com.eyecam.model.CameraMode
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedOutputStream
 import java.io.DataInputStream
-import java.io.DataOutputStream
 import java.io.EOFException
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
 import java.nio.charset.StandardCharsets
+import java.util.ArrayDeque
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 /**
  * Control & Live Stream TCP daemon running on Android device (port 8554).
  * Works over both Wi-Fi LAN (<PhoneIP>:8554) and USB ADB (adb forward tcp:8554 tcp:8554):
- * - Device capabilities handshake (Model name, min/max zoom up to 10x+, 4K support)
- * - Live MJPEG/JPEG video frames (MSG_TYPE_VIDEO_FRAME = 7)
- * - Camera parameters (Zoom 0.5x..10x, ISO, Shutter, Focus, WB, Resolution)
- * - Status telemetry broadcast
+ * - Device capabilities handshake (model name, min/max zoom presets, 4K support)
+ * - Hardware Annex-B H.264 video frames (MSG_TYPE_H264_FRAME = 8) + legacy JPEG fallback (7)
+ * - Non-blocking async writer with congestion P-frame drop & automatic IDR recovery
+ * - Camera parameters (Zoom 0.5x..10x+, ISO, Shutter, Focus, WB, Resolution, Rotation)
+ * - Real live telemetry broadcast
  */
 class ControlServer(
     private val port: Int = 8554,
@@ -35,10 +40,12 @@ class ControlServer(
     private val onKeyframeRequested: () -> Unit,
     private val onClientConnectionChanged: ((Boolean, Boolean, String) -> Unit)? = null,
     private val onZoomUpdatedFromPc: ((Float, Boolean) -> Unit)? = null,
-    private val onResolutionUpdatedFromPc: ((Int, Int, Int) -> Unit)? = null
+    private val onResolutionUpdatedFromPc: ((Int, Int, Int) -> Unit)? = null,
+    private val batteryLevelProvider: (() -> Float)? = null,
+    private val thermalTempProvider: (() -> Float)? = null
 ) {
     companion object {
-        private const val TAG = "ControlServer"
+        private const val TAG = "EyeCam-ControlServer"
 
         const val CONTROL_MAGIC: Short = 0x4350 // 'C' (0x43), 'P' (0x50)
 
@@ -49,20 +56,38 @@ class ControlServer(
         const val MSG_TYPE_KEYFRAME_REQUEST: Short = 5
         const val MSG_TYPE_KEEP_ALIVE: Short = 6
         const val MSG_TYPE_VIDEO_FRAME: Short = 7
+        const val MSG_TYPE_H264_FRAME: Short = 8
+
+        private const val MAX_CONTROL_QUEUE = 64
+        private const val MAX_VIDEO_QUEUE = 6
     }
+
+    private data class OutboundPacket(
+        val msgType: Short,
+        val payload: ByteArray,
+        val isKeyFrame: Boolean = false
+    )
 
     private var serverSocket: ServerSocket? = null
     @Volatile
     private var activeSocket: Socket? = null
     @Volatile
-    private var outStream: DataOutputStream? = null
+    private var writerRunning = false
 
     val isClientConnected: Boolean
         get() = activeSocket != null && activeSocket?.isClosed == false
 
-    private val scope = CoroutineScope(Dispatchers.IO + Job())
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var acceptJob: Job? = null
     private var telemetryJob: Job? = null
+
+    // Non-blocking outbound queues guarded by lock
+    private val queueLock = ReentrantLock()
+    private val queueCondition = queueLock.newCondition()
+    private val controlQueue = ArrayDeque<OutboundPacket>(16)
+    private val videoQueue = ArrayDeque<OutboundPacket>(8)
+    private var needKeyframeBeforeDelta = false
+    private var lastKeyframeRequestMs = 0L
 
     fun start() {
         if (serverSocket != null && !serverSocket!!.isClosed) return
@@ -77,17 +102,22 @@ class ControlServer(
                 while (isActive) {
                     val client = serverSocket?.accept() ?: break
                     client.tcpNoDelay = true
-                    client.sendBufferSize = 2 * 1024 * 1024
+                    try {
+                        client.sendBufferSize = 2 * 1024 * 1024
+                    } catch (_: Exception) {
+                    }
                     Log.i(TAG, "Client connected: ${client.remoteSocketAddress}")
 
-                    // Close previous socket if a new client reconnects
-                    try { activeSocket?.close() } catch (_: Exception) {}
+                    try {
+                        activeSocket?.close()
+                    } catch (_: Exception) {
+                    }
 
                     scope.launch {
                         handleClient(client)
                     }
                 }
-            } catch (e: SocketException) {
+            } catch (_: SocketException) {
                 Log.i(TAG, "ControlServer socket closed.")
             } catch (e: Exception) {
                 Log.e(TAG, "ControlServer error", e)
@@ -97,14 +127,22 @@ class ControlServer(
 
     private suspend fun handleClient(client: Socket) {
         activeSocket = client
-        outStream = DataOutputStream(client.getOutputStream())
+        clearQueues(resetKeyframeWait = true)
+        writerRunning = true
+
+        val writerThread = Thread({
+            writerLoop(client)
+        }, "EyeCam-TcpWriter-$port").apply {
+            isDaemon = true
+            start()
+        }
 
         val remoteIp = client.inetAddress?.hostAddress ?: ""
         val isUsbAdb = remoteIp == "127.0.0.1" || remoteIp == "::1" || remoteIp.contains("localhost")
         onClientConnectionChanged?.invoke(true, isUsbAdb, remoteIp)
 
-        // Immediately send device capabilities (model name, max zoom e.g. 10x on Galaxy S26 Ultra, 4K support)
         sendDeviceCapabilities()
+        onKeyframeRequested()
 
         telemetryJob?.cancel()
         telemetryJob = scope.launch {
@@ -142,11 +180,79 @@ class ControlServer(
             Log.e(TAG, "Error handling control stream", e)
         } finally {
             telemetryJob?.cancel()
-            try { client.close() } catch (_: Exception) {}
+            writerRunning = false
+            queueLock.withLock {
+                queueCondition.signalAll()
+            }
+            try {
+                client.close()
+            } catch (_: Exception) {
+            }
+            try {
+                writerThread.join(400)
+            } catch (_: Exception) {
+            }
             if (activeSocket === client) {
                 activeSocket = null
-                outStream = null
+                clearQueues(resetKeyframeWait = true)
                 onClientConnectionChanged?.invoke(false, false, "")
+            }
+        }
+    }
+
+    private fun writerLoop(client: Socket) {
+        try {
+            val out = BufferedOutputStream(client.getOutputStream(), 256 * 1024)
+            val header = ByteArray(8)
+            header[0] = 0x43.toByte()
+            header[1] = 0x50.toByte()
+
+            while (writerRunning && !client.isClosed && activeSocket === client) {
+                var pkt: OutboundPacket? = null
+                var shouldFlush = false
+
+                queueLock.withLock {
+                    while (writerRunning && controlQueue.isEmpty() && videoQueue.isEmpty() &&
+                        !client.isClosed && activeSocket === client
+                    ) {
+                        queueCondition.await()
+                    }
+                    if (!writerRunning || client.isClosed || activeSocket !== client) return@withLock
+                    pkt = if (controlQueue.isNotEmpty()) {
+                        shouldFlush = true
+                        controlQueue.removeFirst()
+                    } else if (videoQueue.isNotEmpty()) {
+                        val v = videoQueue.removeFirst()
+                        shouldFlush = videoQueue.isEmpty() || v.isKeyFrame
+                        v
+                    } else {
+                        null
+                    }
+                }
+
+                val packet = pkt ?: break
+                val msgType = packet.msgType.toInt()
+                val size = packet.payload.size
+                header[2] = ((msgType ushr 8) and 0xFF).toByte()
+                header[3] = (msgType and 0xFF).toByte()
+                header[4] = ((size ushr 24) and 0xFF).toByte()
+                header[5] = ((size ushr 16) and 0xFF).toByte()
+                header[6] = ((size ushr 8) and 0xFF).toByte()
+                header[7] = (size and 0xFF).toByte()
+
+                out.write(header)
+                out.write(packet.payload)
+                if (shouldFlush) {
+                    out.flush()
+                }
+            }
+        } catch (e: Exception) {
+            if (writerRunning) {
+                Log.w(TAG, "TCP writer loop ended: ${e.message}")
+            }
+            try {
+                client.close()
+            } catch (_: Exception) {
             }
         }
     }
@@ -162,19 +268,84 @@ class ControlServer(
             put("model_name", modelName)
             put("min_zoom", cameraController.minZoomRatio.toDouble())
             put("max_zoom", cameraController.maxZoomRatio.toDouble())
+            put("current_zoom", cameraController.currentZoomRatio.toDouble())
             put("supports_4k", cameraController.supports4K)
             put("zoom_presets", presetsArr)
             put("stream_width", cameraController.streamWidth)
             put("stream_height", cameraController.streamHeight)
             put("stream_fps", cameraController.streamFps)
             put("is_front", cameraController.isFrontCameraActive)
+            put("rotation_deg", cameraController.manualStreamRotationOffsetDeg)
         }
-        sendFrame(MSG_TYPE_JSON_COMMAND, capObj.toString().toByteArray(StandardCharsets.UTF_8))
+        enqueueControlPacket(MSG_TYPE_JSON_COMMAND, capObj.toString().toByteArray(StandardCharsets.UTF_8))
     }
 
     fun sendVideoFrame(jpegBytes: ByteArray) {
         if (!isClientConnected) return
-        sendFrame(MSG_TYPE_VIDEO_FRAME, jpegBytes)
+        enqueueVideoPacket(MSG_TYPE_VIDEO_FRAME, jpegBytes, isKeyFrame = true)
+    }
+
+    fun sendH264Frame(annexBBytes: ByteArray, isKeyFrame: Boolean) {
+        if (!isClientConnected) return
+        enqueueVideoPacket(MSG_TYPE_H264_FRAME, annexBBytes, isKeyFrame = isKeyFrame)
+    }
+
+    private fun enqueueControlPacket(msgType: Short, payload: ByteArray) {
+        if (!isClientConnected) return
+        queueLock.withLock {
+            if (controlQueue.size >= MAX_CONTROL_QUEUE) {
+                controlQueue.removeFirst()
+            }
+            controlQueue.addLast(OutboundPacket(msgType, payload))
+            queueCondition.signal()
+        }
+    }
+
+    private fun enqueueVideoPacket(msgType: Short, payload: ByteArray, isKeyFrame: Boolean) {
+        if (!isClientConnected) return
+        var requestIdr = false
+        queueLock.withLock {
+            if (!writerRunning) return@withLock
+            if (needKeyframeBeforeDelta && !isKeyFrame) {
+                return@withLock
+            }
+
+            if (isKeyFrame) {
+                needKeyframeBeforeDelta = false
+                // Drop queued stale video frames before an IDR keyframe to keep latency minimal
+                videoQueue.clear()
+                videoQueue.addLast(OutboundPacket(msgType, payload, isKeyFrame = true))
+                queueCondition.signal()
+                return@withLock
+            }
+
+            if (videoQueue.size >= MAX_VIDEO_QUEUE) {
+                // Network congestion: drop stale delta and wait for a clean keyframe
+                needKeyframeBeforeDelta = true
+                val now = SystemClock.uptimeMillis()
+                if (now - lastKeyframeRequestMs > 400L) {
+                    lastKeyframeRequestMs = now
+                    requestIdr = true
+                }
+                return@withLock
+            }
+
+            videoQueue.addLast(OutboundPacket(msgType, payload, isKeyFrame = false))
+            queueCondition.signal()
+        }
+        if (requestIdr) {
+            onKeyframeRequested()
+        }
+    }
+
+    private fun clearQueues(resetKeyframeWait: Boolean) {
+        queueLock.withLock {
+            controlQueue.clear()
+            videoQueue.clear()
+            if (resetKeyframeWait) {
+                needKeyframeBeforeDelta = false
+            }
+        }
     }
 
     private fun processMessage(msgType: Short, payload: ByteArray, rxTimeUs: Long) {
@@ -193,7 +364,7 @@ class ControlServer(
                         put("t2_us", t2)
                         put("t3_us", t3)
                     }
-                    sendFrame(MSG_TYPE_FRAME_PONG, pongObj.toString().toByteArray(StandardCharsets.UTF_8))
+                    enqueueControlPacket(MSG_TYPE_FRAME_PONG, pongObj.toString().toByteArray(StandardCharsets.UTF_8))
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed to parse ping", e)
                 }
@@ -221,20 +392,21 @@ class ControlServer(
             when (action) {
                 "GetCapabilities", "GetDeviceCapabilities" -> {
                     sendDeviceCapabilities()
+                    onKeyframeRequested()
                     return
                 }
 
                 "SetZoom", "SetZoomRatio" -> {
                     val zoom = if (json.has("zoom")) json.optDouble("zoom", 1.0).toFloat() else json.optDouble("zoom_ratio", 1.0).toFloat()
                     cameraController.setZoomRatio(zoom)
-                    onZoomUpdatedFromPc?.invoke(zoom, cameraController.isFrontCameraActive)
+                    onZoomUpdatedFromPc?.invoke(cameraController.currentZoomRatio, cameraController.isFrontCameraActive)
                 }
 
                 "SetCameraModule", "SwitchSensor", "SwitchModule", "SetSensor" -> {
                     val module = json.optString("module", json.optString("sensor_id", "1.0x"))
                     cameraController.switchToSensor(module)
                     val isFront = module.equals("front", ignoreCase = true) || module.equals("self", ignoreCase = true)
-                    val zoomVal = module.removeSuffix("x").toFloatOrNull() ?: 1.0f
+                    val zoomVal = if (isFront) 1.0f else (module.removeSuffix("x").removeSuffix("X").toFloatOrNull() ?: 1.0f)
                     onZoomUpdatedFromPc?.invoke(zoomVal, isFront)
                 }
 
@@ -251,6 +423,11 @@ class ControlServer(
                     val fps = json.optInt("fps", 60)
                     cameraController.setResolution(w, h, fps)
                     onResolutionUpdatedFromPc?.invoke(w, h, fps)
+                }
+
+                "SetRotation" -> {
+                    val deg = json.optInt("degrees", -1)
+                    cameraController.setStreamRotationOffset(deg)
                 }
 
                 "TriggerAutoFocus", "Refocus", "trigger_focus" -> {
@@ -342,57 +519,59 @@ class ControlServer(
             put("success", success)
             if (!success) put("error", errorMessage)
         }
-        sendFrame(MSG_TYPE_JSON_COMMAND, ackObj.toString().toByteArray(StandardCharsets.UTF_8))
+        enqueueControlPacket(MSG_TYPE_JSON_COMMAND, ackObj.toString().toByteArray(StandardCharsets.UTF_8))
     }
 
-    private fun sendTelemetryState() {
+    fun sendTelemetryState() {
         val modelName = "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL}"
+        val presetsArr = JSONArray()
+        cameraController.supportedZoomPresets.forEach { presetsArr.put(it.toDouble()) }
+
+        val battery = batteryLevelProvider?.invoke() ?: 100f
+        val tempC = thermalTempProvider?.invoke() ?: 34.0f
+
         val stateObj = JSONObject().apply {
             put("type", "device_state")
             put("device_name", modelName)
             put("min_zoom", cameraController.minZoomRatio.toDouble())
             put("max_zoom", cameraController.maxZoomRatio.toDouble())
+            put("current_zoom", cameraController.currentZoomRatio.toDouble())
             put("supports_4k", cameraController.supports4K)
+            put("zoom_presets", presetsArr)
+            put("stream_width", cameraController.streamWidth)
+            put("stream_height", cameraController.streamHeight)
+            put("stream_fps", cameraController.streamFps)
+            put("is_front", cameraController.isFrontCameraActive)
+            put("rotation_deg", cameraController.manualStreamRotationOffsetDeg)
             put("state", JSONObject().apply {
-                put("battery_level", 85.0)
-                put("thermal_temp_c", 36.5)
-                put("measured_fps", 60)
-                put("measured_bitrate_kbps", 18000)
+                put("battery_level", battery.toDouble())
+                put("thermal_temp_c", tempC.toDouble())
+                put("measured_fps", cameraController.measuredFps.toInt())
+                put("measured_bitrate_kbps", cameraController.measuredBitrateKbps)
             })
         }
-        sendFrame(MSG_TYPE_JSON_COMMAND, stateObj.toString().toByteArray(StandardCharsets.UTF_8))
-    }
-
-    @Synchronized
-    private fun sendFrame(msgType: Short, payload: ByteArray) {
-        val out = outStream ?: return
-        try {
-            val totalLen = 8 + payload.size
-            val packet = ByteArray(totalLen)
-            packet[0] = 0x43.toByte() // 'C'
-            packet[1] = 0x50.toByte() // 'P'
-            packet[2] = ((msgType.toInt() ushr 8) and 0xFF).toByte()
-            packet[3] = (msgType.toInt() and 0xFF).toByte()
-            packet[4] = ((payload.size ushr 24) and 0xFF).toByte()
-            packet[5] = ((payload.size ushr 16) and 0xFF).toByte()
-            packet[6] = ((payload.size ushr 8) and 0xFF).toByte()
-            packet[7] = (payload.size and 0xFF).toByte()
-            System.arraycopy(payload, 0, packet, 8, payload.size)
-            out.write(packet)
-            out.flush()
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to send frame type=$msgType", e)
-        }
+        enqueueControlPacket(MSG_TYPE_JSON_COMMAND, stateObj.toString().toByteArray(StandardCharsets.UTF_8))
     }
 
     fun stop() {
+        writerRunning = false
         acceptJob?.cancel()
         telemetryJob?.cancel()
-        try { activeSocket?.close() } catch (_: Exception) {}
-        try { serverSocket?.close() } catch (_: Exception) {}
+        queueLock.withLock {
+            controlQueue.clear()
+            videoQueue.clear()
+            queueCondition.signalAll()
+        }
+        try {
+            activeSocket?.close()
+        } catch (_: Exception) {
+        }
+        try {
+            serverSocket?.close()
+        } catch (_: Exception) {
+        }
         serverSocket = null
         activeSocket = null
-        outStream = null
         Log.i(TAG, "ControlServer stopped.")
     }
 }
