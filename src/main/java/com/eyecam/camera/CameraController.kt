@@ -156,7 +156,9 @@ class CameraController(private val context: Context) {
     @Volatile private var uiPreviewWidth: Int = 0
     @Volatile private var uiPreviewHeight: Int = 0
     @Volatile private var uiDisplayRotation: Int = Surface.ROTATION_0
-    @Volatile private var devicePhysicalRotation: Int = Surface.ROTATION_90
+    @Volatile private var devicePhysicalRotation: Int = Surface.ROTATION_0
+    @Volatile private var hasPhysicalOrientationSample: Boolean = false
+    @Volatile private var currentInputHasCameraTransform: Boolean = true
     @Volatile var manualStreamRotationOffsetDeg: Int = -1 // -1 = auto physical orientation, or 0/90/180/270
 
     // Telemetry counters
@@ -194,8 +196,12 @@ class CameraController(private val context: Context) {
                 orientation in 245..295 -> Surface.ROTATION_90
                 else -> return
             }
+            val changed = !hasPhysicalOrientationSample || nextRot != devicePhysicalRotation
+            hasPhysicalOrientationSample = true
             if (nextRot != devicePhysicalRotation) {
                 devicePhysicalRotation = nextRot
+            }
+            if (changed) {
                 updateTeeTransforms()
             }
         }
@@ -481,6 +487,9 @@ class CameraController(private val context: Context) {
             uiPreviewHeight = height
         }
         uiDisplayRotation = displayRotation
+        if (!hasPhysicalOrientationSample) {
+            devicePhysicalRotation = displayRotation
+        }
 
         val targetW = if (width > 0) width else uiPreviewWidth.coerceAtLeast(1080)
         val targetH = if (height > 0) height else uiPreviewHeight.coerceAtLeast(1920)
@@ -803,6 +812,12 @@ class CameraController(private val context: Context) {
                 val preview = previewBuilder.build()
                 preview.setSurfaceProvider(mainExecutor) { request ->
                     val size = request.resolution
+                    request.setTransformationInfoListener(mainExecutor) { info ->
+                        if (currentInputHasCameraTransform != info.hasCameraTransform) {
+                            currentInputHasCameraTransform = info.hasCameraTransform
+                            updateTeeTransforms()
+                        }
+                    }
                     eglTee.acquireInputSurface(size.width, size.height) { inputSurface ->
                         request.provideSurface(inputSurface, mainExecutor) {
                             eglTee.releaseInputSurface(inputSurface)
@@ -912,6 +927,11 @@ class CameraController(private val context: Context) {
                             val longSide = maxOf(it.width, it.height)
                             val shortSide = minOf(it.width, it.height)
                             if (longSide == targetW && shortSide == targetH) 0 else 1
+                        },
+                        {
+                            val longSide = maxOf(it.width, it.height)
+                            val shortSide = minOf(it.width, it.height)
+                            if (kotlin.math.abs(longSide * 9 - shortSide * 16) <= 32) 0 else 1
                         },
                         {
                             val longSide = maxOf(it.width, it.height)
@@ -1037,19 +1057,42 @@ class CameraController(private val context: Context) {
         }
     }
 
+    private fun surfaceRotationToDegrees(rotation: Int): Int = when (rotation) {
+        Surface.ROTATION_90 -> 90
+        Surface.ROTATION_180 -> 180
+        Surface.ROTATION_270 -> 270
+        else -> 0
+    }
+
+    private fun computeGlCcwDegrees(camInfo: CameraInfo?, targetRot: Int): Int {
+        return if (currentInputHasCameraTransform) {
+            surfaceRotationToDegrees(targetRot)
+        } else {
+            val cwFromSensor = camInfo?.getSensorRotationDegrees(targetRot)
+                ?: if (isFrontCameraActive) 270 else 90
+            (360 - (cwFromSensor % 360)) % 360
+        }
+    }
+
     private fun updateTeeTransforms() {
         val camInfo: CameraInfo? = boundCamera?.cameraInfo
-        val uiCwDeg = camInfo?.getSensorRotationDegrees(uiDisplayRotation)
-            ?: if (isFrontCameraActive) 270 else 90
-        val encCwDeg = if (manualStreamRotationOffsetDeg >= 0) {
-            val baseRot = camInfo?.getSensorRotationDegrees(Surface.ROTATION_90) ?: 0
-            (baseRot + manualStreamRotationOffsetDeg) % 360
-        } else {
-            camInfo?.getSensorRotationDegrees(devicePhysicalRotation) ?: 0
-        }
+        val uiGlCcwDeg = computeGlCcwDegrees(camInfo, uiDisplayRotation)
 
-        eglTee.updatePreviewTransform(uiCwDeg, mirrorHorizontal = isFrontCameraActive)
-        eglTee.updateEncoderTransform(encCwDeg, mirrorHorizontal = false)
+        val encTargetRot = if (manualStreamRotationOffsetDeg >= 0) {
+            when (((manualStreamRotationOffsetDeg % 360) + 360) % 360) {
+                0 -> Surface.ROTATION_90
+                90 -> Surface.ROTATION_0
+                180 -> Surface.ROTATION_270
+                270 -> Surface.ROTATION_180
+                else -> Surface.ROTATION_90
+            }
+        } else {
+            devicePhysicalRotation
+        }
+        val encGlCcwDeg = computeGlCcwDegrees(camInfo, encTargetRot)
+
+        eglTee.updatePreviewTransform(uiGlCcwDeg, mirrorHorizontal = isFrontCameraActive)
+        eglTee.updateEncoderTransform(encGlCcwDeg, mirrorHorizontal = false)
     }
 
     private fun syncEncoderState(forceRecreate: Boolean = false) {

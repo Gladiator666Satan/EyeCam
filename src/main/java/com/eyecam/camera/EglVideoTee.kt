@@ -19,6 +19,7 @@ import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import kotlin.math.hypot
 import kotlin.math.min
 
 /**
@@ -114,7 +115,7 @@ class EglVideoTee {
     private var encoderEglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
     private var encoderWidth = 1920
     private var encoderHeight = 1080
-    private var encoderCwDeg = 0
+    private var encoderGlCcwDeg = 0
     private var encoderMirrorX = false
 
     // UI preview output target (exclusively touched on glThread)
@@ -122,7 +123,7 @@ class EglVideoTee {
     private var previewEglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
     private var previewWidth = 0
     private var previewHeight = 0
-    private var previewCwDeg = 0
+    private var previewGlCcwDeg = 0
     private var previewMirrorX = false
 
     @Volatile
@@ -279,18 +280,18 @@ class EglVideoTee {
         latch?.await(400, TimeUnit.MILLISECONDS)
     }
 
-    fun updatePreviewTransform(cwDegrees: Int, mirrorHorizontal: Boolean) {
+    fun updatePreviewTransform(glCcwDegrees: Int, mirrorHorizontal: Boolean) {
         if (released) return
         glHandler.post {
-            previewCwDeg = ((cwDegrees % 360) + 360) % 360
+            previewGlCcwDeg = ((glCcwDegrees % 360) + 360) % 360
             previewMirrorX = mirrorHorizontal
         }
     }
 
-    fun updateEncoderTransform(cwDegrees: Int, mirrorHorizontal: Boolean) {
+    fun updateEncoderTransform(glCcwDegrees: Int, mirrorHorizontal: Boolean) {
         if (released) return
         glHandler.post {
-            encoderCwDeg = ((cwDegrees % 360) + 360) % 360
+            encoderGlCcwDeg = ((glCcwDegrees % 360) + 360) % 360
             encoderMirrorX = mirrorHorizontal
         }
     }
@@ -364,12 +365,13 @@ class EglVideoTee {
         if (encSurf != null && encSurf.isValid && encoderEglSurface != EGL14.EGL_NO_SURFACE) {
             drawToSurface(
                 eglSurface = encoderEglSurface,
+                texId = session.texId,
                 bufW = session.bufWidth,
                 bufH = session.bufHeight,
                 dstW = encoderWidth,
                 dstH = encoderHeight,
-                cwDeg = encoderCwDeg,
-                mirrorX = encoderMirrorX,
+                glCcwDeg = encoderGlCcwDeg,
+                desiredMirrorX = encoderMirrorX,
                 ptsNs = ptsNs
             )
         }
@@ -380,12 +382,13 @@ class EglVideoTee {
         ) {
             drawToSurface(
                 eglSurface = previewEglSurface,
+                texId = session.texId,
                 bufW = session.bufWidth,
                 bufH = session.bufHeight,
                 dstW = previewWidth,
                 dstH = previewHeight,
-                cwDeg = previewCwDeg,
-                mirrorX = previewMirrorX,
+                glCcwDeg = previewGlCcwDeg,
+                desiredMirrorX = previewMirrorX,
                 ptsNs = null
             )
         }
@@ -395,41 +398,62 @@ class EglVideoTee {
 
     private fun drawToSurface(
         eglSurface: EGLSurface,
+        texId: Int,
         bufW: Int,
         bufH: Int,
         dstW: Int,
         dstH: Int,
-        cwDeg: Int,
-        mirrorX: Boolean,
+        glCcwDeg: Int,
+        desiredMirrorX: Boolean,
         ptsNs: Long?
     ) {
         if (!EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) {
             return
         }
-        GLES20.glViewport(0, 0, dstW, dstH)
+
+        // Query live EGL surface size so orientation switches never briefly stretch on stale view dimensions
+        val surfDim = IntArray(2)
+        EGL14.eglQuerySurface(eglDisplay, eglSurface, EGL14.EGL_WIDTH, surfDim, 0)
+        EGL14.eglQuerySurface(eglDisplay, eglSurface, EGL14.EGL_HEIGHT, surfDim, 1)
+        val actualDstW = if (surfDim[0] > 0) surfDim[0] else dstW
+        val actualDstH = if (surfDim[1] > 0) surfDim[1] else dstH
+        if (actualDstW <= 0 || actualDstH <= 0) return
+
+        GLES20.glDisable(GLES20.GL_CULL_FACE)
+        GLES20.glViewport(0, 0, actualDstW, actualDstH)
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
 
-        val imgW = if (cwDeg % 180 == 0) bufW.toFloat() else bufH.toFloat()
-        val imgH = if (cwDeg % 180 == 0) bufH.toFloat() else bufW.toFloat()
-        val fitScale = min(dstW.toFloat() / imgW, dstH.toFloat() / imgH)
+        // SurfaceTexture#getTransformMatrix already embeds HAL sensor->natural rotation and front-cam H-flip.
+        // Measure the true post-stMatrix aspect dimensions and reflection parity directly from stMatrix.
+        val rawSpanW = hypot(stMatrix[0] * bufW.toFloat(), stMatrix[1] * bufH.toFloat())
+        val rawSpanH = hypot(stMatrix[4] * bufW.toFloat(), stMatrix[5] * bufH.toFloat())
+        val srcW = if (rawSpanW > 1f) rawSpanW else bufW.toFloat().coerceAtLeast(1f)
+        val srcH = if (rawSpanH > 1f) rawSpanH else bufH.toFloat().coerceAtLeast(1f)
+        val stAlreadyMirrored = (stMatrix[0] * stMatrix[5] - stMatrix[1] * stMatrix[4]) > 0f
+
+        val rotCcw = ((glCcwDeg % 360) + 360) % 360
+        val imgW = if (rotCcw % 180 == 0) srcW else srcH
+        val imgH = if (rotCcw % 180 == 0) srcH else srcW
+        val fitScale = min(actualDstW.toFloat() / imgW, actualDstH.toFloat() / imgH)
+        val applyFlipX = (stAlreadyMirrored != desiredMirrorX)
 
         Matrix.setIdentityM(mvpMatrix, 0)
-        Matrix.scaleM(mvpMatrix, 0, fitScale / dstW.toFloat(), fitScale / dstH.toFloat(), 1f)
-        if (mirrorX) {
+        Matrix.scaleM(mvpMatrix, 0, fitScale / actualDstW.toFloat(), fitScale / actualDstH.toFloat(), 1f)
+        if (applyFlipX) {
             Matrix.scaleM(mvpMatrix, 0, -1f, 1f, 1f)
         }
-        if (cwDeg != 0) {
-            Matrix.rotateM(mvpMatrix, 0, -cwDeg.toFloat(), 0f, 0f, 1f)
+        if (rotCcw != 0) {
+            Matrix.rotateM(mvpMatrix, 0, rotCcw.toFloat(), 0f, 0f, 1f)
         }
-        Matrix.scaleM(mvpMatrix, 0, bufW.toFloat(), bufH.toFloat(), 1f)
+        Matrix.scaleM(mvpMatrix, 0, srcW, srcH, 1f)
 
         GLES20.glUseProgram(program)
         GLES20.glUniformMatrix4fv(uMvpMatrixLoc, 1, false, mvpMatrix, 0)
         GLES20.glUniformMatrix4fv(uStMatrixLoc, 1, false, stMatrix, 0)
 
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, activeSession?.texId ?: 0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, texId)
         GLES20.glUniform1i(sTextureLoc, 0)
 
         posBuffer.position(0)
