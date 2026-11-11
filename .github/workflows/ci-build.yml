@@ -132,8 +132,10 @@ jobs:
 
       - name: Install Linux Build Dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake build-essential ninja-build libv4l-dev v4l2loopback-dkms v4l-utils
+          if ! command -v cmake >/dev/null || ! command -v ninja >/dev/null || [ ! -f /usr/include/linux/videodev2.h ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends cmake build-essential ninja-build linux-libc-dev
+          fi
 
       - name: Configure CMake (Linux x64)
         run: |
