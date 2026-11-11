@@ -813,8 +813,9 @@ class CameraController(private val context: Context) {
                 preview.setSurfaceProvider(mainExecutor) { request ->
                     val size = request.resolution
                     request.setTransformationInfoListener(mainExecutor) { info ->
-                        if (currentInputHasCameraTransform != info.hasCameraTransform) {
-                            currentInputHasCameraTransform = info.hasCameraTransform
+                        val hasCamTransform = info.hasCameraTransform()
+                        if (currentInputHasCameraTransform != hasCamTransform) {
+                            currentInputHasCameraTransform = hasCamTransform
                             updateTeeTransforms()
                         }
                     }
