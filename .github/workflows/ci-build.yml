@@ -75,7 +75,16 @@ jobs:
           git push origin main || true
 
       - name: Build Debug APK
-        run: ./gradlew assembleDebug --no-daemon --stacktrace
+        run: |
+          ./gradlew assembleDebug --no-daemon --stacktrace > /tmp/gradle-build.log 2>&1
+          GRADLE_EXIT=$?
+          cat /tmp/gradle-build.log
+          if [ $GRADLE_EXIT -ne 0 ]; then
+            grep -E "^(e: |FAILURE:|> Task .* FAILED|Caused by:|Execution failed|.*:[0-9]+:[0-9]+: )" /tmp/gradle-build.log | head -n 40 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+          fi
+          exit $GRADLE_EXIT
 
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4

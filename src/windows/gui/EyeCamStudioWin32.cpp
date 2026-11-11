@@ -528,16 +528,19 @@ public:
         // Низька затримка (без буферизації B-кадрів / реордерингу)
         ICodecAPI* pCodecApi = nullptr;
         if (SUCCEEDED(m_decoder->QueryInterface(IID_PPV_ARGS(&pCodecApi))) && pCodecApi) {
-            const GUID lowLatencyGuid = __uuidof(CODECAPI_AVLowLatencyMode);
+            // CODECAPI_AVLowLatencyMode ({9c27891a-ed7a-40e1-88e8-b22727a024ee})
+            static constexpr GUID kAvLowLatencyMode = {
+                0x9c27891a, 0xed7a, 0x40e1, {0x88, 0xe8, 0xb2, 0x27, 0x27, 0xa0, 0x24, 0xee}
+            };
             VARIANT var{};
             VariantInit(&var);
             var.vt = VT_UI4;
             var.ulVal = 1;
-            if (FAILED(pCodecApi->SetValue(&lowLatencyGuid, &var))) {
+            if (FAILED(pCodecApi->SetValue(&kAvLowLatencyMode, &var))) {
                 VariantClear(&var);
                 var.vt = VT_BOOL;
                 var.boolVal = VARIANT_TRUE;
-                pCodecApi->SetValue(&lowLatencyGuid, &var);
+                pCodecApi->SetValue(&kAvLowLatencyMode, &var);
             }
             VariantClear(&var);
             pCodecApi->Release();
