@@ -6,8 +6,8 @@
 
 **Перетворіть ваш Android-смартфон на швидку 4K веб-камеру для ПК із мінімальною затримкою**
 
-[![CI Build](https://github.com/Gladiator666Satan/EyeCam/actions/workflows/ci-build.yml/badge.svg)](https://github.com/Gladiator666Satan/EyeCam/actions/workflows/ci-build.yml)
-[![Latest Release](https://img.shields.io/github/v/release/Gladiator666Satan/EyeCam?label=Release&color=00E676)](https://github.com/Gladiator666Satan/EyeCam/releases/latest)
+[![CI Build](https://github.com/Gladiator666Satan/EyeCam/actions/workflows/ci-build.yml/badge.svg?branch=main&event=push)](https://github.com/Gladiator666Satan/EyeCam/actions/workflows/ci-build.yml)
+[![Latest Release](https://img.shields.io/github/v/release/Gladiator666Satan/EyeCam?label=Release&color=00E676&sort=semver)](https://github.com/Gladiator666Satan/EyeCam/releases/latest)
 ![Android](https://img.shields.io/badge/Android-8.0%2B-3DDC84?logo=android&logoColor=white)
 ![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-0078D4?logo=windows&logoColor=white)
 ![Linux](https://img.shields.io/badge/Linux-V4L2%20Loopback-FCC624?logo=linux&logoColor=black)
