@@ -24,6 +24,10 @@ if not exist "%DLL_PATH%" (
 )
 
 if not exist "%DLL_PATH%" (
+    set DLL_PATH=%SCRIPT_DIR%..\EyeCamFilter.dll
+)
+
+if not exist "%DLL_PATH%" (
     set DLL_PATH=%SCRIPT_DIR%EyeCamFilter.dll
 )
 

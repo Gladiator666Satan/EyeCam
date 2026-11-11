@@ -5,7 +5,7 @@
 ; ==============================================================================
 
 #define MyAppName "EyeCam Studio"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.3.0"
 #define MyAppPublisher "EyeCam Open-Source Project"
 #define MyAppURL "https://github.com/Gladiator666Satan/EyeCam"
 #define MyAppExeName "EyeCamStudio.exe"
