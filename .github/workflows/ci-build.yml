@@ -326,12 +326,19 @@ jobs:
       - name: Prepare Release Assets
         run: |
           mkdir -p release_assets
-          cp -f artifacts/eyecam-debug-apk/*.apk release_assets/
-          cp -f artifacts/eyecam-windows-installer/EyeCam-Setup-x64.exe release_assets/
-          cp -f artifacts/eyecam-windows-portable/EyeCam-Windows-x64-portable.zip release_assets/
-          cp -f artifacts/eyecam-linux-binaries/EyeCam-Linux-x64.tar.gz release_assets/
+          find artifacts -maxdepth 4 -type f
+          APK_PATH=$(find artifacts/eyecam-debug-apk -type f -name "*.apk" | head -n1)
+          WIN_EXE_PATH=$(find artifacts/eyecam-windows-installer -type f -name "EyeCam-Setup-x64.exe" | head -n1)
+          WIN_ZIP_PATH=$(find artifacts/eyecam-windows-portable -type f -name "EyeCam-Windows-x64-portable.zip" | head -n1)
+          LINUX_TAR_PATH=$(find artifacts/eyecam-linux-binaries -type f -name "EyeCam-Linux-x64.tar.gz" | head -n1)
+          for f in "$APK_PATH" "$WIN_EXE_PATH" "$WIN_ZIP_PATH" "$LINUX_TAR_PATH"; do
+            if [ -z "$f" ] || [ ! -f "$f" ]; then
+              echo "::error::Missing expected release artifact! Found: $(find artifacts -type f | tr '\n' ' ')"
+              exit 1
+            fi
+            cp -f "$f" release_assets/
+          done
           ls -lh release_assets/
-          test "$(ls -1 release_assets | wc -l)" -eq 4
 
       - name: Create or Update GitHub Release
         env:
@@ -339,7 +346,7 @@ jobs:
         run: |
           APP_VER=$(grep -E 'versionName[[:space:]]*=' build.gradle.kts | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
           TAG="v${APP_VER:-1.3.0}"
-          APK_FILE=$(basename release_assets/EyeCam-v*-android.apk)
+          APK_FILE=$(basename "$(find release_assets -maxdepth 1 -name '*.apk' | head -n1)")
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
