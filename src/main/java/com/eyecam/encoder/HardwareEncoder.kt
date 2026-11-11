@@ -30,8 +30,8 @@ fun interface NalUnitListener {
  */
 class HardwareEncoder(
     @Volatile var config: EncoderConfig,
-    private val listener: NalUnitListener = NalUnitListener { },
-    private val onAccessUnit: ((data: ByteArray, isKeyFrame: Boolean, ptsUs: Long) -> Unit)? = null
+    private val onAccessUnit: ((data: ByteArray, isKeyFrame: Boolean, ptsUs: Long) -> Unit)? = null,
+    private val listener: NalUnitListener = NalUnitListener { }
 ) {
     companion object {
         private const val TAG = "EyeCam-Encoder"

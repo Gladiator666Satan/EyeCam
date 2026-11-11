@@ -18,9 +18,12 @@ class VideoPipelineCoordinator(
     private var hardwareEncoder: HardwareEncoder? = null
 
     fun startStreaming(previewSurface: Surface, logicalCameraId: String = "0") {
-        val encoder = HardwareEncoder(encoderConfig) { nalUnit ->
-            networkSocketSender(nalUnit)
-        }
+        val encoder = HardwareEncoder(
+            config = encoderConfig,
+            listener = NalUnitListener { nalUnit ->
+                networkSocketSender(nalUnit)
+            }
+        )
         encoder.start()
         hardwareEncoder = encoder
 
