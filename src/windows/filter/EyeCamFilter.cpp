@@ -186,7 +186,7 @@ static bool QueryActiveSharedMemoryFormat(uint32_t& outW, uint32_t& outH, uint32
     void* pBuf = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, sizeof(SharedMemoryHeader));
     if (pBuf) {
         auto* hdr = reinterpret_cast<const SharedMemoryHeader*>(pBuf);
-        if (hdr->magic == EYECAM_MAGIC && hdr->width >= 320 && hdr->height >= 240) {
+        if (hdr->magicNumber == EYECAM_MAGIC && hdr->width >= 320 && hdr->height >= 240) {
             outW = hdr->width;
             outH = hdr->height;
             outFps = (hdr->fps >= 15 && hdr->fps <= 60) ? hdr->fps : 30;
