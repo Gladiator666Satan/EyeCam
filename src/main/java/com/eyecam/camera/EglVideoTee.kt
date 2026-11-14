@@ -57,13 +57,22 @@ class EglVideoTee {
             }
         """
 
-        private const val FRAGMENT_SHADER = """
+        private const val FRAGMENT_SHADER_PASSTHROUGH = """
+            #extension GL_OES_EGL_image_external : require
+            precision mediump float;
+            varying vec2 vTexCoord;
+            uniform samplerExternalOES sTexture;
+            void main() {
+                gl_FragColor = texture2D(sTexture, vTexCoord);
+            }
+        """
+
+        private const val FRAGMENT_SHADER_LUT3D = """
             #extension GL_OES_EGL_image_external : require
             precision mediump float;
             varying vec2 vTexCoord;
             uniform samplerExternalOES sTexture;
             uniform sampler2D sLutTexture;
-            uniform int uLutEnabled;
 
             vec3 sampleLut3D(vec3 color) {
                 vec3 c = clamp(color, 0.0, 1.0);
@@ -83,11 +92,7 @@ class EglVideoTee {
 
             void main() {
                 vec4 src = texture2D(sTexture, vTexCoord);
-                if (uLutEnabled != 0) {
-                    gl_FragColor = vec4(sampleLut3D(src.rgb), src.a);
-                } else {
-                    gl_FragColor = src;
-                }
+                gl_FragColor = vec4(sampleLut3D(src.rgb), src.a);
             }
         """
 
@@ -288,14 +293,20 @@ class EglVideoTee {
     private var eglConfig: EGLConfig? = null
     private var pbufferSurface: EGLSurface = EGL14.EGL_NO_SURFACE
 
-    private var program = 0
-    private var aPositionLoc = -1
-    private var aTexCoordLoc = -1
-    private var uMvpMatrixLoc = -1
-    private var uStMatrixLoc = -1
-    private var sTextureLoc = -1
-    private var sLutTextureLoc = -1
-    private var uLutEnabledLoc = -1
+    private var programPassthrough = 0
+    private var aPositionLocPass = -1
+    private var aTexCoordLocPass = -1
+    private var uMvpMatrixLocPass = -1
+    private var uStMatrixLocPass = -1
+    private var sTextureLocPass = -1
+
+    private var programLut = 0
+    private var aPositionLocLut = -1
+    private var aTexCoordLocLut = -1
+    private var uMvpMatrixLocLut = -1
+    private var uStMatrixLocLut = -1
+    private var sTextureLocLut = -1
+    private var sLutTextureLocLut = -1
 
     private var lutTexId = 0
     private var lutEnabled = false
@@ -554,9 +565,13 @@ class EglVideoTee {
                     EGL14.eglDestroySurface(eglDisplay, previewEglSurface)
                     previewEglSurface = EGL14.EGL_NO_SURFACE
                 }
-                if (program != 0) {
-                    GLES20.glDeleteProgram(program)
-                    program = 0
+                if (programPassthrough != 0) {
+                    GLES20.glDeleteProgram(programPassthrough)
+                    programPassthrough = 0
+                }
+                if (programLut != 0) {
+                    GLES20.glDeleteProgram(programLut)
+                    programLut = 0
                 }
                 if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
                     EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
@@ -684,35 +699,45 @@ class EglVideoTee {
         }
         Matrix.scaleM(mvpMatrix, 0, srcW, srcH, 1f)
 
-        GLES20.glUseProgram(program)
-        GLES20.glUniformMatrix4fv(uMvpMatrixLoc, 1, false, mvpMatrix, 0)
-        GLES20.glUniformMatrix4fv(uStMatrixLoc, 1, false, stMatrix, 0)
+        val useLut = lutEnabled && lutTexId != 0 && programLut != 0
+        val activeProg = if (useLut) programLut else programPassthrough
+        val posLoc = if (useLut) aPositionLocLut else aPositionLocPass
+        val texLoc = if (useLut) aTexCoordLocLut else aTexCoordLocPass
+        val mvpLoc = if (useLut) uMvpMatrixLocLut else uMvpMatrixLocPass
+        val stLoc = if (useLut) uStMatrixLocLut else uStMatrixLocPass
+        val oesSamplerLoc = if (useLut) sTextureLocLut else sTextureLocPass
+
+        GLES20.glUseProgram(activeProg)
+        GLES20.glUniformMatrix4fv(mvpLoc, 1, false, mvpMatrix, 0)
+        GLES20.glUniformMatrix4fv(stLoc, 1, false, stMatrix, 0)
 
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, texId)
-        GLES20.glUniform1i(sTextureLoc, 0)
+        GLES20.glUniform1i(oesSamplerLoc, 0)
 
-        if (lutEnabled && lutTexId != 0) {
+        if (useLut) {
             GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, lutTexId)
-            GLES20.glUniform1i(sLutTextureLoc, 1)
-            GLES20.glUniform1i(uLutEnabledLoc, 1)
-        } else {
-            GLES20.glUniform1i(uLutEnabledLoc, 0)
+            GLES20.glUniform1i(sLutTextureLocLut, 1)
         }
 
         posBuffer.position(0)
-        GLES20.glEnableVertexAttribArray(aPositionLoc)
-        GLES20.glVertexAttribPointer(aPositionLoc, 2, GLES20.GL_FLOAT, false, 0, posBuffer)
+        GLES20.glEnableVertexAttribArray(posLoc)
+        GLES20.glVertexAttribPointer(posLoc, 2, GLES20.GL_FLOAT, false, 0, posBuffer)
 
         texBuffer.position(0)
-        GLES20.glEnableVertexAttribArray(aTexCoordLoc)
-        GLES20.glVertexAttribPointer(aTexCoordLoc, 2, GLES20.GL_FLOAT, false, 0, texBuffer)
+        GLES20.glEnableVertexAttribArray(texLoc)
+        GLES20.glVertexAttribPointer(texLoc, 2, GLES20.GL_FLOAT, false, 0, texBuffer)
 
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
 
-        GLES20.glDisableVertexAttribArray(aPositionLoc)
-        GLES20.glDisableVertexAttribArray(aTexCoordLoc)
+        GLES20.glDisableVertexAttribArray(posLoc)
+        GLES20.glDisableVertexAttribArray(texLoc)
+        if (useLut) {
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        }
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
 
         if (ptsNs != null) {
@@ -740,14 +765,25 @@ class EglVideoTee {
 
         makePbufferCurrent()
 
-        program = buildProgram(VERTEX_SHADER, FRAGMENT_SHADER)
-        aPositionLoc = GLES20.glGetAttribLocation(program, "aPosition")
-        aTexCoordLoc = GLES20.glGetAttribLocation(program, "aTexCoord")
-        uMvpMatrixLoc = GLES20.glGetUniformLocation(program, "uMvpMatrix")
-        uStMatrixLoc = GLES20.glGetUniformLocation(program, "uStMatrix")
-        sTextureLoc = GLES20.glGetUniformLocation(program, "sTexture")
-        sLutTextureLoc = GLES20.glGetUniformLocation(program, "sLutTexture")
-        uLutEnabledLoc = GLES20.glGetUniformLocation(program, "uLutEnabled")
+        programPassthrough = buildProgram(VERTEX_SHADER, FRAGMENT_SHADER_PASSTHROUGH)
+        aPositionLocPass = GLES20.glGetAttribLocation(programPassthrough, "aPosition")
+        aTexCoordLocPass = GLES20.glGetAttribLocation(programPassthrough, "aTexCoord")
+        uMvpMatrixLocPass = GLES20.glGetUniformLocation(programPassthrough, "uMvpMatrix")
+        uStMatrixLocPass = GLES20.glGetUniformLocation(programPassthrough, "uStMatrix")
+        sTextureLocPass = GLES20.glGetUniformLocation(programPassthrough, "sTexture")
+
+        try {
+            programLut = buildProgram(VERTEX_SHADER, FRAGMENT_SHADER_LUT3D)
+            aPositionLocLut = GLES20.glGetAttribLocation(programLut, "aPosition")
+            aTexCoordLocLut = GLES20.glGetAttribLocation(programLut, "aTexCoord")
+            uMvpMatrixLocLut = GLES20.glGetUniformLocation(programLut, "uMvpMatrix")
+            uStMatrixLocLut = GLES20.glGetUniformLocation(programLut, "uStMatrix")
+            sTextureLocLut = GLES20.glGetUniformLocation(programLut, "sTexture")
+            sLutTextureLocLut = GLES20.glGetUniformLocation(programLut, "sLutTexture")
+        } catch (e: Exception) {
+            Log.w(TAG, "3D LUT shader compilation skipped: ${e.message}")
+            programLut = 0
+        }
     }
 
     private fun chooseEglConfig(recordable: Boolean): EGLConfig? {

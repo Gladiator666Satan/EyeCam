@@ -22,22 +22,22 @@ object CameraUtils {
         if (focalLengths != null && focalLengths.isNotEmpty() && sensorSize != null) {
             val focalLength = focalLengths[0]
             val sensorWidth = sensorSize.width
-            val hFov = Math.toDegrees(2.0 * atan((sensorWidth / (2.0 * focalLength)).toDouble())).toFloat()
+            val hFov = if (focalLength > 0.1f && sensorWidth > 0.1f) {
+                Math.toDegrees(2.0 * atan((sensorWidth / (2.0 * focalLength)).toDouble())).toFloat()
+            } else {
+                75.0f
+            }
 
-            // Будь-який сенсор з фокусною відстанню < 2.8 мм або FOV >= 85° є ULTRA_WIDE
-            // (на Samsung Galaxy Ultra надширококутний сенсор також має макро-автофокус з minFocusDistance >= 10.0f)
+            // Надширококутний сенсор (0.5x UW) має фокусну відстань < 2.6 мм (або FOV >= 92° при f < 3.0 мм).
+            // Звичайні основні камери смартфонів (зокрема Redmi 8A з f ≈ 3.8 мм та minFocusDistance = 10 dpt)
+            // завжди класифікуються як WIDE, щоб не створювати хибні модулі на 2-камерних пристроях.
             return when {
-                hFov >= 85.0f || focalLength < 2.8f -> SensorType.ULTRA_WIDE
-                minFocusDistance >= 10.0f && focalLength in 2.8f..4.0f -> SensorType.MACRO
-                hFov in 60.0f..84.9f || focalLength in 2.8f..5.5f -> SensorType.WIDE
-                hFov < 60.0f || focalLength > 5.5f -> SensorType.TELEPHOTO
+                focalLength < 2.6f || (hFov >= 92.0f && focalLength < 3.0f) -> SensorType.ULTRA_WIDE
+                focalLength > 5.6f || (hFov < 52.0f && focalLength > 5.0f) -> SensorType.TELEPHOTO
                 else -> SensorType.WIDE
             }
         }
 
-        if (minFocusDistance >= 10.0f) {
-            return SensorType.MACRO
-        }
         return SensorType.WIDE
     }
 

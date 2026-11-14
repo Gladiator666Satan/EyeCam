@@ -17,9 +17,12 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -41,6 +44,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.eyecam.model.AppLanguage
 import com.eyecam.ui.components.CameraPreview
 import com.eyecam.ui.components.DisplayProtectionOverlay
 import com.eyecam.ui.components.QuickToggleHud
@@ -71,9 +75,11 @@ private const val GITHUB_API_LATEST_URL = "https://api.github.com/repos/Gladiato
 /**
  * Головний екран програми EyeCam:
  * - Живе прев'ю камери з TextureView + EglVideoTee (.cube 3D LUT)
- * - Плаваючий HUD з кнопками модулів, внутрішнім зумом, ліхтариком, AE Lock та замочками повзунків
- * - Модальне вікно підтримки автора із заблюреним фоном програми (Patreon + Buy Me a Coffee)
- * - Модальне вікно GitHub та автоматичної перевірки оновлень з GitHub Releases
+ * - Плаваючий HUD із горизонтально прокручуваним нижнім меню, кнопками модулів та внутрішнім зумом
+ * - Єдине модальне вікно Меню із заблюреним фоном програми:
+ *   1. Перемикач мови (English за замовчуванням при першому встановленні / Українська)
+ *   2. Підтримка автора (Patreon + Buy Me a Coffee)
+ *   3. GitHub та автоматична перевірка оновлень з GitHub Releases
  */
 @Composable
 fun EyeCamScreen(
@@ -83,8 +89,7 @@ fun EyeCamScreen(
 ) {
     val context = LocalContext.current
     val uiState by viewModel.uiState.collectAsState()
-    var showSupportModal by remember { mutableStateOf(false) }
-    var showUpdateModal by remember { mutableStateOf(false) }
+    var showMenuModal by remember { mutableStateOf(false) }
 
     val cubePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -103,20 +108,18 @@ fun EyeCamScreen(
         }
     }
 
-    val isModalOpen = showSupportModal || showUpdateModal
-
     Box(
         modifier = modifier
             .fillMaxSize()
             .background(OledPureBlack)
     ) {
-        // Фоновий шар програми (блюриться при відкритті модального вікна підтримки або оновлень)
+        // Фоновий шар програми (блюриться при відкритті модального вікна Меню)
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .then(if (isModalOpen) Modifier.blur(18.dp) else Modifier)
-                .pointerInput(uiState.isDisplayProtectionActive, isModalOpen) {
-                    if (!uiState.isDisplayProtectionActive && !isModalOpen) {
+                .then(if (showMenuModal) Modifier.blur(18.dp) else Modifier)
+                .pointerInput(uiState.isDisplayProtectionActive, showMenuModal) {
+                    if (!uiState.isDisplayProtectionActive && !showMenuModal) {
                         detectTapGestures(
                             onPress = {
                                 viewModel.onUserInteraction()
@@ -127,6 +130,7 @@ fun EyeCamScreen(
         ) {
             CameraPreview(
                 isStreaming = uiState.isStreaming,
+                language = uiState.language,
                 hasCameraPermission = uiState.hasCameraPermission,
                 isDisplayProtectionActive = uiState.isDisplayProtectionActive,
                 streamWidth = uiState.telemetry.resolutionWidth,
@@ -154,29 +158,18 @@ fun EyeCamScreen(
                     onUpdateManualWb = { kelvin -> viewModel.updateManualWhiteBalance(kelvin) },
                     onPickCubeLut = { cubePickerLauncher.launch(arrayOf("*/*")) },
                     onClearCubeLut = { viewModel.clearCubeLut() },
-                    onOpenSupportModal = { showSupportModal = true },
-                    onOpenUpdateModal = { showUpdateModal = true },
+                    onOpenMenuModal = { showMenuModal = true },
                     onActivateDisplayProtection = { viewModel.activateDisplayProtection() }
                 )
             }
         }
 
-        // Модальне вікно підтримки автора поверх заблюреного фону
-        if (showSupportModal) {
-            SupportAuthorModalOverlay(
-                onDismiss = { showSupportModal = false },
-                onOpenUrl = { url ->
-                    try {
-                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-                    } catch (_: Exception) {}
-                }
-            )
-        }
-
-        // Модальне вікно GitHub та перевірки оновлень поверх заблюреного фону
-        if (showUpdateModal) {
-            GitHubUpdateModalOverlay(
-                onDismiss = { showUpdateModal = false },
+        // Модальне вікно Меню (Мова EN/UA + Підтримка автора + GitHub та Оновлення) поверх заблюреного фону
+        if (showMenuModal) {
+            UnifiedMenuModalOverlay(
+                language = uiState.language,
+                onSelectLanguage = { lang -> viewModel.setLanguage(lang) },
+                onDismiss = { showMenuModal = false },
                 onOpenUrl = { url ->
                     try {
                         context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
@@ -194,118 +187,29 @@ fun EyeCamScreen(
 }
 
 @Composable
-private fun SupportAuthorModalOverlay(
+private fun UnifiedMenuModalOverlay(
+    language: AppLanguage,
+    onSelectLanguage: (AppLanguage) -> Unit,
     onDismiss: () -> Unit,
     onOpenUrl: (String) -> Unit
 ) {
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color(0xB806090F))
-            .clickable { onDismiss() },
-        contentAlignment = Alignment.Center
-    ) {
-        Column(
-            modifier = Modifier
-                .padding(24.dp)
-                .widthIn(max = 380.dp)
-                .clip(RoundedCornerShape(24.dp))
-                .background(OledCard)
-                .border(1.5.dp, StatusAmber.copy(alpha = 0.7f), RoundedCornerShape(24.dp))
-                .clickable(enabled = false) {}
-                .padding(24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(14.dp)
-        ) {
-            Text(
-                text = "❤️ ПІДТРИМАТИ АВТОРА",
-                fontSize = 18.sp,
-                fontWeight = FontWeight.Bold,
-                color = StatusAmber,
-                textAlign = TextAlign.Center
-            )
-            Text(
-                text = "Дякуємо за використання EyeCam! Ви можете підтримати розвиток проєкту та нові оновлення:",
-                fontSize = 13.sp,
-                color = TextSecondary,
-                textAlign = TextAlign.Center
-            )
-
-            // Кнопка 1: Patreon
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(Color(0xFFFF424D))
-                    .clickable { onOpenUrl(PATREON_URL) }
-                    .padding(vertical = 14.dp, horizontal = 16.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = "🟠  Patreon — Gladiator_Satan",
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White
-                )
-            }
-
-            // Кнопка 2: Buy Me a Coffee
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(StatusAmber)
-                    .clickable { onOpenUrl(BUYMEACOFFEE_URL) }
-                    .padding(vertical = 14.dp, horizontal = 16.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = "☕  Buy Me a Coffee — gladiator_satan",
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.Black
-                )
-            }
-
-            Spacer(modifier = Modifier.height(4.dp))
-
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(OledPillBackground)
-                    .border(1.dp, OledBorder, RoundedCornerShape(12.dp))
-                    .clickable { onDismiss() }
-                    .padding(horizontal = 24.dp, vertical = 10.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = "Закрити",
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = TextPrimary
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun GitHubUpdateModalOverlay(
-    onDismiss: () -> Unit,
-    onOpenUrl: (String) -> Unit
-) {
+    val isUa = language == AppLanguage.UA
     val scope = rememberCoroutineScope()
     var checking by remember { mutableStateOf(true) }
-    var statusText by remember { mutableStateOf("Перевірка оновлень на GitHub Releases...") }
+    var statusText by remember {
+        mutableStateOf(
+            if (isUa) "Перевірка оновлень на GitHub Releases..." else "Checking GitHub Releases for updates..."
+        )
+    }
     var latestVersion by remember { mutableStateOf("") }
     var releaseUrl by remember { mutableStateOf(GITHUB_RELEASES_URL) }
     var hasUpdate by remember { mutableStateOf(false) }
 
-    fun triggerCheck() {
+    fun triggerCheck(forUa: Boolean) {
         checking = true
-        statusText = "Перевірка оновлень на GitHub Releases..."
+        statusText = if (forUa) "Перевірка оновлень на GitHub Releases..." else "Checking GitHub Releases for updates..."
         scope.launch {
-            val res = checkGitHubLatestRelease()
+            val res = checkGitHubLatestRelease(forUa)
             checking = false
             latestVersion = res.latestTag
             releaseUrl = res.htmlUrl
@@ -314,8 +218,8 @@ private fun GitHubUpdateModalOverlay(
         }
     }
 
-    LaunchedEffect(Unit) {
-        triggerCheck()
+    LaunchedEffect(isUa) {
+        triggerCheck(isUa)
     }
 
     Box(
@@ -327,130 +231,256 @@ private fun GitHubUpdateModalOverlay(
     ) {
         Column(
             modifier = Modifier
-                .padding(24.dp)
+                .padding(16.dp)
                 .widthIn(max = 390.dp)
+                .heightIn(max = 600.dp)
                 .clip(RoundedCornerShape(24.dp))
                 .background(OledCard)
                 .border(1.5.dp, StatusCyan.copy(alpha = 0.7f), RoundedCornerShape(24.dp))
                 .clickable(enabled = false) {}
-                .padding(24.dp),
+                .verticalScroll(rememberScrollState())
+                .padding(20.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(14.dp)
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Text(
-                text = "🐙 GITHUB ТА ОНОВЛЕННЯ",
-                fontSize = 18.sp,
+                text = if (isUa) "☰ МЕНЮ EYECAM" else "☰ EYECAM MENU",
+                fontSize = 17.sp,
                 fontWeight = FontWeight.Bold,
                 color = StatusCyan,
                 textAlign = TextAlign.Center
             )
 
-            Text(
-                text = "Поточна версія EyeCam: v$CURRENT_APP_VERSION",
-                fontSize = 12.sp,
-                fontFamily = FontFamily.Monospace,
-                fontWeight = FontWeight.Bold,
-                color = TextSecondary
-            )
-
-            Box(
+            // 1. Вибір мови (English за замовчуванням / Українська)
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(12.dp))
+                    .clip(RoundedCornerShape(14.dp))
                     .background(OledPillBackground)
-                    .border(
-                        1.dp,
-                        if (hasUpdate) StatusEmerald else OledBorder,
-                        RoundedCornerShape(12.dp)
-                    )
-                    .padding(14.dp),
-                contentAlignment = Alignment.Center
+                    .border(1.dp, OledBorder, RoundedCornerShape(14.dp))
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Text(
-                    text = statusText,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = if (hasUpdate) StatusEmerald else TextPrimary,
-                    textAlign = TextAlign.Center
+                    text = if (isUa) "🌐 МОВА ІНТЕРФЕЙСУ" else "🌐 APP LANGUAGE",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = TextSecondary
                 )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    val enSelected = language == AppLanguage.EN
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(if (enSelected) StatusEmerald else OledCard)
+                            .border(1.dp, if (enSelected) StatusEmerald else OledBorder, RoundedCornerShape(10.dp))
+                            .clickable { onSelectLanguage(AppLanguage.EN) }
+                            .padding(vertical = 10.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = "English (EN)",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (enSelected) Color.Black else TextPrimary
+                        )
+                    }
+
+                    val uaSelected = language == AppLanguage.UA
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(if (uaSelected) StatusEmerald else OledCard)
+                            .border(1.dp, if (uaSelected) StatusEmerald else OledBorder, RoundedCornerShape(10.dp))
+                            .clickable { onSelectLanguage(AppLanguage.UA) }
+                            .padding(vertical = 10.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = "Українська (UA)",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (uaSelected) Color.Black else TextPrimary
+                        )
+                    }
+                }
             }
 
-            if (hasUpdate) {
+            // 2. Підтримка автора (Patreon & Buy Me a Coffee)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(OledPillBackground)
+                    .border(1.dp, StatusAmber.copy(alpha = 0.55f), RoundedCornerShape(14.dp))
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    text = if (isUa) "❤️ ПІДТРИМАТИ АВТОРА" else "❤️ SUPPORT THE AUTHOR",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = StatusAmber,
+                    textAlign = TextAlign.Center
+                )
+                Text(
+                    text = if (isUa) {
+                        "Підтримайте розвиток EyeCam та вихід нових оновлень:"
+                    } else {
+                        "Support EyeCam development and future updates:"
+                    },
+                    fontSize = 11.sp,
+                    color = TextSecondary,
+                    textAlign = TextAlign.Center
+                )
+
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(StatusEmerald)
-                        .clickable { onOpenUrl(releaseUrl) }
-                        .padding(vertical = 14.dp, horizontal = 16.dp),
+                        .clip(RoundedCornerShape(11.dp))
+                        .background(Color(0xFFFF424D))
+                        .clickable { onOpenUrl(PATREON_URL) }
+                        .padding(vertical = 11.dp, horizontal = 12.dp),
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
-                        text = "⬇️ Завантажити нову версію ($latestVersion)",
-                        fontSize = 14.sp,
+                        text = "🟠  Patreon — Gladiator_Satan",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
+                    )
+                }
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(11.dp))
+                        .background(StatusAmber)
+                        .clickable { onOpenUrl(BUYMEACOFFEE_URL) }
+                        .padding(vertical = 11.dp, horizontal = 12.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "☕  Buy Me a Coffee — gladiator_satan",
+                        fontSize = 13.sp,
                         fontWeight = FontWeight.Bold,
                         color = Color.Black
                     )
                 }
             }
 
-            // Посилання на офіційний репозиторій GitHub
-            Box(
+            // 3. GitHub та Перевірка оновлень
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(14.dp))
-                    .background(StatusCyan)
-                    .clickable { onOpenUrl(GITHUB_REPO_URL) }
-                    .padding(vertical = 13.dp, horizontal = 16.dp),
+                    .background(OledPillBackground)
+                    .border(1.dp, StatusCyan.copy(alpha = 0.55f), RoundedCornerShape(14.dp))
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    text = if (isUa) "🐙 GITHUB ТА ОНОВЛЕННЯ (v$CURRENT_APP_VERSION)" else "🐙 GITHUB & UPDATES (v$CURRENT_APP_VERSION)",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = StatusCyan,
+                    fontFamily = FontFamily.Monospace,
+                    textAlign = TextAlign.Center
+                )
+
+                Text(
+                    text = statusText,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = if (hasUpdate) StatusEmerald else TextPrimary,
+                    textAlign = TextAlign.Center
+                )
+
+                if (hasUpdate) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(11.dp))
+                            .background(StatusEmerald)
+                            .clickable { onOpenUrl(releaseUrl) }
+                            .padding(vertical = 11.dp, horizontal = 12.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = if (isUa) "⬇️ Завантажити оновлення ($latestVersion)" else "⬇️ Download Update ($latestVersion)",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.Black
+                        )
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(StatusCyan)
+                            .clickable { onOpenUrl(GITHUB_REPO_URL) }
+                            .padding(vertical = 10.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = "🌐 GitHub Repo",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.Black
+                        )
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(OledCard)
+                            .border(1.dp, StatusCyan.copy(alpha = 0.6f), RoundedCornerShape(10.dp))
+                            .clickable(enabled = !checking) { triggerCheck(isUa) }
+                            .padding(vertical = 10.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = if (isUa) "↻ Перевірити" else "↻ Check Updates",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = StatusCyan
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(2.dp))
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(OledPillBackground)
+                    .border(1.dp, OledBorder, RoundedCornerShape(12.dp))
+                    .clickable { onDismiss() }
+                    .padding(vertical = 11.dp),
                 contentAlignment = Alignment.Center
             ) {
                 Text(
-                    text = "🌐 Відкрити GitHub репозиторій EyeCam",
+                    text = if (isUa) "Закрити меню" else "Close Menu",
                     fontSize = 13.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.Black
+                    fontWeight = FontWeight.SemiBold,
+                    color = TextPrimary
                 )
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(OledPillBackground)
-                        .border(1.dp, OledBorder, RoundedCornerShape(12.dp))
-                        .clickable(enabled = !checking) { triggerCheck() }
-                        .padding(vertical = 10.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = "↻ Перевірити ще раз",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = StatusCyan
-                    )
-                }
-
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(OledPillBackground)
-                        .border(1.dp, OledBorder, RoundedCornerShape(12.dp))
-                        .clickable { onDismiss() }
-                        .padding(vertical = 10.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = "Закрити",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = TextPrimary
-                    )
-                }
             }
         }
     }
@@ -463,7 +493,7 @@ private data class UpdateCheckResult(
     val message: String
 )
 
-private suspend fun checkGitHubLatestRelease(): UpdateCheckResult = withContext(Dispatchers.IO) {
+private suspend fun checkGitHubLatestRelease(isUa: Boolean): UpdateCheckResult = withContext(Dispatchers.IO) {
     try {
         val conn = (URL(GITHUB_API_LATEST_URL).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
@@ -480,9 +510,9 @@ private suspend fun checkGitHubLatestRelease(): UpdateCheckResult = withContext(
             val url = json.optString("html_url", GITHUB_RELEASES_URL)
             val newer = isRemoteVersionNewer(CURRENT_APP_VERSION, tag)
             val msg = if (newer) {
-                "🚀 Доступна нова версія $tag на GitHub Releases!"
+                if (isUa) "🚀 Доступна нова версія $tag на GitHub Releases!" else "🚀 New version $tag is available on GitHub Releases!"
             } else {
-                "✓ У вас встановлена найновіша версія (v$CURRENT_APP_VERSION)"
+                if (isUa) "✓ У вас встановлена найновіша версія (v$CURRENT_APP_VERSION)" else "✓ You are running the latest version (v$CURRENT_APP_VERSION)"
             }
             UpdateCheckResult(newer, tag, url, msg)
         } else {
@@ -490,7 +520,7 @@ private suspend fun checkGitHubLatestRelease(): UpdateCheckResult = withContext(
                 false,
                 "v$CURRENT_APP_VERSION",
                 GITHUB_RELEASES_URL,
-                "Не вдалося отримати дані релізу (HTTP $code). Перевірте сторінку Releases."
+                if (isUa) "Не вдалося отримати дані релізу (HTTP $code)." else "Could not fetch release info (HTTP $code)."
             )
         }
     } catch (e: Exception) {
@@ -498,7 +528,7 @@ private suspend fun checkGitHubLatestRelease(): UpdateCheckResult = withContext(
             false,
             "v$CURRENT_APP_VERSION",
             GITHUB_RELEASES_URL,
-            "Немає з'єднання з GitHub API. Ви можете відкрити сторінку релізів вручну."
+            if (isUa) "Немає з'єднання з GitHub API." else "Could not reach GitHub API."
         )
     }
 }

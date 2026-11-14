@@ -12,6 +12,7 @@ import android.util.Log
 import android.view.Surface
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.eyecam.model.AppLanguage
 import com.eyecam.model.CameraSensorInfo
 import com.eyecam.model.StreamUiState
 import com.eyecam.service.CameraStreamService
@@ -219,6 +220,24 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     fun clearCubeLut() {
         onUserInteraction()
         streamService?.clearCubeLut()
+    }
+
+    fun setLanguage(lang: AppLanguage) {
+        onUserInteraction()
+        streamService?.setLanguage(lang)
+    }
+
+    fun unbindAndStopService() {
+        cancelInactivityTimer()
+        if (isBound) {
+            try {
+                context.unbindService(serviceConnection)
+            } catch (_: Exception) {}
+            isBound = false
+        }
+        try {
+            context.stopService(Intent(context, CameraStreamService::class.java))
+        } catch (_: Exception) {}
     }
 
     fun triggerAutoFocus() {

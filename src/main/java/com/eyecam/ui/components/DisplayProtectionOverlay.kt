@@ -34,6 +34,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.eyecam.model.AppLanguage
 import com.eyecam.model.StreamUiState
 import com.eyecam.ui.theme.OledPureBlack
 import com.eyecam.ui.theme.StatusEmerald
@@ -150,7 +151,11 @@ fun DisplayProtectionOverlay(
                         modifier = Modifier.size(12.dp)
                     )
                     Text(
-                        text = "Двічі торкніться екрана для виходу",
+                        text = if (uiState.language == AppLanguage.UA) {
+                            "Двічі торкніться екрана для виходу"
+                        } else {
+                            "Double-tap anywhere to wake screen"
+                        },
                         color = Color(0xFF2C2C2C),
                         fontSize = 11.sp
                     )

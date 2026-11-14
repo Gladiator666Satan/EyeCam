@@ -68,6 +68,13 @@ class MainActivity : ComponentActivity() {
             EyeCamTheme {
                 val uiState by viewModel.uiState.collectAsState()
 
+                LaunchedEffect(uiState.shouldExitApp) {
+                    if (uiState.shouldExitApp) {
+                        viewModel.unbindAndStopService()
+                        finishAndRemoveTask()
+                    }
+                }
+
                 LaunchedEffect(uiState.isDisplayProtectionActive) {
                     applyDisplayBrightness(uiState.isDisplayProtectionActive)
                 }

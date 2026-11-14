@@ -337,9 +337,16 @@ class CameraController(private val context: Context) {
         try {
             for (camId in cameraManager.cameraIdList) {
                 val chars = cameraManager.getCameraCharacteristics(camId)
+                val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0)
+                val isBackwardCompatible = caps.contains(
+                    CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_BACKWARD_COMPATIBLE
+                )
+                // Ігноруємо допоміжні сенсори глибини/боке/ІЧ, які не підтримують повноцінний відеопотік 720p+
+                if (!isBackwardCompatible || !supportsOutputSize(chars, 1280, 720)) {
+                    continue
+                }
                 val facing = chars.get(CameraCharacteristics.LENS_FACING)
                     ?: CameraCharacteristics.LENS_FACING_BACK
-                val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0)
                 val isLogical = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
                     caps.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA)
                 val physIds: Set<String> = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
@@ -420,6 +427,13 @@ class CameraController(private val context: Context) {
                     physicalSubCameras[physId] = camId
                     try {
                         val pChars = cameraManager.getCameraCharacteristics(physId)
+                        val pCaps = pChars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0)
+                        val pCompatible = pCaps.contains(
+                            CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_BACKWARD_COMPATIBLE
+                        )
+                        if (!pCompatible && !supportsOutputSize(pChars, 1280, 720)) {
+                            continue
+                        }
                         val pType = CameraUtils.classifySensor(pChars)
                         val pFocal = pChars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
                             ?: floatArrayOf(4.0f)
@@ -494,11 +508,20 @@ class CameraController(private val context: Context) {
     private fun buildCameraModules(
         rearCandidates: List<Any>
     ) {
-        // Check logical zoom range of primary rear camera
         var rearLogicalMinZ = 1.0f
         var rearLogicalMaxZ = 4.0f
+        var primaryRearIsLogical = false
+        var primaryRearPhysCount = 0
         try {
             val rChars = cameraManager.getCameraCharacteristics(rearLogicalCameraId)
+            val rCaps = rChars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0)
+            primaryRearIsLogical = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
+                rCaps.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA)
+            primaryRearPhysCount = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                rChars.physicalCameraIds.size
+            } else {
+                0
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 rChars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.let {
                     rearLogicalMinZ = it.lower
@@ -514,135 +537,152 @@ class CameraController(private val context: Context) {
             it.lensFacing == CameraCharacteristics.LENS_FACING_BACK && (!it.isLogical || it.physicalCameraIds.isEmpty())
         }
 
-        val uwSensor = rearSensorInfos
-            .filter { it.sensorType == SensorType.ULTRA_WIDE }
-            .minByOrNull { it.focalLengths.firstOrNull() ?: 2.0f }
-
         val mainSensor = rearSensorInfos
             .filter { it.sensorType == SensorType.WIDE }
             .minByOrNull { abs((it.focalLengths.firstOrNull() ?: 4.5f) - 4.5f) }
             ?: rearSensorInfos.firstOrNull { it.id == rearLogicalCameraId }
+            ?: rearSensorInfos.firstOrNull()
+
+        val mainId = mainSensor?.id ?: rearLogicalCameraId
+        val mainFocal = mainSensor?.focalLengths?.firstOrNull() ?: 4.3f
+
+        // Сенсор вважається окремим додатковим модулем лише якщо це інший фізичний ID та інша фокусна відстань
+        val uwSensor = rearSensorInfos
+            .filter {
+                it.id != mainId &&
+                    it.id != rearLogicalCameraId &&
+                    (it.sensorType == SensorType.ULTRA_WIDE || (it.focalLengths.firstOrNull() ?: 4.0f) < 2.6f)
+            }
+            .minByOrNull { it.focalLengths.firstOrNull() ?: 2.0f }
 
         val teleSensors = rearSensorInfos
-            .filter { it.sensorType == SensorType.TELEPHOTO }
+            .filter {
+                it.id != mainId &&
+                    it.id != uwSensor?.id &&
+                    it.id != rearLogicalCameraId &&
+                    (it.sensorType == SensorType.TELEPHOTO || (it.focalLengths.firstOrNull() ?: 4.0f) > mainFocal * 1.45f)
+            }
+            .distinctBy { ((it.focalLengths.firstOrNull() ?: 6.0f) * 2f).roundToInt() }
             .sortedBy { it.focalLengths.firstOrNull() ?: 6.0f }
 
-        val macroSensor = rearSensorInfos
-            .firstOrNull { it.sensorType == SensorType.MACRO && it.id != uwSensor?.id && it.id != mainSensor?.id }
+        val isMultiRearDevice = primaryRearIsLogical ||
+            primaryRearPhysCount >= 2 ||
+            rearLogicalMinZ <= 0.85f ||
+            uwSensor != null ||
+            teleSensors.isNotEmpty()
+
+        val hasUwModule = isMultiRearDevice && (uwSensor != null || rearLogicalMinZ <= 0.85f)
+        val hasTeleModule = isMultiRearDevice && (
+            teleSensors.isNotEmpty() ||
+                (rearLogicalMinZ <= 0.85f && rearLogicalMaxZ >= 8.0f) ||
+                (primaryRearIsLogical && primaryRearPhysCount >= 3 && rearLogicalMaxZ >= 6.0f)
+            )
+        val hasSecondTeleModule = isMultiRearDevice && (
+            teleSensors.size >= 2 ||
+                (rearLogicalMinZ <= 0.85f && rearLogicalMaxZ >= 10.0f) ||
+                (primaryRearIsLogical && primaryRearPhysCount >= 4 && rearLogicalMaxZ >= 10.0f)
+            )
 
         val modules = ArrayList<CameraModuleInfo>()
 
-        // 1. Ultra-Wide (0.5x) — only added if physical/standalone UW exists OR logical zoom < 0.85x
-        if (uwSensor != null || rearLogicalMinZ <= 0.85f) {
+        // 1. Ultra-Wide (0.5x) — додається лише за реальної наявності надширококутного модуля
+        if (hasUwModule) {
             val parentLog = uwSensor?.let { physicalSubCameras[it.id] }
-            val logId = parentLog ?: uwSensor?.id ?: rearLogicalCameraId
-            val physId = if (parentLog != null) uwSensor.id else null
+            val logId = if (parentLog != null || uwSensor == null || rearLogicalMinZ <= 0.85f) {
+                rearLogicalCameraId
+            } else {
+                uwSensor.id
+            }
             modules.add(
                 CameraModuleInfo(
                     key = "uw",
                     label = "0.5x UW",
                     shortLabel = "0.5x",
                     logicalCameraId = logId,
-                    physicalCameraId = physId,
+                    physicalCameraId = uwSensor?.id,
                     sensorType = SensorType.ULTRA_WIDE,
                     isFront = false,
                     baseOpticalZoom = 0.5f,
-                    maxIntraZoom = 3.0f,
-                    logicalBandMin = rearLogicalMinZ.coerceAtMost(0.6f),
-                    logicalBandMax = 0.96f
+                    maxIntraZoom = 2.5f,
+                    logicalBandMin = rearLogicalMinZ.coerceIn(0.5f, 0.65f),
+                    logicalBandMax = 0.95f
                 )
             )
         }
 
-        // 2. Main Wide (1x) — always present on rear camera
+        // 2. Main Wide (1x) — основна тилова камера
+        val firstTele = teleSensors.firstOrNull()
+        val firstTeleDisplayRatio = if (firstTele != null) {
+            val teleFocal = firstTele.focalLengths.firstOrNull() ?: 9.0f
+            val optRatio = (teleFocal / mainFocal).coerceIn(1.8f, 4.0f)
+            if (optRatio >= 2.5f) 3 else 2
+        } else {
+            3
+        }
         run {
             val parentLog = mainSensor?.let { physicalSubCameras[it.id] }
-            val logId = parentLog ?: mainSensor?.id ?: rearLogicalCameraId
-            val physId = if (parentLog != null) mainSensor.id else null
-            val hasTele = teleSensors.isNotEmpty()
+            val logId = parentLog ?: rearLogicalCameraId
+            val maxBandForMain = if (hasTeleModule) {
+                (firstTeleDisplayRatio.toFloat() - 0.08f).coerceAtLeast(1.92f)
+            } else {
+                rearLogicalMaxZ.coerceIn(2.0f, 8.0f)
+            }
             modules.add(
                 CameraModuleInfo(
                     key = "main",
                     label = "1x Main",
                     shortLabel = "1x",
                     logicalCameraId = logId,
-                    physicalCameraId = physId,
+                    physicalCameraId = mainSensor?.id,
                     sensorType = SensorType.WIDE,
                     isFront = false,
                     baseOpticalZoom = 1.0f,
                     maxIntraZoom = if (isLowEndDevice) 4.0f else 6.0f,
                     logicalBandMin = 1.0f,
-                    logicalBandMax = if (hasTele) 1.95f else rearLogicalMaxZ.coerceIn(2.0f, 8.0f)
+                    logicalBandMax = maxBandForMain
                 )
             )
         }
 
-        // 3. Primary Telephoto (2x / 3x) — only if hardware telephoto sensor exists
-        val firstTele = teleSensors.firstOrNull()
-        if (firstTele != null) {
-            val parentLog = physicalSubCameras[firstTele.id]
-            val logId = parentLog ?: firstTele.id
-            val physId = if (parentLog != null) firstTele.id else null
-            val mainFocal = mainSensor?.focalLengths?.firstOrNull() ?: 4.3f
-            val teleFocal = firstTele.focalLengths.firstOrNull() ?: 9.0f
-            val optRatio = (teleFocal / mainFocal).coerceIn(1.8f, 4.0f)
-            val displayRatio = if (optRatio >= 2.6f) 3 else 2
-            val hasSecondTele = teleSensors.size >= 2
+        // 3. Primary Telephoto (2x / 3x) — лише якщо у смартфоні фізично є телефото-модуль
+        if (hasTeleModule) {
+            val parentLog = firstTele?.let { physicalSubCameras[it.id] }
+            val logId = if (parentLog != null || firstTele == null) rearLogicalCameraId else firstTele.id
             modules.add(
                 CameraModuleInfo(
                     key = "tele",
-                    label = "${displayRatio}x Tele",
-                    shortLabel = "${displayRatio}x",
+                    label = "${firstTeleDisplayRatio}x Tele",
+                    shortLabel = "${firstTeleDisplayRatio}x",
                     logicalCameraId = logId,
-                    physicalCameraId = physId,
+                    physicalCameraId = firstTele?.id,
                     sensorType = SensorType.TELEPHOTO,
                     isFront = false,
-                    baseOpticalZoom = displayRatio.toFloat(),
+                    baseOpticalZoom = firstTeleDisplayRatio.toFloat(),
                     maxIntraZoom = 6.0f,
-                    logicalBandMin = displayRatio.toFloat(),
-                    logicalBandMax = if (hasSecondTele) 4.9f else rearLogicalMaxZ.coerceAtLeast(displayRatio * 3f)
+                    logicalBandMin = firstTeleDisplayRatio.toFloat(),
+                    logicalBandMax = if (hasSecondTeleModule) 4.92f else rearLogicalMaxZ.coerceIn(6.0f, 12.0f)
                 )
             )
         }
 
-        // 4. Secondary Super-Telephoto (5x/10x) OR Dedicated Macro
+        // 4. Secondary Super-Telephoto (5x) — лише на флагманах із перископом (напр. S26 Ultra)
         val secondTele = teleSensors.getOrNull(1)
-        if (secondTele != null) {
-            val parentLog = physicalSubCameras[secondTele.id]
-            val logId = parentLog ?: secondTele.id
-            val physId = if (parentLog != null) secondTele.id else null
+        if (hasSecondTeleModule) {
+            val parentLog = secondTele?.let { physicalSubCameras[it.id] }
+            val logId = if (parentLog != null || secondTele == null) rearLogicalCameraId else secondTele.id
             modules.add(
                 CameraModuleInfo(
                     key = "tele5x",
                     label = "5x Tele",
                     shortLabel = "5x",
                     logicalCameraId = logId,
-                    physicalCameraId = physId,
+                    physicalCameraId = secondTele?.id,
                     sensorType = SensorType.TELEPHOTO,
                     isFront = false,
                     baseOpticalZoom = 5.0f,
                     maxIntraZoom = 8.0f,
                     logicalBandMin = 5.0f,
-                    logicalBandMax = rearLogicalMaxZ.coerceAtLeast(10.0f)
-                )
-            )
-        } else if (macroSensor != null) {
-            val parentLog = physicalSubCameras[macroSensor.id]
-            val logId = parentLog ?: macroSensor.id
-            val physId = if (parentLog != null) macroSensor.id else null
-            modules.add(
-                CameraModuleInfo(
-                    key = "macro",
-                    label = "Macro",
-                    shortLabel = "MC",
-                    logicalCameraId = logId,
-                    physicalCameraId = physId,
-                    sensorType = SensorType.MACRO,
-                    isFront = false,
-                    baseOpticalZoom = 1.0f,
-                    maxIntraZoom = 3.0f,
-                    logicalBandMin = 1.0f,
-                    logicalBandMax = 3.0f
+                    logicalBandMax = rearLogicalMaxZ.coerceIn(10.0f, 20.0f)
                 )
             )
         }
@@ -813,9 +853,7 @@ class CameraController(private val context: Context) {
             return
         }
 
-        val changed = activeModuleKey != matched.key ||
-            activeCameraId != matched.logicalCameraId ||
-            selectedPhysicalCameraId != matched.physicalCameraId ||
+        val needRebind = activeCameraId != matched.logicalCameraId ||
             isFrontCameraActive != matched.isFront ||
             boundCamera == null
 
@@ -836,10 +874,11 @@ class CameraController(private val context: Context) {
 
         runOnMain {
             if (cameraOpenRequested) {
-                if (changed) {
+                if (needRebind) {
                     bindOrRebindCamera()
                 } else {
                     applyIntraModuleZoomInternal(1.0f)
+                    applyCurrentCameraControls()
                 }
             }
             onStateChanged?.invoke()
@@ -1230,34 +1269,27 @@ class CameraController(private val context: Context) {
     )
 
     private fun buildBindAttempts(): List<BindAttempt> {
-        val targetId = selectedPhysicalCameraId ?: activeCameraId
-        val preferredFps = selectBestFpsRange(targetId, streamFps)
+        val preferredFps = selectBestFpsRange(activeCameraId, streamFps)
         val safe30Fps = Range(15, 30)
 
         val attempts = ArrayList<BindAttempt>()
 
-        // 1. Exact CameraX selector (including physical ID if requested)
-        val primarySelector = buildCameraSelector(activeCameraId, selectedPhysicalCameraId)
-        attempts.add(BindAttempt(primarySelector, preferredFps, selectedPhysicalCameraId))
+        // 1. Bind logical/top-level camera ID directly without setPhysicalCameraId
+        // (Samsung One UI and Xiaomi MIUI HALs stall createCaptureSession if setPhysicalCameraId is pinned on Preview)
+        val logicalSelector = buildCameraSelector(activeCameraId, null)
+        attempts.add(BindAttempt(logicalSelector, preferredFps, null))
         if (preferredFps.upper > 30) {
-            attempts.add(BindAttempt(primarySelector, Range(30, 30), selectedPhysicalCameraId))
-            attempts.add(BindAttempt(primarySelector, safe30Fps, selectedPhysicalCameraId))
-        }
-
-        // 2. Fallback to parent logical camera without physical pinning (if OEM HAL rejects physical pin)
-        if (selectedPhysicalCameraId != null) {
-            val logicalSelector = buildCameraSelector(activeCameraId, null)
-            attempts.add(BindAttempt(logicalSelector, preferredFps, null))
             attempts.add(BindAttempt(logicalSelector, Range(30, 30), null))
             attempts.add(BindAttempt(logicalSelector, safe30Fps, null))
         }
 
-        // 3. Fallback to standard CameraSelector lens facing
+        // 2. Fallback to standard CameraSelector lens facing
         val fallbackSelector = if (isFrontCameraActive) {
             CameraSelector.DEFAULT_FRONT_CAMERA
         } else {
             CameraSelector.DEFAULT_BACK_CAMERA
         }
+        attempts.add(BindAttempt(fallbackSelector, preferredFps, null))
         attempts.add(BindAttempt(fallbackSelector, Range(30, 30), null))
         attempts.add(BindAttempt(fallbackSelector, safe30Fps, null))
         return attempts

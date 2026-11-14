@@ -5,6 +5,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -23,6 +24,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
 import com.eyecam.R
 import com.eyecam.camera.CameraController
+import com.eyecam.model.AppLanguage
 import com.eyecam.model.CameraSensorInfo
 import com.eyecam.model.ConnectionType
 import com.eyecam.model.StreamUiState
@@ -65,6 +67,9 @@ class CameraStreamService : LifecycleService() {
     private var currentDisplayRotation: Int = Surface.ROTATION_0
     private var isPcConnected = false
     private var isPcViaUsbAdb = false
+    @Volatile
+    private var stoppedManuallyByUser = false
+    private var receiverRegistered = false
 
     @Volatile
     private var cachedBatteryPct: Float = 100f
@@ -74,14 +79,31 @@ class CameraStreamService : LifecycleService() {
     private val _uiState = MutableStateFlow(StreamUiState())
     val uiState: StateFlow<StreamUiState> = _uiState.asStateFlow()
 
+    private val notificationActionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                ACTION_STOP_STREAM, ACTION_EXIT_APP -> {
+                    Log.i(TAG, "Notification Stop/Exit action received: ${intent.action}")
+                    stopStreamingAndExitIfBackground(fromNotification = true)
+                }
+                ACTION_TOGGLE_MUTE -> {
+                    toggleMicrophoneMute()
+                }
+            }
+        }
+    }
+
     companion object {
         private const val TAG = "CameraStreamService"
         private const val NOTIFICATION_CHANNEL_ID = "eyecam_stream_channel"
         private const val NOTIFICATION_CHANNEL_NAME = "EyeCam Streaming Service"
         private const val NOTIFICATION_ID = 1001
+        private const val PREFS_NAME = "eyecam_prefs"
+        private const val KEY_APP_LANG = "app_lang"
 
         const val ACTION_START_STREAM = "com.eyecam.action.START_STREAM"
         const val ACTION_STOP_STREAM = "com.eyecam.action.STOP_STREAM"
+        const val ACTION_EXIT_APP = "com.eyecam.action.EXIT_APP"
         const val ACTION_TOGGLE_MUTE = "com.eyecam.action.TOGGLE_MUTE"
         const val ACTION_SWITCH_SENSOR = "com.eyecam.action.SWITCH_SENSOR"
         const val EXTRA_SENSOR_ID = "extra_sensor_id"
@@ -94,6 +116,28 @@ class CameraStreamService : LifecycleService() {
     override fun onCreate() {
         super.onCreate()
         Log.i(TAG, "Ініціалізація CameraStreamService...")
+
+        // Default language on first install is English ("en"), persisted in SharedPreferences
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val savedLang = AppLanguage.fromCode(prefs.getString(KEY_APP_LANG, "en"))
+        _uiState.update { it.copy(language = savedLang, shouldExitApp = false) }
+
+        try {
+            val filter = IntentFilter().apply {
+                addAction(ACTION_STOP_STREAM)
+                addAction(ACTION_EXIT_APP)
+                addAction(ACTION_TOGGLE_MUTE)
+            }
+            ContextCompat.registerReceiver(
+                this,
+                notificationActionReceiver,
+                filter,
+                ContextCompat.RECEIVER_NOT_EXPORTED
+            )
+            receiverRegistered = true
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed registering notificationActionReceiver: ${e.message}")
+        }
 
         powerLockManager = PowerLockManager(this)
         thermalManager = ThermalManager(this) { thermalState, adjustedFps, adjustedBitrateKbps, reason ->
@@ -133,7 +177,7 @@ class CameraStreamService : LifecycleService() {
             onClientConnectionChanged = { connected, viaUsb, remoteIp ->
                 isPcConnected = connected
                 isPcViaUsbAdb = viaUsb
-                if (connected && !_uiState.value.isStreaming && cameraController.hasCameraPermission()) {
+                if (connected && !_uiState.value.isStreaming && !stoppedManuallyByUser && cameraController.hasCameraPermission()) {
                     serviceScope.launch(Dispatchers.Main) {
                         startStreaming()
                     }
@@ -303,6 +347,18 @@ class CameraStreamService : LifecycleService() {
         }
     }
 
+    fun setLanguage(lang: AppLanguage) {
+        try {
+            getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_APP_LANG, lang.code)
+                .apply()
+        } catch (_: Exception) {}
+        _uiState.update { it.copy(language = lang) }
+        refreshConnectionStatus()
+        updateNotification()
+    }
+
     fun clearCubeLut() {
         cameraController.clearCubeLut()
     }
@@ -321,23 +377,24 @@ class CameraStreamService : LifecycleService() {
         cachedBatteryPct = battPct
         cachedBatteryTempC = battTemp
         val localIp = getLocalWifiIpAddress()
+        val isUa = _uiState.value.language == AppLanguage.UA
 
         val (connType, connDetails) = when {
             isPcConnected && isPcViaUsbAdb -> {
-                ConnectionType.USB to "USB ADB • ПК ПІДКЛЮЧЕНО"
+                ConnectionType.USB to if (isUa) "USB • ПК ПІДКЛЮЧЕНО" else "USB • PC CONNECTED"
             }
             isPcConnected -> {
-                ConnectionType.WIFI to "WI-FI • ПК ПІДКЛЮЧЕНО"
+                ConnectionType.WIFI to if (isUa) "WI-FI • ПК ПІДКЛЮЧЕНО" else "WI-FI • PC CONNECTED"
             }
             usbConnected -> {
-                val ipSuffix = if (localIp.isNotEmpty()) " • IP: $localIp" else ""
-                ConnectionType.USB to "USB ПІДКЛЮЧЕНО$ipSuffix"
+                val ipSuffix = if (localIp.isNotEmpty()) " • $localIp" else ""
+                ConnectionType.USB to (if (isUa) "USB ГОТОВИЙ$ipSuffix" else "USB READY$ipSuffix")
             }
             localIp.isNotEmpty() -> {
                 ConnectionType.WIFI to "WI-FI: $localIp"
             }
             else -> {
-                ConnectionType.NONE to "ОФЛАЙН (Підключіть USB або Wi-Fi)"
+                ConnectionType.NONE to if (isUa) "ОФЛАЙН" else "OFFLINE"
             }
         }
 
@@ -410,15 +467,23 @@ class CameraStreamService : LifecycleService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
         when (intent?.action) {
-            ACTION_START_STREAM -> startStreaming()
-            ACTION_STOP_STREAM -> stopStreaming()
+            ACTION_START_STREAM -> {
+                stoppedManuallyByUser = false
+                startStreaming()
+            }
+            ACTION_STOP_STREAM -> {
+                stopStreamingAndExitIfBackground(fromNotification = false)
+            }
+            ACTION_EXIT_APP -> {
+                stopStreamingAndExitIfBackground(fromNotification = true)
+            }
             ACTION_TOGGLE_MUTE -> toggleMicrophoneMute()
             ACTION_SWITCH_SENSOR -> {
                 val sensorId = intent.getStringExtra(EXTRA_SENSOR_ID)
                 sensorId?.let { id -> selectCameraModule(id) }
             }
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     override fun onBind(intent: Intent): IBinder? {
@@ -428,6 +493,7 @@ class CameraStreamService : LifecycleService() {
 
     fun startStreaming() {
         if (_uiState.value.isStreaming) return
+        stoppedManuallyByUser = false
 
         val hasCamPerm = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
         if (!hasCamPerm) {
@@ -472,6 +538,7 @@ class CameraStreamService : LifecycleService() {
 
         _uiState.update { current ->
             current.copy(
+                shouldExitApp = false,
                 isStreaming = true,
                 telemetry = current.telemetry.copy(
                     fps = cameraController.streamFps,
@@ -486,14 +553,24 @@ class CameraStreamService : LifecycleService() {
     }
 
     fun stopStreaming() {
-        Log.i(TAG, "Зупинка трансляції EyeCam...")
+        stopStreamingAndExitIfBackground(fromNotification = false)
+    }
+
+    fun stopStreamingAndExitIfBackground(fromNotification: Boolean) {
+        Log.i(TAG, "Зупинка трансляції EyeCam (fromNotification=$fromNotification, hasPreview=${currentPreviewSurface != null})...")
+        stoppedManuallyByUser = true
 
         cameraController.isNetworkStreamActive = false
+        val inBackground = currentPreviewSurface == null
+        if (fromNotification || inBackground) {
+            cameraController.closeCamera()
+        }
         thermalManager.stopMonitoring()
         powerLockManager.releaseAll()
 
         _uiState.update { current ->
             current.copy(
+                shouldExitApp = fromNotification || inBackground,
                 isStreaming = false,
                 isDisplayProtectionActive = false,
                 telemetry = current.telemetry.copy(fps = 0, bitrateKbps = 0)
@@ -503,6 +580,16 @@ class CameraStreamService : LifecycleService() {
         try {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } catch (_: Exception) {}
+        try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.cancel(NOTIFICATION_ID)
+        } catch (_: Exception) {}
+
+        if (fromNotification || inBackground) {
+            try {
+                stopSelf()
+            } catch (_: Exception) {}
+        }
     }
 
     fun toggleMicrophoneMute() {
@@ -585,35 +672,66 @@ class CameraStreamService : LifecycleService() {
     }
 
     private fun buildNotification(): Notification {
-        val stopIntent = Intent(this, CameraStreamService::class.java).apply {
-            action = ACTION_STOP_STREAM
+        val isUa = _uiState.value.language == AppLanguage.UA
+
+        // Використовуємо BroadcastReceiver всередині живого ForegroundService,
+        // щоб кнопка «Завершити / Stop» спрацьовувала миттєво навіть коли додаток згорнуто у фон!
+        val stopBroadcastIntent = Intent(ACTION_EXIT_APP).apply {
+            setPackage(packageName)
         }
-        val stopPendingIntent = PendingIntent.getService(
-            this, 1, stopIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        val stopPendingIntent = PendingIntent.getBroadcast(
+            this,
+            1002,
+            stopBroadcastIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val muteIntent = Intent(this, CameraStreamService::class.java).apply {
-            action = ACTION_TOGGLE_MUTE
+        val muteBroadcastIntent = Intent(ACTION_TOGGLE_MUTE).apply {
+            setPackage(packageName)
         }
-        val mutePendingIntent = PendingIntent.getService(
-            this, 2, muteIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        val mutePendingIntent = PendingIntent.getBroadcast(
+            this,
+            1003,
+            muteBroadcastIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val micStatus = if (_uiState.value.isMicMuted) "Мікрофон: ВИМКНЕНО" else "Мікрофон: АКТИВНИЙ"
+        val micStatus = if (_uiState.value.isMicMuted) {
+            if (isUa) "Мікрофон: ВИМК" else "Mic: MUTED"
+        } else {
+            if (isUa) "Мікрофон: УВІМК" else "Mic: ON"
+        }
         val modLabel = _uiState.value.activeModuleKey.uppercase()
-        val thermalName = _uiState.value.telemetry.thermalState.descriptionUa
+        val thermalName = if (isUa) {
+            _uiState.value.telemetry.thermalState.descriptionUa
+        } else {
+            _uiState.value.telemetry.thermalState.descriptionEn
+        }
+        val titleText = if (isUa) "EyeCam: Трансляція активна" else "EyeCam: Stream Active"
+        val bodyText = if (isUa) {
+            "Модуль: $modLabel (${_uiState.value.intraModuleZoom}x) | $micStatus | $thermalName"
+        } else {
+            "Lens: $modLabel (${_uiState.value.intraModuleZoom}x) | $micStatus | $thermalName"
+        }
+        val stopBtnText = if (isUa) "Завершити" else "Stop & Exit"
+        val muteBtnText = if (_uiState.value.isMicMuted) {
+            if (isUa) "Увімк. звук" else "Unmute"
+        } else {
+            if (isUa) "Вимк. звук" else "Mute"
+        }
 
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
-            .setContentTitle("EyeCam: Трансляція активна")
-            .setContentText("Модуль: $modLabel (${_uiState.value.intraModuleZoom}x) | $micStatus | $thermalName")
+            .setContentTitle(titleText)
+            .setContentText(bodyText)
             .setSmallIcon(R.drawable.ic_eyecam_logo)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setColor(Color.BLACK)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Зупинити", stopPendingIntent)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, stopBtnText, stopPendingIntent)
             .addAction(
                 if (_uiState.value.isMicMuted) android.R.drawable.stat_notify_call_mute else android.R.drawable.presence_audio_online,
-                if (_uiState.value.isMicMuted) "Увімкнути звук" else "Вимкнути звук",
+                muteBtnText,
                 mutePendingIntent
             )
             .setPriority(NotificationCompat.PRIORITY_LOW)
@@ -635,7 +753,7 @@ class CameraStreamService : LifecycleService() {
                 NOTIFICATION_CHANNEL_NAME,
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Постійне сповіщення активної відеотрансляції EyeCam"
+                description = "EyeCam Active Camera Stream Notification"
                 enableLights(false)
                 enableVibration(false)
                 setShowBadge(false)
@@ -648,6 +766,12 @@ class CameraStreamService : LifecycleService() {
     override fun onDestroy() {
         super.onDestroy()
         Log.i(TAG, "Знищення CameraStreamService та звільнення ресурсів")
+        if (receiverRegistered) {
+            try {
+                unregisterReceiver(notificationActionReceiver)
+            } catch (_: Exception) {}
+            receiverRegistered = false
+        }
         serviceJob.cancel()
         controlServer.stop()
         cameraController.release()

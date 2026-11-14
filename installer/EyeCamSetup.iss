@@ -28,8 +28,8 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\build\installer
 OutputBaseFilename=EyeCam-Setup-x64
-SetupIconFile=..\src\windows\gui\eyecam_pc.ico
-UninstallDisplayIcon={app}\eyecam_pc.ico
+SetupIconFile=..\src\windows\gui\eyecam_cyber.ico
+UninstallDisplayIcon={app}\eyecam_cyber.ico
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
@@ -49,14 +49,15 @@ Source: "..\build\bin\Release\EyeCamStudio.exe"; DestDir: "{app}"; Flags: ignore
 Source: "..\build\bin\Release\EyeCamFilter.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\build\bin\Release\windows_test.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\src\windows\gui\eyecam_pc.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\src\windows\gui\eyecam_cyber.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\build\adb\*"; DestDir: "{app}\adb"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\scripts\windows\*"; DestDir: "{app}\scripts"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\eyecam_pc.ico"; Comment: "Launch EyeCam Studio (4K Virtual Camera & USB/Wi-Fi Receiver)"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\eyecam_cyber.ico"; Comment: "Launch EyeCam Studio (4K Virtual Camera & USB/Wi-Fi Receiver)"
 Name: "{group}\Re-register Virtual Camera Driver"; Filename: "{sys}\regsvr32.exe"; Parameters: """{app}\{#MyFilterDllName}"""; Comment: "Register DirectShow Virtual Camera Filter"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\eyecam_pc.ico"; Tasks: desktopicon; Comment: "EyeCam Studio — Turn your smartphone into a 4K PC webcam"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\eyecam_cyber.ico"; Tasks: desktopicon; Comment: "EyeCam Studio — Turn your smartphone into a 4K PC webcam"
 
 [Run]
 ; 1. Automatically register DirectShow Virtual Camera Filter (EyeCamFilter.dll)
@@ -68,6 +69,9 @@ Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""E
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""EyeCam Studio TCP 8554"""; Flags: runhidden waituntilterminated; Tasks: firewall
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""EyeCam Studio TCP 8554"" dir=in action=allow protocol=TCP localport=8554"; Flags: runhidden waituntilterminated; Tasks: firewall
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""EyeCam Studio TCP 8554 Out"" dir=out action=allow protocol=TCP remoteport=8554"; Flags: runhidden waituntilterminated; Tasks: firewall
+
+; 3. Refresh Windows Explorer Shell Icon Cache so Desktop & Start Menu shortcuts immediately display Cyber Eye icon
+Filename: "{sys}\ie4uinit.exe"; Parameters: "-show"; Flags: runhidden waituntilterminated skipifdoesntexist
 
 ; 3. Pre-start ADB daemon for instant USB device detection
 Filename: "{app}\adb\adb.exe"; Parameters: "start-server"; StatusMsg: "Initializing USB ADB bridge..."; Flags: runhidden waituntilterminated skipifdoesntexist

@@ -345,6 +345,9 @@ private:
 };
 
 struct StudioState {
+    // Мова інтерфейсу (за замовчуванням English (EN) при першому встановленні, перемикається на UA)
+    bool isUkrainian = false;
+
     // Підключення та транспорт (Wi-Fi LAN або USB ADB)
     TransportTab transport = TransportTab::USB_ADB;
     std::string deviceIp = "192.168.1.105";
@@ -360,7 +363,7 @@ struct StudioState {
     bool usbDropdownOpen = false;
 
     // Профіль підключеного смартфона
-    std::wstring connectedPhoneName = L"Очікування підключення смартфона...";
+    std::wstring connectedPhoneName = L"Waiting for smartphone...";
     float phoneMinZoom = 1.0f;
     float phoneMaxZoom = 8.0f;
     bool phoneSupports4K = true;
@@ -1213,6 +1216,7 @@ public:
         COLORREF captionCol = RGB(11, 14, 20);
         DwmSetWindowAttribute(m_hwnd, DWMWA_CAPTION_COLOR, &captionCol, sizeof(captionCol));
 
+        m_state.isUkrainian = LoadSavedLanguageIsUa();
         m_state.isDriverRegistered = CheckDirectShowDriverRegistered();
 
         if (!m_state.isDriverRegistered) {
@@ -1336,6 +1340,35 @@ private:
         WSACleanup();
     }
 
+    static bool LoadSavedLanguageIsUa() {
+        HKEY hKey = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\EyeCamStudio", 0, KEY_READ, &hKey) == ERROR_SUCCESS && hKey) {
+            wchar_t val[16]{};
+            DWORD sz = sizeof(val);
+            DWORD type = 0;
+            bool isUa = false;
+            if (RegQueryValueExW(hKey, L"Language", nullptr, &type, reinterpret_cast<LPBYTE>(val), &sz) == ERROR_SUCCESS && type == REG_SZ) {
+                isUa = (wcscmp(val, L"ua") == 0 || wcscmp(val, L"uk") == 0);
+            }
+            RegCloseKey(hKey);
+            return isUa;
+        }
+        return false; // English (EN) default on first install
+    }
+
+    static void SaveLanguagePref(bool isUa) {
+        HKEY hKey = nullptr;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\EyeCamStudio", 0, nullptr, 0, KEY_WRITE, nullptr, &hKey, nullptr) == ERROR_SUCCESS && hKey) {
+            const wchar_t* val = isUa ? L"ua" : L"en";
+            RegSetValueExW(hKey, L"Language", 0, REG_SZ, reinterpret_cast<const BYTE*>(val), static_cast<DWORD>((wcslen(val) + 1) * sizeof(wchar_t)));
+            RegCloseKey(hKey);
+        }
+    }
+
+    const wchar_t* TR(const wchar_t* en, const wchar_t* ua) const {
+        return m_state.isUkrainian ? ua : en;
+    }
+
     static HICON LoadCustomStudioIcon(HINSTANCE hInstance) {
         wchar_t exePath[MAX_PATH]{};
         GetModuleFileNameW(nullptr, exePath, MAX_PATH);
@@ -1345,13 +1378,19 @@ private:
             dirPath = dirPath.substr(0, pos);
         }
 
-        std::wstring primaryIconPath = dirPath + L"\\eyecam_pc.ico";
+        std::wstring cyberIconPath = dirPath + L"\\eyecam_cyber.ico";
         HICON hIco = static_cast<HICON>(LoadImageW(
+            nullptr, cyberIconPath.c_str(), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE
+        ));
+        if (hIco) return hIco;
+
+        std::wstring primaryIconPath = dirPath + L"\\eyecam_pc.ico";
+        hIco = static_cast<HICON>(LoadImageW(
             nullptr, primaryIconPath.c_str(), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE
         ));
         if (hIco) return hIco;
 
-        std::wstring fallbackIconPath = dirPath + L"\\..\\..\\src\\windows\\gui\\eyecam_pc.ico";
+        std::wstring fallbackIconPath = dirPath + L"\\..\\..\\src\\windows\\gui\\eyecam_cyber.ico";
         hIco = static_cast<HICON>(LoadImageW(
             nullptr, fallbackIconPath.c_str(), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE
         ));
@@ -1375,7 +1414,7 @@ private:
         if (m_state.updateCheckInProgress.exchange(true)) return;
         {
             std::lock_guard<std::mutex> lock(m_frameMutex);
-            m_state.updateStatusText = L"Перевірка оновлень на GitHub Releases...";
+            m_state.updateStatusText = TR(L"Checking GitHub Releases for updates...", L"Перевірка оновлень на GitHub Releases...");
         }
         std::thread([this]() {
             std::string tag, htmlUrl;
@@ -1392,12 +1431,18 @@ private:
                     bool newer = IsVersionNewer(cleanTag, kEyeCamVersionStr);
                     m_state.updateAvailable = newer;
                     if (newer) {
-                        m_state.updateStatusText = L"🚀 Доступне нове оновлення: v" + m_state.latestGithubTag + L"!";
+                        m_state.updateStatusText = m_state.isUkrainian
+                            ? (L"🚀 Доступне нове оновлення: v" + m_state.latestGithubTag + L"!")
+                            : (L"🚀 New update available: v" + m_state.latestGithubTag + L"!");
                     } else {
-                        m_state.updateStatusText = L"✓ У вас встановлена найновіша версія (v" + std::wstring(kEyeCamVersionWide) + L")";
+                        m_state.updateStatusText = m_state.isUkrainian
+                            ? (L"✓ У вас встановлена найновіша версія (v" + std::wstring(kEyeCamVersionWide) + L")")
+                            : (L"✓ You are running the latest version (v" + std::wstring(kEyeCamVersionWide) + L")");
                     }
                 } else {
-                    m_state.updateStatusText = L"Не вдалося перевірити реліз (перевірте інтернет або відкрийте GitHub)";
+                    m_state.updateStatusText = m_state.isUkrainian
+                        ? L"Не вдалося перевірити реліз (перевірте інтернет або відкрийте GitHub)"
+                        : L"Could not check releases (check internet connection or open GitHub)";
                 }
             }
             m_state.updateCheckInProgress = false;
@@ -2463,14 +2508,16 @@ private:
         DrawRoundedCard(drvBadge, m_state.isDriverRegistered ? HexColor(0x092E20) : HexColor(0x332409),
                         m_state.isDriverRegistered ? COL_EMERALD : COL_AMBER, 16.0f);
         DrawTextStr(
-            m_state.isDriverRegistered ? L"● DirectShow Webcam: ACTIVE" : L"▲ DirectShow: НЕ ЗАРЕЄСТРОВАНО",
+            m_state.isDriverRegistered
+                ? L"● DirectShow Webcam: ACTIVE"
+                : TR(L"▲ DirectShow: NOT REGISTERED", L"▲ DirectShow: НЕ ЗАРЕЄСТРОВАНО"),
             drvBadge, m_pFontMono, m_state.isDriverRegistered ? COL_EMERALD : COL_AMBER,
             DWRITE_TEXT_ALIGNMENT_CENTER
         );
 
         // Кнопка «🐙 GitHub / Оновлення» у шапці
         bool hasUpd = m_state.updateAvailable.load();
-        m_rcBtnHeaderGithub = {drvBadge.left - 186.0f, pad + 11, drvBadge.left - 10.0f, pad + topBarH - 11};
+        m_rcBtnHeaderGithub = {drvBadge.left - 178.0f, pad + 11, drvBadge.left - 10.0f, pad + topBarH - 11};
         DrawRoundedCard(
             m_rcBtnHeaderGithub,
             hasUpd ? HexColor(0x0B2E26) : COL_BG_CARD,
@@ -2478,18 +2525,27 @@ private:
             10.0f
         );
         DrawTextStr(
-            hasUpd ? L"⬆ Оновлення GitHub!" : L"🐙 GitHub • Оновлення",
+            hasUpd ? TR(L"⬆ GitHub Update!", L"⬆ Оновлення GitHub!") : TR(L"🐙 GitHub • Updates", L"🐙 GitHub • Оновлення"),
             m_rcBtnHeaderGithub, m_pFontBody,
             hasUpd ? COL_EMERALD : COL_CYAN,
             DWRITE_TEXT_ALIGNMENT_CENTER
         );
 
         // Кнопка «❤️ Підтримати автора» у шапці
-        m_rcBtnHeaderSupport = {m_rcBtnHeaderGithub.left - 178.0f, pad + 11, m_rcBtnHeaderGithub.left - 10.0f, pad + topBarH - 11};
+        m_rcBtnHeaderSupport = {m_rcBtnHeaderGithub.left - 166.0f, pad + 11, m_rcBtnHeaderGithub.left - 10.0f, pad + topBarH - 11};
         DrawRoundedCard(m_rcBtnHeaderSupport, HexColor(0x2A121B), COL_PATREON, 10.0f);
         DrawTextStr(
-            L"❤️ Підтримати автора",
+            TR(L"❤️ Support Author", L"❤️ Підтримати автора"),
             m_rcBtnHeaderSupport, m_pFontBody, HexColor(0xFF8A92),
+            DWRITE_TEXT_ALIGNMENT_CENTER
+        );
+
+        // Кнопка перемикання мови (EN за замовчуванням / UA)
+        m_rcBtnHeaderLang = {m_rcBtnHeaderSupport.left - 96.0f, pad + 11, m_rcBtnHeaderSupport.left - 10.0f, pad + topBarH - 11};
+        DrawRoundedCard(m_rcBtnHeaderLang, HexColor(0x132436), COL_CYAN, 10.0f);
+        DrawTextStr(
+            m_state.isUkrainian ? L"🌐 Мова: UA" : L"🌐 Lang: EN",
+            m_rcBtnHeaderLang, m_pFontBody, COL_CYAN,
             DWRITE_TEXT_ALIGNMENT_CENTER
         );
 
@@ -2506,11 +2562,11 @@ private:
         float rx = leftPanel.right - 16;
         float cy = leftPanel.top + 16;
 
-        DrawTextStr(L"1. СПОСІБ ПІДКЛЮЧЕННЯ", {lx, cy, rx, cy + 24}, m_pFontSection, COL_TEXT_PRIMARY);
+        DrawTextStr(TR(L"1. CONNECTION TRANSPORT", L"1. СПОСІБ ПІДКЛЮЧЕННЯ"), {lx, cy, rx, cy + 24}, m_pFontSection, COL_TEXT_PRIMARY);
         cy += 30;
 
         float tabW = (rx - lx - 8.0f) * 0.5f;
-        const wchar_t* tabNames[2] = {L"Wi-Fi (LAN)", L"USB (Кабель)"};
+        const wchar_t* tabNames[2] = {L"Wi-Fi (LAN)", TR(L"USB (Cable)", L"USB (Кабель)")};
         for (int i = 0; i < 2; ++i) {
             m_rcTransportTabs[i] = {lx + i * (tabW + 8.0f), cy, lx + i * (tabW + 8.0f) + tabW, cy + 36.0f};
             bool active = (static_cast<int>(m_state.transport) == i);
@@ -2521,7 +2577,7 @@ private:
         cy += 48;
 
         if (m_state.transport == TransportTab::WIFI_LAN) {
-            DrawTextStr(L"IP-адреса смартфона (див. у додатку):", {lx, cy, rx, cy + 20}, m_pFontBody, COL_TEXT_SECOND);
+            DrawTextStr(TR(L"Smartphone IP address (see mobile app):", L"IP-адреса смартфона (див. у додатку):"), {lx, cy, rx, cy + 20}, m_pFontBody, COL_TEXT_SECOND);
             cy += 24;
             m_rcIpInput = {lx, cy, rx, cy + 38};
             m_rcUsbDropdown = {0, 0, 0, 0};
@@ -2533,17 +2589,17 @@ private:
             DrawTextStr(L"  " + ipW, m_rcIpInput, m_pFontMono, COL_TEXT_PRIMARY);
             cy += 46;
 
-            DrawTextStr(L"Порт синхронізації та відео (TCP): 8554", {lx, cy, rx, cy + 20}, m_pFontBody, COL_TEXT_DIM);
+            DrawTextStr(TR(L"Video & Control Port (TCP): 8554", L"Порт синхронізації та відео (TCP): 8554"), {lx, cy, rx, cy + 20}, m_pFontBody, COL_TEXT_DIM);
             cy += 30;
         } else {
             m_rcIpInput = {0, 0, 0, 0};
-            DrawTextStr(L"Виберіть смартфон, підключений по USB:", {lx, cy, rx, cy + 20}, m_pFontBody, COL_TEXT_SECOND);
+            DrawTextStr(TR(L"Select USB-connected smartphone:", L"Виберіть смартфон, підключений по USB:"), {lx, cy, rx, cy + 20}, m_pFontBody, COL_TEXT_SECOND);
             cy += 24;
 
             m_rcUsbDropdown = {lx, cy, rx, cy + 38};
             DrawRoundedCard(m_rcUsbDropdown, HexColor(0x0D1117), m_state.usbDropdownOpen ? COL_CYAN : COL_BORDER, 8.0f);
 
-            std::wstring selectedUsbLabel = L"  Пристроїв USB не виявлено";
+            std::wstring selectedUsbLabel = TR(L"  No USB devices detected", L"  Пристроїв USB не виявлено");
             {
                 std::lock_guard<std::mutex> lock(m_usbMutex);
                 if (!m_state.usbDevices.empty()) {
@@ -2558,7 +2614,7 @@ private:
 
             m_rcBtnRefreshUsb = {lx, cy, rx, cy + 32};
             DrawRoundedCard(m_rcBtnRefreshUsb, COL_BG_CARD, COL_BORDER, 8.0f);
-            DrawTextStr(L"↻  Оновити список USB-пристроїв", m_rcBtnRefreshUsb, m_pFontBody, COL_CYAN, DWRITE_TEXT_ALIGNMENT_CENTER);
+            DrawTextStr(TR(L"↻  Refresh USB Device List", L"↻  Оновити список USB-пристроїв"), m_rcBtnRefreshUsb, m_pFontBody, COL_CYAN, DWRITE_TEXT_ALIGNMENT_CENTER);
             cy += 40;
         }
 
@@ -2571,7 +2627,9 @@ private:
             10.0f
         );
         DrawTextStr(
-            m_state.isStreaming ? L"■  ЗУПИНИТИ ВІРТУАЛЬНУ КАМЕРУ" : L"▶  ЗАПУСТИТИ ТРАНСЛЯЦІЮ",
+            m_state.isStreaming
+                ? TR(L"■  STOP VIRTUAL CAMERA", L"■  ЗУПИНИТИ ВІРТУАЛЬНУ КАМЕРУ")
+                : TR(L"▶  START STREAMING", L"▶  ЗАПУСТИТИ ТРАНСЛЯЦІЮ"),
             m_rcBtnStartStop, m_pFontSection,
             m_state.isStreaming ? COL_CRIMSON : HexColor(0x06120C),
             DWRITE_TEXT_ALIGNMENT_CENTER
@@ -2579,16 +2637,16 @@ private:
         cy += 58;
 
         // Блок реєстрації системного драйвера DirectShow
-        DrawTextStr(L"2. СИСТЕМНИЙ ДРАЙВЕР КАМЕРИ", {lx, cy, rx, cy + 24}, m_pFontSection, COL_TEXT_PRIMARY);
+        DrawTextStr(TR(L"2. SYSTEM VIRTUAL CAMERA DRIVER", L"2. СИСТЕМНИЙ ДРАЙВЕР КАМЕРИ"), {lx, cy, rx, cy + 24}, m_pFontSection, COL_TEXT_PRIMARY);
         cy += 28;
 
         UiRect drvCard{lx, cy, rx, cy + 126};
         DrawRoundedCard(drvCard, COL_BG_CARD, COL_BORDER, 10.0f);
-        DrawTextStr(L"Камера: EyeCam Virtual Camera", {lx + 12, cy + 8, rx - 12, cy + 30}, m_pFontBody, COL_TEXT_PRIMARY);
+        DrawTextStr(TR(L"Device: EyeCam Virtual Camera", L"Камера: EyeCam Virtual Camera"), {lx + 12, cy + 8, rx - 12, cy + 30}, m_pFontBody, COL_TEXT_PRIMARY);
         DrawTextStr(
             m_state.isDriverRegistered
-                ? L"Статус: Зареєстровано в системі\nДоступна в OBS, Zoom, Discord, Teams"
-                : L"Статус: Потрібна реєстрація DLL\nНатисніть кнопку нижче (права Admin)",
+                ? TR(L"Status: Registered in Windows\nAvailable in OBS, Zoom, Discord, Teams", L"Статус: Зареєстровано в системі\nДоступна в OBS, Zoom, Discord, Teams")
+                : TR(L"Status: DLL Registration Required\nClick button below (Admin UAC)", L"Статус: Потрібна реєстрація DLL\nНатисніть кнопку нижче (права Admin)"),
             {lx + 12, cy + 32, rx - 12, cy + 76}, m_pFontBody,
             m_state.isDriverRegistered ? COL_EMERALD : COL_AMBER
         );
@@ -2596,7 +2654,9 @@ private:
         m_rcBtnRegisterDriver = {lx + 12, cy + 82, rx - 12, cy + 116};
         DrawRoundedCard(m_rcBtnRegisterDriver, COL_BG_PANEL, COL_CYAN, 8.0f);
         DrawTextStr(
-            m_state.isDriverRegistered ? L"↻ Перереєструвати драйвер (UAC)" : L"⚡ Зареєструвати камеру в системі",
+            m_state.isDriverRegistered
+                ? TR(L"↻ Re-register Driver (UAC)", L"↻ Перереєструвати драйвер (UAC)")
+                : TR(L"⚡ Register Virtual Camera", L"⚡ Зареєструвати камеру в системі"),
             m_rcBtnRegisterDriver, m_pFontBody, COL_CYAN, DWRITE_TEXT_ALIGNMENT_CENTER
         );
 
@@ -2609,7 +2669,7 @@ private:
 
             m_rcUsbItems.clear();
             if (count == 0) {
-                DrawTextStr(L"  Немає активних USB ADB пристроїв", dropBox, m_pFontBody, COL_TEXT_SECOND);
+                DrawTextStr(TR(L"  No active USB ADB devices", L"  Немає активних USB ADB пристроїв"), dropBox, m_pFontBody, COL_TEXT_SECOND);
             } else {
                 for (int i = 0; i < count; ++i) {
                     UiRect itemR{dropBox.left + 4, dropBox.top + i * 34.0f + 2, dropBox.right - 4, dropBox.top + (i + 1) * 34.0f - 2};
@@ -2661,24 +2721,28 @@ private:
             DrawCyberEyeLogo((videoRect.left + videoRect.right) * 0.5f - 24.0f, midY - 72.0f, 48.0f);
 
             if (!m_state.isStreaming) {
-                DrawTextStr(L"ТРАНСЛЯЦІЮ ПРИЗУПИНЕНО", {videoRect.left, midY - 12, videoRect.right, midY + 18},
+                DrawTextStr(TR(L"STREAM PAUSED", L"ТРАНСЛЯЦІЮ ПРИЗУПИНЕНО"), {videoRect.left, midY - 12, videoRect.right, midY + 18},
                             m_pFontTitle, COL_TEXT_DIM, DWRITE_TEXT_ALIGNMENT_CENTER);
             } else if (m_state.transport == TransportTab::USB_ADB) {
-                DrawTextStr(L"ОЧІКУВАННЯ ВІДЕОПОТОКУ ПО USB (ADB)...", {videoRect.left, midY - 14, videoRect.right, midY + 14},
+                DrawTextStr(TR(L"WAITING FOR VIDEO STREAM OVER USB (ADB)...", L"ОЧІКУВАННЯ ВІДЕОПОТОКУ ПО USB (ADB)..."), {videoRect.left, midY - 14, videoRect.right, midY + 14},
                             m_pFontSection, COL_CYAN, DWRITE_TEXT_ALIGNMENT_CENTER);
                 DrawTextStr(
-                    L"1. Підключіть телефон кабелем USB та увімкніть «Налагодження по USB»\n"
-                    L"2. Відкрийте EyeCam на смартфоні — трансляція запуститься автоматично",
+                    TR(L"1. Connect phone via USB cable and enable 'USB Debugging'\n"
+                       L"2. Open EyeCam on your smartphone — streaming starts automatically",
+                       L"1. Підключіть телефон кабелем USB та увімкніть «Налагодження по USB»\n"
+                       L"2. Відкрийте EyeCam на смартфоні — трансляція запуститься автоматично"),
                     {videoRect.left + 20, midY + 20, videoRect.right - 20, midY + 72},
                     m_pFontBody, COL_TEXT_SECOND, DWRITE_TEXT_ALIGNMENT_CENTER
                 );
             } else {
-                std::wstring waitWifi = L"ОЧІКУВАННЯ ПІДКЛЮЧЕННЯ ДО " + Utf8ToWide(m_state.deviceIp) + L":8554...";
+                std::wstring waitWifi = (m_state.isUkrainian ? L"ОЧІКУВАННЯ ПІДКЛЮЧЕННЯ ДО " : L"WAITING FOR CONNECTION TO ") + Utf8ToWide(m_state.deviceIp) + L":8554...";
                 DrawTextStr(waitWifi, {videoRect.left, midY - 14, videoRect.right, midY + 14},
                             m_pFontSection, COL_CYAN, DWRITE_TEXT_ALIGNMENT_CENTER);
                 DrawTextStr(
-                    L"Перевірте IP-адресу у верхньому лівому куті додатку EyeCam на телефоні\n"
-                    L"та натисніть зелену кнопку Play у мобільному застосунку.",
+                    TR(L"Check the IP address in the top-left corner of the EyeCam mobile app\n"
+                       L"and tap the green Play button on your phone.",
+                       L"Перевірте IP-адресу у верхньому лівому куті додатку EyeCam на телефоні\n"
+                       L"та натисніть зелену кнопку Play у мобільному застосунку."),
                     {videoRect.left + 20, midY + 20, videoRect.right - 20, midY + 72},
                     m_pFontBody, COL_TEXT_SECOND, DWRITE_TEXT_ALIGNMENT_CENTER
                 );
@@ -2747,7 +2811,9 @@ private:
         if (m_state.isPhoneConnected && m_state.phoneThermalC > 1.0f) {
             swprintf_s(
                 teleStr,
-                L"  %ls   |   %u FPS   |   %.1f Мбіт/с   |   %.0f°C • %d%%   |   Кадрів: %llu",
+                m_state.isUkrainian
+                    ? L"  %ls   |   %u FPS   |   %.1f Мбіт/с   |   %.0f°C • %d%%   |   Кадрів: %llu"
+                    : L"  %ls   |   %u FPS   |   %.1f Mbps   |   %.0f°C • %d%%   |   Frames: %llu",
                 phoneNameCopy.c_str(),
                 liveFps,
                 m_state.measuredBitrateKbps.load() / 1000.0f,
@@ -2758,7 +2824,9 @@ private:
         } else {
             swprintf_s(
                 teleStr,
-                L"  Пристрій: %ls   |   %u FPS   |   %.1f Мбіт/с   |   Кадрів: %llu",
+                m_state.isUkrainian
+                    ? L"  Пристрій: %ls   |   %u FPS   |   %.1f Мбіт/с   |   Кадрів: %llu"
+                    : L"  Device: %ls   |   %u FPS   |   %.1f Mbps   |   Frames: %llu",
                 phoneNameCopy.c_str(),
                 liveFps,
                 m_state.measuredBitrateKbps.load() / 1000.0f,
@@ -2778,7 +2846,7 @@ private:
         float rcy = rightPanel.top + 14;
 
         // 3. Окремі кнопки фізичних модулів (активні лише за наявності в пристрої)
-        DrawTextStr(L"3. МОДУЛІ КАМЕРИ ТА ВНУТРІШНІЙ ЗУМ", {rlx, rcy, rrx, rcy + 20}, m_pFontSection, COL_TEXT_PRIMARY);
+        DrawTextStr(TR(L"3. CAMERA MODULES & INTRA-ZOOM", L"3. МОДУЛІ КАМЕРИ ТА ВНУТРІШНІЙ ЗУМ"), {rlx, rcy, rrx, rcy + 20}, m_pFontSection, COL_TEXT_PRIMARY);
         rcy += 23;
 
         const wchar_t* moduleBtnLabels[5] = {L"0.5x UW", L"1x Main", L"Tele", L"5x/MC", L"Front"};
@@ -2800,8 +2868,11 @@ private:
 
         // Повзунок зуму суворо всередині обраного модуля (без авто-перемикання об'єктивів)
         wchar_t zoomSliderText[120]{};
-        swprintf_s(zoomSliderText, L"Зум всередині модуля: %.1fx  (1.0x – %.1fx)",
-                   m_state.intraModuleZoom, m_state.maxIntraModuleZoom);
+        swprintf_s(
+            zoomSliderText,
+            m_state.isUkrainian ? L"Зум всередині модуля: %.1fx  (1.0x – %.1fx)" : L"Intra-Module Zoom: %.1fx  (1.0x – %.1fx)",
+            m_state.intraModuleZoom, m_state.maxIntraModuleZoom
+        );
         DrawTextStr(zoomSliderText, {rlx, rcy, rrx, rcy + 16}, m_pFontBody, COL_CYAN);
         rcy += 18;
 
@@ -2815,7 +2886,7 @@ private:
         rcy += 22;
 
         // 4. Формат віртуальної камери (адаптується до можливостей смартфона, напр. Redmi 8A -> 30 FPS)
-        DrawTextStr(L"4. РОЗДІЛЬНА ЗДАТНІСТЬ ВІДЕО", {rlx, rcy, rrx, rcy + 20}, m_pFontSection, COL_TEXT_PRIMARY);
+        DrawTextStr(TR(L"4. VIDEO RESOLUTION", L"4. РОЗДІЛЬНА ЗДАТНІСТЬ ВІДЕО"), {rlx, rcy, rrx, rcy + 20}, m_pFontSection, COL_TEXT_PRIMARY);
         rcy += 23;
 
         const wchar_t* resLabels60[4] = {L"4K UHD", L"2K QHD", L"1080p 60", L"720p 60"};
@@ -2839,7 +2910,7 @@ private:
         rcy += 37;
 
         // 5. Експозиція, Фокус, Ліхтарик та Замочки повзунків (ISP)
-        DrawTextStr(L"5. ЕКСПОЗИЦІЯ, ФОКУС ТА СВІТЛО (ISP)", {rlx, rcy, rrx, rcy + 20}, m_pFontSection, COL_TEXT_PRIMARY);
+        DrawTextStr(TR(L"5. EXPOSURE, FOCUS & LIGHT (ISP)", L"5. ЕКСПОЗИЦІЯ, ФОКУС ТА СВІТЛО (ISP)"), {rlx, rcy, rrx, rcy + 20}, m_pFontSection, COL_TEXT_PRIMARY);
         rcy += 23;
 
         bool anyManualSlider = m_state.sliderManual[0] || m_state.sliderManual[1] ||
@@ -2861,7 +2932,9 @@ private:
             : (!anyManualSlider ? COL_EMERALD : COL_TEXT_PRIMARY);
         DrawRoundedCard(m_rcBtnModeToggle, autoFill, autoBrd, 8.0f);
         DrawTextStr(
-            autoPulseActive ? L"✓ AUTO АКТИВОВАНО!" : (!anyManualSlider ? L"✨ Режим: ВСЕ В AUTO" : L"✨ Скинути все в AUTO"),
+            autoPulseActive
+                ? TR(L"✓ AUTO APPLIED!", L"✓ AUTO АКТИВОВАНО!")
+                : (!anyManualSlider ? TR(L"✨ Mode: ALL AUTO", L"✨ Режим: ВСЕ В AUTO") : TR(L"✨ Reset All to AUTO", L"✨ Скинути все в AUTO")),
             m_rcBtnModeToggle, m_pFontBody, autoTxt, DWRITE_TEXT_ALIGNMENT_CENTER
         );
 
@@ -2870,7 +2943,7 @@ private:
         D2D1_COLOR_F afTxt  = afPulseActive ? HexColor(0x040A10) : COL_CYAN;
         DrawRoundedCard(m_rcBtnRefocus, afFill, COL_CYAN, 8.0f);
         DrawTextStr(
-            afPulseActive ? L"🎯 ФОКУСУВАННЯ..." : L"🎯 Автофокус",
+            afPulseActive ? TR(L"🎯 FOCUSING...", L"🎯 ФОКУСУВАННЯ...") : TR(L"🎯 Auto-Focus", L"🎯 Автофокус"),
             m_rcBtnRefocus, m_pFontBody, afTxt, DWRITE_TEXT_ALIGNMENT_CENTER
         );
         rcy += 35;
@@ -2886,7 +2959,7 @@ private:
             8.0f
         );
         DrawTextStr(
-            m_state.aeLocked ? L"🔒 Експоз.: ЗАФІКСОВАНО" : L"🔓 Фіксація експозиції",
+            m_state.aeLocked ? TR(L"🔒 AE: LOCKED", L"🔒 Експоз.: ЗАФІКСОВАНО") : TR(L"🔓 Lock Exposure (AE)", L"🔓 Фіксація експозиції"),
             m_rcBtnAeLock, m_pFontBody,
             m_state.aeLocked ? COL_AMBER : COL_TEXT_SECOND,
             DWRITE_TEXT_ALIGNMENT_CENTER
@@ -2905,7 +2978,9 @@ private:
             : (m_state.torchOn ? COL_AMBER : COL_TEXT_SECOND);
         DrawRoundedCard(m_rcBtnTorch, torchFill, torchBrd, 8.0f);
         DrawTextStr(
-            isFrontActive ? L"🔦 Ліхтарик (Фронт.)" : (m_state.torchOn ? L"🔦 Ліхтарик: УВІМК." : L"🔦 Ліхтарик: ВИМК."),
+            isFrontActive
+                ? TR(L"🔦 Torch (Front N/A)", L"🔦 Ліхтарик (Фронт.)")
+                : (m_state.torchOn ? TR(L"🔦 Torch: ON", L"🔦 Ліхтарик: УВІМК.") : TR(L"🔦 Torch: OFF", L"🔦 Ліхтарик: ВИМК.")),
             m_rcBtnTorch, m_pFontBody, torchTxt, DWRITE_TEXT_ALIGNMENT_CENTER
         );
         rcy += 36;
@@ -2916,17 +2991,17 @@ private:
         int wbKelvin = 2800 + static_cast<int>(m_state.wbNorm * 5700.0f);
 
         wchar_t sBuf0[80], sBuf1[80], sBuf2[80], sBuf3[80];
-        if (m_state.sliderManual[0]) swprintf_s(sBuf0, L"ISO Чутливість: %d (РУЧНИЙ)", isoVal);
-        else                         swprintf_s(sBuf0, L"ISO Чутливість: АВТО");
+        if (m_state.sliderManual[0]) swprintf_s(sBuf0, m_state.isUkrainian ? L"ISO Чутливість: %d (РУЧНИЙ)" : L"ISO Sensitivity: %d (MANUAL)", isoVal);
+        else                         swprintf_s(sBuf0, m_state.isUkrainian ? L"ISO Чутливість: АВТО" : L"ISO Sensitivity: AUTO");
 
-        if (m_state.sliderManual[1]) swprintf_s(sBuf1, L"Витримка (Shutter): 1/%d s (РУЧНИЙ)", shutterDenom);
-        else                         swprintf_s(sBuf1, L"Витримка (Shutter): АВТО");
+        if (m_state.sliderManual[1]) swprintf_s(sBuf1, m_state.isUkrainian ? L"Витримка (Shutter): 1/%d s (РУЧНИЙ)" : L"Shutter Speed: 1/%d s (MANUAL)", shutterDenom);
+        else                         swprintf_s(sBuf1, m_state.isUkrainian ? L"Витримка (Shutter): АВТО" : L"Shutter Speed: AUTO");
 
-        if (m_state.sliderManual[2]) swprintf_s(sBuf2, L"Фокусна відстань: %.2f dpt (РУЧНИЙ)", m_state.focusNorm * 10.0f);
-        else                         swprintf_s(sBuf2, L"Фокусна відстань: АВТО");
+        if (m_state.sliderManual[2]) swprintf_s(sBuf2, m_state.isUkrainian ? L"Фокусна відстань: %.2f dpt (РУЧНИЙ)" : L"Focus Distance: %.2f dpt (MANUAL)", m_state.focusNorm * 10.0f);
+        else                         swprintf_s(sBuf2, m_state.isUkrainian ? L"Фокусна відстань: АВТО" : L"Focus Distance: AUTO");
 
-        if (m_state.sliderManual[3]) swprintf_s(sBuf3, L"Баланс білого: %d K (РУЧНИЙ)", wbKelvin);
-        else                         swprintf_s(sBuf3, L"Баланс білого: АВТО");
+        if (m_state.sliderManual[3]) swprintf_s(sBuf3, m_state.isUkrainian ? L"Баланс білого: %d K (РУЧНИЙ)" : L"White Balance: %d K (MANUAL)", wbKelvin);
+        else                         swprintf_s(sBuf3, m_state.isUkrainian ? L"Баланс білого: АВТО" : L"White Balance: AUTO");
 
         const wchar_t* sliderTitles[4] = {sBuf0, sBuf1, sBuf2, sBuf3};
         float sliderVals[4] = {m_state.isoNorm, m_state.shutterNorm, m_state.focusNorm, m_state.wbNorm};
@@ -2974,7 +3049,9 @@ private:
             hasLut ? COL_CYAN : COL_BORDER,
             7.0f
         );
-        std::wstring lutLabel = hasLut ? (L"🎨 .cube LUT: " + m_state.activeLutName) : L"📂 Завантажити .cube 3D LUT...";
+        std::wstring lutLabel = hasLut
+            ? (L"🎨 .cube LUT: " + m_state.activeLutName)
+            : TR(L"📂 Load .cube 3D LUT...", L"📂 Завантажити .cube 3D LUT...");
         DrawTextStr(lutLabel, m_rcBtnLoadLut, m_pFontBody, hasLut ? COL_CYAN : COL_TEXT_SECOND, DWRITE_TEXT_ALIGNMENT_CENTER);
 
         if (hasLut) {
@@ -2993,17 +3070,17 @@ private:
 
         DrawRoundedCard(m_rcBtnMirror, m_state.mirrorHorizontal ? HexColor(0x162C3D) : COL_BG_CARD,
                         m_state.mirrorHorizontal ? COL_CYAN : COL_BORDER, 8.0f);
-        DrawTextStr(L"⇄ Дзеркало", m_rcBtnMirror, m_pFontBody,
+        DrawTextStr(TR(L"⇄ Mirror", L"⇄ Дзеркало"), m_rcBtnMirror, m_pFontBody,
                     m_state.mirrorHorizontal ? COL_CYAN : COL_TEXT_SECOND, DWRITE_TEXT_ALIGNMENT_CENTER);
 
         DrawRoundedCard(m_rcBtnGrid, m_state.showGrid ? HexColor(0x162C3D) : COL_BG_CARD,
                         m_state.showGrid ? COL_CYAN : COL_BORDER, 8.0f);
-        DrawTextStr(L"# Сітка 3x3", m_rcBtnGrid, m_pFontBody,
+        DrawTextStr(TR(L"# Grid 3x3", L"# Сітка 3x3"), m_rcBtnGrid, m_pFontBody,
                     m_state.showGrid ? COL_CYAN : COL_TEXT_SECOND, DWRITE_TEXT_ALIGNMENT_CENTER);
 
         wchar_t rotLabel[24]{};
         if (m_state.streamRotationDeg < 0) {
-            swprintf_s(rotLabel, L"↻ Авто");
+            swprintf_s(rotLabel, m_state.isUkrainian ? L"↻ Авто" : L"↻ Auto");
         } else {
             swprintf_s(rotLabel, L"↻ %d°", m_state.streamRotationDeg);
         }
@@ -3031,12 +3108,13 @@ private:
         if (m_state.activeModal == ModalOverlay::SUPPORT_AUTHOR) {
             DrawCyberEyeLogo(cx + 22.0f, cy + 18.0f, 38.0f);
             DrawTextStr(
-                L"Підтримати автора EyeCam",
+                TR(L"Support EyeCam Author", L"Підтримати автора EyeCam"),
                 {cx + 70.0f, cy + 16.0f, m_rcModalClose.left - 8.0f, cy + 44.0f},
                 m_pFontTitle, COL_TEXT_PRIMARY
             );
             DrawTextStr(
-                L"Дякую за використання EyeCam Studio! Якщо проєкт корисний у вашій роботі чи стрімах, ви можете підтримати його розвиток:",
+                TR(L"Thank you for using EyeCam Studio! If this open-source project helps your workflow or streams, you can support its development:",
+                   L"Дякую за використання EyeCam Studio! Якщо проєкт корисний у вашій роботі чи стрімах, ви можете підтримати його розвиток:"),
                 {cx + 22.0f, cy + 62.0f, cx + cardW - 22.0f, cy + 112.0f},
                 m_pFontBody, COL_TEXT_SECOND
             );
@@ -3045,7 +3123,7 @@ private:
             m_rcModalPrimaryBtn = {cx + 24.0f, cy + 126.0f, cx + cardW - 24.0f, cy + 174.0f};
             DrawRoundedCard(m_rcModalPrimaryBtn, COL_PATREON, HexColor(0xFF757D), 10.0f);
             DrawTextStr(
-                L"🧡  Підтримати на Patreon  (Gladiator_Satan)",
+                TR(L"🧡  Support on Patreon  (Gladiator_Satan)", L"🧡  Підтримати на Patreon  (Gladiator_Satan)"),
                 m_rcModalPrimaryBtn, m_pFontSection, HexColor(0xFFFFFF),
                 DWRITE_TEXT_ALIGNMENT_CENTER
             );
@@ -3060,14 +3138,14 @@ private:
             );
 
             DrawTextStr(
-                L"Натисніть поза межами вікна або ✕, щоб повернутися до студії",
+                TR(L"Click outside the card or press ✕ to return to Studio", L"Натисніть поза межами вікна або ✕, щоб повернутися до студії"),
                 {cx + 20.0f, cy + 244.0f, cx + cardW - 20.0f, cy + 270.0f},
                 m_pFontBody, COL_TEXT_DIM, DWRITE_TEXT_ALIGNMENT_CENTER
             );
         } else if (m_state.activeModal == ModalOverlay::GITHUB_UPDATE) {
             DrawCyberEyeLogo(cx + 22.0f, cy + 18.0f, 38.0f);
             DrawTextStr(
-                L"GitHub & Перевірка оновлень",
+                TR(L"GitHub & Update Checker", L"GitHub & Перевірка оновлень"),
                 {cx + 70.0f, cy + 16.0f, m_rcModalClose.left - 8.0f, cy + 44.0f},
                 m_pFontTitle, COL_TEXT_PRIMARY
             );
@@ -3084,8 +3162,8 @@ private:
             UiRect infoBox{cx + 24.0f, cy + 64.0f, cx + cardW - 24.0f, cy + 146.0f};
             DrawRoundedCard(infoBox, COL_BG_CARD, hasUpd ? COL_EMERALD : COL_BORDER, 10.0f);
 
-            std::wstring verLine = L"Поточна версія: v" + std::wstring(kEyeCamVersionWide) +
-                                   L"   •   Останній реліз на GitHub: v" + latestCopy;
+            std::wstring verLine = (m_state.isUkrainian ? L"Поточна версія: v" : L"Installed: v") + std::wstring(kEyeCamVersionWide) +
+                                   (m_state.isUkrainian ? L"   •   Останній реліз на GitHub: v" : L"   •   Latest GitHub Release: v") + latestCopy;
             DrawTextStr(verLine, {infoBox.left + 14.0f, infoBox.top + 10.0f, infoBox.right - 14.0f, infoBox.top + 38.0f},
                         m_pFontMono, COL_CYAN);
             DrawTextStr(statusCopy, {infoBox.left + 14.0f, infoBox.top + 42.0f, infoBox.right - 14.0f, infoBox.bottom - 10.0f},
@@ -3095,7 +3173,7 @@ private:
             m_rcModalPrimaryBtn = {cx + 24.0f, cy + 162.0f, cx + cardW - 24.0f, cy + 208.0f};
             DrawRoundedCard(m_rcModalPrimaryBtn, HexColor(0x182638), COL_CYAN, 10.0f);
             DrawTextStr(
-                L"🐙  Відкрити репозиторій EyeCam на GitHub",
+                TR(L"🐙  Open EyeCam Repository on GitHub", L"🐙  Відкрити репозиторій EyeCam на GitHub"),
                 m_rcModalPrimaryBtn, m_pFontSection, COL_CYAN,
                 DWRITE_TEXT_ALIGNMENT_CENTER
             );
@@ -3109,7 +3187,9 @@ private:
                 10.0f
             );
             DrawTextStr(
-                hasUpd ? L"⬇  Завантажити нову версію з GitHub Releases" : L"🔄  Перевірити наявність оновлень зараз",
+                hasUpd
+                    ? TR(L"⬇  Download Latest Release from GitHub", L"⬇  Завантажити нову версію з GitHub Releases")
+                    : TR(L"🔄  Check for Updates Now", L"🔄  Перевірити наявність оновлень зараз"),
                 m_rcModalSecondaryBtn, m_pFontSection,
                 hasUpd ? HexColor(0x05100A) : COL_TEXT_PRIMARY,
                 DWRITE_TEXT_ALIGNMENT_CENTER
@@ -3277,7 +3357,12 @@ private:
             return;
         }
 
-        // Кнопки у шапці: Підтримати автора та GitHub / Оновлення
+        // Кнопки у шапці: Перемикання мови (EN/UA), Підтримати автора та GitHub / Оновлення
+        if (m_rcBtnHeaderLang.Contains(x, y)) {
+            m_state.isUkrainian = !m_state.isUkrainian;
+            SaveLanguagePref(m_state.isUkrainian);
+            return;
+        }
         if (m_rcBtnHeaderSupport.Contains(x, y)) {
             m_state.activeModal = ModalOverlay::SUPPORT_AUTHOR;
             return;
@@ -3720,6 +3805,7 @@ private:
     std::vector<uint8_t> m_cachedPreviewBuffer;
 
     // Інтерактивні зони UI
+    UiRect m_rcBtnHeaderLang{};
     UiRect m_rcBtnHeaderSupport{};
     UiRect m_rcBtnHeaderGithub{};
     UiRect m_rcTransportTabs[2]{};

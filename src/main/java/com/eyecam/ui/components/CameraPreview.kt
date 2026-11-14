@@ -43,6 +43,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.eyecam.model.AppLanguage
 import com.eyecam.ui.theme.OledBorder
 import com.eyecam.ui.theme.OledPillBackground
 import com.eyecam.ui.theme.OledPureBlack
@@ -60,6 +61,7 @@ import kotlinx.coroutines.delay
 @Composable
 fun CameraPreview(
     isStreaming: Boolean,
+    language: AppLanguage = AppLanguage.EN,
     hasCameraPermission: Boolean = true,
     isDisplayProtectionActive: Boolean = false,
     streamWidth: Int = 1920,
@@ -199,8 +201,13 @@ fun CameraPreview(
                             .padding(horizontal = 10.dp, vertical = 4.dp)
                     ) {
                         val resLabel = "${streamWidth}x${streamHeight}"
+                        val isUa = language == AppLanguage.UA
                         Text(
-                            text = if (isLandscape) "📷 16:9 ВЕБ-КАМЕРА [$resLabel]" else "📷 9:16 ПОРТРЕТ [$resLabel]",
+                            text = if (isLandscape) {
+                                if (isUa) "📷 16:9 ВЕБ-КАМЕРА [$resLabel]" else "📷 16:9 WEBCAM [$resLabel]"
+                            } else {
+                                if (isUa) "📷 9:16 ПОРТРЕТ [$resLabel]" else "📷 9:16 PORTRAIT [$resLabel]"
+                            },
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
                             color = StatusCyan,
@@ -255,8 +262,9 @@ fun CameraPreview(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
+                    val isUa = language == AppLanguage.UA
                     Text(
-                        text = "Потрібен доступ до камери",
+                        text = if (isUa) "Потрібен доступ до камери" else "Camera permission is required",
                         color = TextDimmed,
                         fontSize = 15.sp
                     )
@@ -268,7 +276,7 @@ fun CameraPreview(
                             .padding(horizontal = 20.dp, vertical = 10.dp)
                     ) {
                         Text(
-                            text = "Надати дозвіл на камеру",
+                            text = if (isUa) "Надати дозвіл на камеру" else "Grant Camera Permission",
                             color = Color.Black,
                             fontWeight = FontWeight.Bold,
                             fontSize = 13.sp

@@ -1,6 +1,19 @@
 package com.eyecam.model
 
 /**
+ * Мова інтерфейсу додатку (за замовчуванням при першому встановленні — English).
+ */
+enum class AppLanguage(val code: String) {
+    EN("en"),
+    UA("ua");
+
+    companion object {
+        fun fromCode(code: String?): AppLanguage =
+            if (code?.lowercase() == "ua" || code?.lowercase() == "uk") UA else EN
+    }
+}
+
+/**
  * Тип активного з'єднання з десктопним клієнтом.
  */
 enum class ConnectionType {
@@ -12,13 +25,17 @@ enum class ConnectionType {
 /**
  * Рівень термального тротлінгу пристрою (адаптація під PowerManager.THERMAL_STATUS_*).
  */
-enum class ThermalState(val severityLevel: Int, val descriptionUa: String) {
-    NORMAL(0, "Нормальна"),
-    LIGHT(1, "Помірне нагрівання"),
-    MODERATE(2, "Попередження тротлінгу"),
-    SEVERE(3, "Критичний тротлінг (FPS/бітрейт обмежено)"),
-    CRITICAL(4, "Аварійний перегрів"),
-    UNKNOWN(-1, "Невідомо")
+enum class ThermalState(
+    val severityLevel: Int,
+    val descriptionUa: String,
+    val descriptionEn: String
+) {
+    NORMAL(0, "Нормальна", "Normal"),
+    LIGHT(1, "Помірне нагрівання", "Warm"),
+    MODERATE(2, "Попередження тротлінгу", "Throttling Warning"),
+    SEVERE(3, "Критичний тротлінг", "Severe Throttling"),
+    CRITICAL(4, "Аварійний перегрів", "Critical Overheat"),
+    UNKNOWN(-1, "Невідомо", "Unknown")
 }
 
 /**
@@ -36,7 +53,7 @@ data class StreamTelemetry(
     val batteryTemperatureC: Float = 25.0f,
     val thermalState: ThermalState = ThermalState.NORMAL,
     val connectionType: ConnectionType = ConnectionType.NONE,
-    val connectionDetails: String = "Очікування підключення...",
+    val connectionDetails: String = "",
     val isPcConnected: Boolean = false,
     val localIpAddress: String = "",
     val droppedFramesCount: Long = 0L
@@ -46,6 +63,8 @@ data class StreamTelemetry(
  * Загальний стан системи для UI та бізнес-логіки.
  */
 data class StreamUiState(
+    val language: AppLanguage = AppLanguage.EN,
+    val shouldExitApp: Boolean = false,
     val isStreaming: Boolean = false,
     val hasCameraPermission: Boolean = false,
     val isMicMuted: Boolean = false,
