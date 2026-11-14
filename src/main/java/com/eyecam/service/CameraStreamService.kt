@@ -11,6 +11,7 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Color
+import android.net.Uri
 import android.os.BatteryManager
 import android.os.Binder
 import android.os.Build
@@ -65,6 +66,11 @@ class CameraStreamService : LifecycleService() {
     private var isPcConnected = false
     private var isPcViaUsbAdb = false
 
+    @Volatile
+    private var cachedBatteryPct: Float = 100f
+    @Volatile
+    private var cachedBatteryTempC: Float = 32f
+
     private val _uiState = MutableStateFlow(StreamUiState())
     val uiState: StateFlow<StreamUiState> = _uiState.asStateFlow()
 
@@ -107,27 +113,14 @@ class CameraStreamService : LifecycleService() {
                     telemetry = current.telemetry.copy(
                         fps = if (_uiState.value.isStreaming) fps.toInt() else 0,
                         bitrateKbps = if (_uiState.value.isStreaming) bitrateKbps else 0,
-                        batteryPercentage = readBatteryPercent().toInt(),
-                        batteryTemperatureC = readBatteryTempC()
+                        batteryPercentage = cachedBatteryPct.toInt(),
+                        batteryTemperatureC = cachedBatteryTempC
                     )
                 )
             }
         }
         cameraController.onStateChanged = {
-            _uiState.update { current ->
-                current.copy(
-                    currentZoomRatio = cameraController.currentZoomRatio,
-                    isFrontCamera = cameraController.isFrontCameraActive,
-                    minZoomRatio = cameraController.minZoomRatio,
-                    maxZoomRatio = cameraController.maxZoomRatio,
-                    supportedZoomPresets = cameraController.supportedZoomPresets.toList(),
-                    telemetry = current.telemetry.copy(
-                        resolutionWidth = cameraController.streamWidth,
-                        resolutionHeight = cameraController.streamHeight,
-                        targetFps = cameraController.streamFps
-                    )
-                )
-            }
+            syncUiStateFromController()
             if (controlServer.isClientConnected) {
                 controlServer.sendTelemetryState()
             }
@@ -149,33 +142,52 @@ class CameraStreamService : LifecycleService() {
                 Log.i(TAG, "PC Client connection changed: connected=$connected, viaUsb=$viaUsb, ip=$remoteIp")
             },
             onZoomUpdatedFromPc = { _, _ ->
-                _uiState.update {
-                    it.copy(
-                        currentZoomRatio = cameraController.currentZoomRatio,
-                        isFrontCamera = cameraController.isFrontCameraActive
-                    )
-                }
+                syncUiStateFromController()
                 updateNotification()
             },
-            onResolutionUpdatedFromPc = { w, h, fps ->
-                _uiState.update { current ->
-                    current.copy(
-                        telemetry = current.telemetry.copy(
-                            resolutionWidth = w,
-                            resolutionHeight = h,
-                            targetFps = fps
-                        )
-                    )
-                }
+            onResolutionUpdatedFromPc = { _, _, _ ->
+                syncUiStateFromController()
             },
-            batteryLevelProvider = { readBatteryPercent() },
-            thermalTempProvider = { readBatteryTempC() }
+            batteryLevelProvider = { cachedBatteryPct },
+            thermalTempProvider = { cachedBatteryTempC }
         )
         controlServer.start()
 
         createNotificationChannel()
         refreshHardwareCapabilities()
         startConnectionMonitorLoop()
+    }
+
+    private fun syncUiStateFromController() {
+        _uiState.update { current ->
+            current.copy(
+                isTorchOn = cameraController.isTorchOn,
+                isTorchAvailable = cameraController.isTorchAvailable,
+                isAeLocked = cameraController.isAeLocked,
+                cameraMode = cameraController.currentMode,
+                availableModules = cameraController.availableModules.toList(),
+                activeModuleKey = cameraController.activeModuleKey,
+                intraModuleZoom = cameraController.intraModuleZoom,
+                maxIntraModuleZoom = cameraController.maxIntraModuleZoom,
+                currentZoomRatio = cameraController.intraModuleZoom,
+                minZoomRatio = 1.0f,
+                maxZoomRatio = cameraController.maxIntraModuleZoom,
+                supportedZoomPresets = cameraController.supportedZoomPresets.toList(),
+                isFrontCamera = cameraController.isFrontCameraActive,
+                supports4K = cameraController.supports4K,
+                supports2K = cameraController.supports2K,
+                supports60Fps = cameraController.supports60Fps,
+                isLowEndDevice = cameraController.isLowEndDevice,
+                activeLutName = cameraController.activeLutName,
+                afTriggerPulseSeq = cameraController.afTriggerPulseSeq,
+                autoModePulseSeq = cameraController.autoModePulseSeq,
+                telemetry = current.telemetry.copy(
+                    resolutionWidth = cameraController.streamWidth,
+                    resolutionHeight = cameraController.streamHeight,
+                    targetFps = cameraController.streamFps
+                )
+            )
+        }
     }
 
     fun refreshHardwareCapabilities() {
@@ -188,9 +200,18 @@ class CameraStreamService : LifecycleService() {
                 hasCameraPermission = hasPerm,
                 activeSensor = sensors.firstOrNull(),
                 availableSensors = sensors,
-                minZoomRatio = cameraController.minZoomRatio,
-                maxZoomRatio = cameraController.maxZoomRatio,
-                supportedZoomPresets = cameraController.supportedZoomPresets,
+                availableModules = cameraController.availableModules.toList(),
+                activeModuleKey = cameraController.activeModuleKey,
+                intraModuleZoom = cameraController.intraModuleZoom,
+                maxIntraModuleZoom = cameraController.maxIntraModuleZoom,
+                minZoomRatio = 1.0f,
+                maxZoomRatio = cameraController.maxIntraModuleZoom,
+                supportedZoomPresets = cameraController.supportedZoomPresets.toList(),
+                isTorchAvailable = cameraController.isTorchAvailable,
+                supports4K = cameraController.supports4K,
+                supports2K = cameraController.supports2K,
+                supports60Fps = cameraController.supports60Fps,
+                isLowEndDevice = cameraController.isLowEndDevice,
                 deviceModelName = modelName
             )
         }
@@ -227,7 +248,6 @@ class CameraStreamService : LifecycleService() {
                 cameraController.openCamera(previewSurface = surface)
             }
         } else if (surface == null) {
-            // Detach UI surface ONLY — keep CameraX + HardwareEncoder running seamlessly!
             cameraController.updatePreviewSurface(null, 0, 0, displayRotation)
             if (!_uiState.value.isStreaming) {
                 cameraController.closeCamera()
@@ -243,17 +263,63 @@ class CameraStreamService : LifecycleService() {
         cameraController.triggerFocusAtPoint(x, y)
     }
 
+    fun toggleTorch() {
+        cameraController.toggleTorch()
+    }
+
+    fun toggleAeLock() {
+        cameraController.toggleAeLock()
+    }
+
+    fun resetAllToAuto() {
+        cameraController.resetAllToAuto()
+    }
+
+    fun updateManualIso(iso: Int) {
+        cameraController.updateManualIso(iso)
+    }
+
+    fun updateManualExposure(expNs: Long) {
+        cameraController.updateManualExposure(expNs)
+    }
+
+    fun updateManualFocus(diopters: Float) {
+        cameraController.updateManualFocus(diopters)
+    }
+
+    fun updateManualWhiteBalance(kelvin: Int) {
+        cameraController.updateManualWhiteBalance(kelvin)
+    }
+
+    fun loadCubeLutFromUri(uri: Uri, displayName: String) {
+        serviceScope.launch(Dispatchers.IO) {
+            try {
+                contentResolver.openInputStream(uri)?.use { stream ->
+                    cameraController.loadCubeLut(displayName, stream)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed opening .cube LUT URI: ${e.message}", e)
+            }
+        }
+    }
+
+    fun clearCubeLut() {
+        cameraController.clearCubeLut()
+    }
+
     private fun startConnectionMonitorLoop() {
-        serviceScope.launch {
+        serviceScope.launch(Dispatchers.IO) {
             while (isActive) {
                 refreshConnectionStatus()
-                delay(1500)
+                delay(3000)
             }
         }
     }
 
     private fun refreshConnectionStatus() {
-        val usbConnected = isUsbCableConnected()
+        val (usbConnected, battPct, battTemp) = readBatteryAndUsbState()
+        cachedBatteryPct = battPct
+        cachedBatteryTempC = battTemp
         val localIp = getLocalWifiIpAddress()
 
         val (connType, connDetails) = when {
@@ -282,29 +348,46 @@ class CameraStreamService : LifecycleService() {
                     connectionType = connType,
                     connectionDetails = connDetails,
                     isPcConnected = isPcConnected,
-                    localIpAddress = localIp
+                    localIpAddress = localIp,
+                    batteryPercentage = battPct.toInt(),
+                    batteryTemperatureC = battTemp
                 )
             )
         }
     }
 
-    private fun isUsbCableConnected(): Boolean {
-        try {
-            val usbState = registerReceiver(null, IntentFilter("android.hardware.usb.action.USB_STATE"))
-            if (usbState != null && (usbState.getBooleanExtra("connected", false) || usbState.getBooleanExtra("configured", false))) {
-                return true
-            }
-        } catch (_: Exception) {}
+    private fun readBatteryAndUsbState(): Triple<Boolean, Float, Float> {
+        var usbPlugged = false
+        var pct = 100f
+        var tempC = 32f
 
         try {
             val battIntent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-            val plugged = battIntent?.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1) ?: -1
-            if (plugged == BatteryManager.BATTERY_PLUGGED_USB) {
-                return true
+            if (battIntent != null) {
+                val plugged = battIntent.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1)
+                if (plugged == BatteryManager.BATTERY_PLUGGED_USB) {
+                    usbPlugged = true
+                }
+                val level = battIntent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+                val scale = battIntent.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
+                if (level >= 0 && scale > 0) {
+                    pct = (level * 100f) / scale
+                }
+                val tenths = battIntent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 320)
+                tempC = tenths / 10.0f
             }
         } catch (_: Exception) {}
 
-        return false
+        if (!usbPlugged) {
+            try {
+                val usbState = registerReceiver(null, IntentFilter("android.hardware.usb.action.USB_STATE"))
+                if (usbState != null && (usbState.getBooleanExtra("connected", false) || usbState.getBooleanExtra("configured", false))) {
+                    usbPlugged = true
+                }
+            } catch (_: Exception) {}
+        }
+
+        return Triple(usbPlugged, pct, tempC)
     }
 
     private fun getLocalWifiIpAddress(): String {
@@ -332,10 +415,7 @@ class CameraStreamService : LifecycleService() {
             ACTION_TOGGLE_MUTE -> toggleMicrophoneMute()
             ACTION_SWITCH_SENSOR -> {
                 val sensorId = intent.getStringExtra(EXTRA_SENSOR_ID)
-                sensorId?.let { id ->
-                    val targetSensor = _uiState.value.availableSensors.find { it.id == id }
-                    targetSensor?.let { switchSensor(it) }
-                }
+                sensorId?.let { id -> selectCameraModule(id) }
             }
         }
         return START_STICKY
@@ -346,9 +426,6 @@ class CameraStreamService : LifecycleService() {
         return binder
     }
 
-    /**
-     * Запуск трансляції: безпечне підняття Foreground Service з перевіркою дозволів Android 14/15/16.
-     */
     fun startStreaming() {
         if (_uiState.value.isStreaming) return
 
@@ -367,7 +444,6 @@ class CameraStreamService : LifecycleService() {
 
         thermalManager.startMonitoring()
 
-        // Безпечний запуск Foreground Service для Android 14/15/16 (перевірка фактично наданих дозволів)
         val notification = buildNotification()
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -398,8 +474,9 @@ class CameraStreamService : LifecycleService() {
             current.copy(
                 isStreaming = true,
                 telemetry = current.telemetry.copy(
-                    fps = 60,
-                    bitrateKbps = 18000
+                    fps = cameraController.streamFps,
+                    targetFps = cameraController.streamFps,
+                    bitrateKbps = cameraController.streamBitrate / 1000
                 )
             )
         }
@@ -408,9 +485,6 @@ class CameraStreamService : LifecycleService() {
         observeThermalChanges()
     }
 
-    /**
-     * Зупинка трансляції та очищення ресурсів.
-     */
     fun stopStreaming() {
         Log.i(TAG, "Зупинка трансляції EyeCam...")
 
@@ -438,57 +512,38 @@ class CameraStreamService : LifecycleService() {
 
     fun setZoomRatio(zoom: Float) {
         cameraController.setZoomRatio(zoom)
-        _uiState.update {
-            it.copy(
-                currentZoomRatio = cameraController.currentZoomRatio
-            )
-        }
+        syncUiStateFromController()
         updateNotification()
     }
 
-    /**
-     * Перемикання на тиловий пресет зуму / об'єктиву (наприклад 0.5x, 1x, 2x, 3x, 5x, 10x).
-     * Автоматично виходить із фронтальної камери, якщо вона була активною.
-     */
+    fun selectCameraModule(moduleKeyOrPreset: String) {
+        cameraController.selectCameraModule(moduleKeyOrPreset)
+        syncUiStateFromController()
+        updateNotification()
+    }
+
     fun selectLensPreset(zoom: Float) {
-        cameraController.switchToSensor("${zoom}x")
-        _uiState.update {
-            it.copy(
-                isFrontCamera = cameraController.isFrontCameraActive,
-                currentZoomRatio = cameraController.currentZoomRatio,
-                minZoomRatio = cameraController.minZoomRatio,
-                maxZoomRatio = cameraController.maxZoomRatio
-            )
-        }
+        cameraController.selectCameraModule("${zoom}x")
+        syncUiStateFromController()
         updateNotification()
     }
 
     fun setFrontCamera(useFront: Boolean) {
         cameraController.switchFrontBack(useFront)
-        _uiState.update {
-            it.copy(
-                isFrontCamera = useFront,
-                currentZoomRatio = 1.0f,
-                minZoomRatio = cameraController.minZoomRatio,
-                maxZoomRatio = cameraController.maxZoomRatio
-            )
-        }
+        syncUiStateFromController()
         updateNotification()
     }
 
     fun switchSensor(newSensor: CameraSensorInfo) {
-        cameraController.switchPhysicalCameraSeamless(newSensor.id)
-        _uiState.update { it.copy(activeSensor = newSensor) }
+        cameraController.selectCameraModule(newSensor.id)
+        syncUiStateFromController()
         updateNotification()
     }
 
     fun switchSensor(sensorId: String) {
-        val target = _uiState.value.availableSensors.find { it.id == sensorId }
-        if (target != null) {
-            switchSensor(target)
-        } else {
-            cameraController.switchToSensor(sensorId)
-        }
+        cameraController.selectCameraModule(sensorId)
+        syncUiStateFromController()
+        updateNotification()
     }
 
     fun setDisplayProtection(active: Boolean) {
@@ -499,12 +554,13 @@ class CameraStreamService : LifecycleService() {
         serviceScope.launch {
             thermalManager.thermalState.collect { thermalState ->
                 val policy = thermalManager.getPolicyForState(thermalState)
+                val maxDeviceFps = if (cameraController.isLowEndDevice) 30 else 60
 
                 _uiState.update { current ->
                     current.copy(
                         telemetry = current.telemetry.copy(
                             thermalState = thermalState,
-                            targetFps = policy.recommendedFps,
+                            targetFps = policy.recommendedFps.coerceAtMost(maxDeviceFps),
                             targetBitrateKbps = (ThermalManager.BASELINE_BITRATE_KBPS * policy.bitrateReductionRatio).toInt()
                         ),
                         isDisplayProtectionActive = if (policy.shouldEnforceDisplayProtection) {
@@ -544,12 +600,12 @@ class CameraStreamService : LifecycleService() {
         )
 
         val micStatus = if (_uiState.value.isMicMuted) "Мікрофон: ВИМКНЕНО" else "Мікрофон: АКТИВНИЙ"
-        val zoomLabel = if (_uiState.value.isFrontCamera) "FRONT" else "${_uiState.value.currentZoomRatio}x"
+        val modLabel = _uiState.value.activeModuleKey.uppercase()
         val thermalName = _uiState.value.telemetry.thermalState.descriptionUa
 
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setContentTitle("EyeCam: Трансляція активна")
-            .setContentText("Зум: $zoomLabel | $micStatus | $thermalName")
+            .setContentText("Модуль: $modLabel (${_uiState.value.intraModuleZoom}x) | $micStatus | $thermalName")
             .setSmallIcon(R.drawable.ic_eyecam_logo)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -586,27 +642,6 @@ class CameraStreamService : LifecycleService() {
             }
             val manager = getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(channel)
-        }
-    }
-
-    private fun readBatteryPercent(): Float {
-        return try {
-            val intent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-            val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
-            val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
-            if (level >= 0 && scale > 0) (level * 100f) / scale else 100f
-        } catch (_: Exception) {
-            100f
-        }
-    }
-
-    private fun readBatteryTempC(): Float {
-        return try {
-            val intent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-            val tenths = intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 350) ?: 350
-            tenths / 10.0f
-        } catch (_: Exception) {
-            35.0f
         }
     }
 

@@ -5,6 +5,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.net.Uri
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
@@ -23,7 +24,8 @@ import kotlinx.coroutines.launch
 
 /**
  * ViewModel для зв'язування Jetpack Compose UI з життєвим циклом CameraStreamService,
- * керування прев'ю камери, зумом (до 10x) та відліку таймера OLED-захисту.
+ * керування модулями камер, внутрішнім зумом, ліхтариком, блокуванням експозиції,
+ * індивідуальними повзунками ISP із замочками, .cube LUT та таймером OLED-захисту.
  */
 class StreamViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -40,7 +42,7 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     private var pendingDisplayRotation: Int = Surface.ROTATION_0
 
     private var inactivityTimerJob: Job? = null
-    private val INACTIVITY_TIMEOUT_MS = 15_000L
+    private val INACTIVITY_TIMEOUT_MS = 18_000L
 
     companion object {
         private const val TAG = "StreamViewModel"
@@ -116,9 +118,6 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         streamService?.attachPreviewSurface(surface, width, height, displayRotation)
     }
 
-    /**
-     * Старт / Стоп відеотрансляції.
-     */
     fun toggleStreaming(onPermissionMissing: () -> Unit = {}) {
         val service = streamService
         if (service != null && !service.cameraController.hasCameraPermission()) {
@@ -147,6 +146,11 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun selectCameraModule(moduleKey: String) {
+        onUserInteraction()
+        streamService?.selectCameraModule(moduleKey)
+    }
+
     fun setZoomRatio(zoom: Float) {
         onUserInteraction()
         streamService?.setZoomRatio(zoom)
@@ -170,6 +174,51 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     fun toggleMicMute() {
         onUserInteraction()
         streamService?.toggleMicrophoneMute()
+    }
+
+    fun toggleTorch() {
+        onUserInteraction()
+        streamService?.toggleTorch()
+    }
+
+    fun toggleAeLock() {
+        onUserInteraction()
+        streamService?.toggleAeLock()
+    }
+
+    fun resetAllToAuto() {
+        onUserInteraction()
+        streamService?.resetAllToAuto()
+    }
+
+    fun updateManualIso(iso: Int) {
+        onUserInteraction()
+        streamService?.updateManualIso(iso)
+    }
+
+    fun updateManualExposure(expNs: Long) {
+        onUserInteraction()
+        streamService?.updateManualExposure(expNs)
+    }
+
+    fun updateManualFocus(diopters: Float) {
+        onUserInteraction()
+        streamService?.updateManualFocus(diopters)
+    }
+
+    fun updateManualWhiteBalance(kelvin: Int) {
+        onUserInteraction()
+        streamService?.updateManualWhiteBalance(kelvin)
+    }
+
+    fun loadCubeLutFromUri(uri: Uri, displayName: String) {
+        onUserInteraction()
+        streamService?.loadCubeLutFromUri(uri, displayName)
+    }
+
+    fun clearCubeLut() {
+        onUserInteraction()
+        streamService?.clearCubeLut()
     }
 
     fun triggerAutoFocus() {

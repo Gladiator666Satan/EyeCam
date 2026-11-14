@@ -28,10 +28,10 @@ import kotlin.concurrent.withLock
 /**
  * Control & Live Stream TCP daemon running on Android device (port 8554).
  * Works over both Wi-Fi LAN (<PhoneIP>:8554) and USB ADB (adb forward tcp:8554 tcp:8554):
- * - Device capabilities handshake (model name, min/max zoom presets, 4K support)
+ * - Device capabilities handshake (model name, physical camera modules, intra-module zoom, 4K/2K/60FPS flags)
  * - Hardware Annex-B H.264 video frames (MSG_TYPE_H264_FRAME = 8) + legacy JPEG fallback (7)
  * - Non-blocking async writer with congestion P-frame drop & automatic IDR recovery
- * - Camera parameters (Zoom 0.5x..10x+, ISO, Shutter, Focus, WB, Resolution, Rotation)
+ * - Camera parameters (Module selection, Intra-module Zoom, Torch, AE Lock, per-slider ISO/Shutter/Focus/WB)
  * - Real live telemetry broadcast
  */
 class ControlServer(
@@ -81,7 +81,6 @@ class ControlServer(
     private var acceptJob: Job? = null
     private var telemetryJob: Job? = null
 
-    // Non-blocking outbound queues guarded by lock
     private val queueLock = ReentrantLock()
     private val queueCondition = queueLock.newCondition()
     private val controlQueue = ArrayDeque<OutboundPacket>(16)
@@ -257,25 +256,55 @@ class ControlServer(
         }
     }
 
-    fun sendDeviceCapabilities() {
+    private fun populateCapabilitiesFields(target: JSONObject) {
         val modelName = "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL}"
         val presetsArr = JSONArray()
         cameraController.supportedZoomPresets.forEach { presetsArr.put(it.toDouble()) }
 
-        val capObj = JSONObject().apply {
-            put("type", "device_capabilities")
+        val moduleKeysArr = JSONArray()
+        cameraController.availableModules.forEach { moduleKeysArr.put(it.key) }
+
+        val mode = cameraController.currentMode
+
+        target.apply {
             put("device_name", modelName)
             put("model_name", modelName)
-            put("min_zoom", cameraController.minZoomRatio.toDouble())
-            put("max_zoom", cameraController.maxZoomRatio.toDouble())
-            put("current_zoom", cameraController.currentZoomRatio.toDouble())
+            put("min_zoom", 1.0)
+            put("max_zoom", cameraController.maxIntraModuleZoom.toDouble())
+            put("current_zoom", cameraController.intraModuleZoom.toDouble())
+            put("intra_zoom", cameraController.intraModuleZoom.toDouble())
+            put("max_intra_zoom", cameraController.maxIntraModuleZoom.toDouble())
+            put("active_module", cameraController.activeModuleKey)
+            put("available_modules", moduleKeysArr)
+            put("has_uw", cameraController.availableModules.any { it.key == "uw" })
+            put("has_main", cameraController.availableModules.any { it.key == "main" })
+            put("has_tele", cameraController.availableModules.any { it.key == "tele" })
+            put("has_tele5x", cameraController.availableModules.any { it.key == "tele5x" || it.key == "macro" })
+            put("has_front", cameraController.availableModules.any { it.key == "front" })
             put("supports_4k", cameraController.supports4K)
+            put("supports_2k", cameraController.supports2K)
+            put("supports_60fps", cameraController.supports60Fps)
+            put("is_low_end", cameraController.isLowEndDevice)
             put("zoom_presets", presetsArr)
             put("stream_width", cameraController.streamWidth)
             put("stream_height", cameraController.streamHeight)
             put("stream_fps", cameraController.streamFps)
             put("is_front", cameraController.isFrontCameraActive)
+            put("torch_on", cameraController.isTorchOn)
+            put("torch_available", cameraController.isTorchAvailable)
+            put("ae_locked", cameraController.isAeLocked)
+            put("iso_manual", mode.isIsoManual)
+            put("shutter_manual", mode.isShutterManual)
+            put("focus_manual", mode.isFocusManual)
+            put("wb_manual", mode.isWbManual)
             put("rotation_deg", cameraController.manualStreamRotationOffsetDeg)
+        }
+    }
+
+    fun sendDeviceCapabilities() {
+        val capObj = JSONObject().apply {
+            put("type", "device_capabilities")
+            populateCapabilitiesFields(this)
         }
         enqueueControlPacket(MSG_TYPE_JSON_COMMAND, capObj.toString().toByteArray(StandardCharsets.UTF_8))
     }
@@ -312,7 +341,6 @@ class ControlServer(
 
             if (isKeyFrame) {
                 needKeyframeBeforeDelta = false
-                // Drop queued stale video frames before an IDR keyframe to keep latency minimal
                 videoQueue.clear()
                 videoQueue.addLast(OutboundPacket(msgType, payload, isKeyFrame = true))
                 queueCondition.signal()
@@ -320,7 +348,6 @@ class ControlServer(
             }
 
             if (videoQueue.size >= MAX_VIDEO_QUEUE) {
-                // Network congestion: drop stale delta and wait for a clean keyframe
                 needKeyframeBeforeDelta = true
                 val now = SystemClock.uptimeMillis()
                 if (now - lastKeyframeRequestMs > 400L) {
@@ -396,18 +423,20 @@ class ControlServer(
                     return
                 }
 
-                "SetZoom", "SetZoomRatio" -> {
-                    val zoom = if (json.has("zoom")) json.optDouble("zoom", 1.0).toFloat() else json.optDouble("zoom_ratio", 1.0).toFloat()
+                "SetZoom", "SetZoomRatio", "SetIntraZoom" -> {
+                    val zoom = if (json.has("zoom")) {
+                        json.optDouble("zoom", 1.0).toFloat()
+                    } else {
+                        json.optDouble("zoom_ratio", 1.0).toFloat()
+                    }
                     cameraController.setZoomRatio(zoom)
-                    onZoomUpdatedFromPc?.invoke(cameraController.currentZoomRatio, cameraController.isFrontCameraActive)
+                    onZoomUpdatedFromPc?.invoke(cameraController.intraModuleZoom, cameraController.isFrontCameraActive)
                 }
 
                 "SetCameraModule", "SwitchSensor", "SwitchModule", "SetSensor" -> {
-                    val module = json.optString("module", json.optString("sensor_id", "1.0x"))
-                    cameraController.switchToSensor(module)
-                    val isFront = module.equals("front", ignoreCase = true) || module.equals("self", ignoreCase = true)
-                    val zoomVal = if (isFront) 1.0f else (module.removeSuffix("x").removeSuffix("X").toFloatOrNull() ?: 1.0f)
-                    onZoomUpdatedFromPc?.invoke(zoomVal, isFront)
+                    val module = json.optString("module", json.optString("sensor_id", "main"))
+                    cameraController.selectCameraModule(module)
+                    onZoomUpdatedFromPc?.invoke(1.0f, cameraController.isFrontCameraActive)
                 }
 
                 "SwitchCamera", "SetCamera" -> {
@@ -417,12 +446,36 @@ class ControlServer(
                     onZoomUpdatedFromPc?.invoke(1.0f, isFront)
                 }
 
+                "SetTorch", "ToggleTorch" -> {
+                    if (json.has("enabled")) {
+                        cameraController.setTorchEnabled(json.optBoolean("enabled", false))
+                    } else {
+                        cameraController.toggleTorch()
+                    }
+                }
+
+                "SetAeLock", "ToggleAeLock" -> {
+                    if (json.has("locked")) {
+                        cameraController.setAeLocked(json.optBoolean("locked", false))
+                    } else {
+                        cameraController.toggleAeLock()
+                    }
+                }
+
+                "ResetAuto", "ResetAllToAuto" -> {
+                    cameraController.resetAllToAuto()
+                }
+
                 "SetResolution" -> {
                     val w = json.optInt("width", 1920)
                     val h = json.optInt("height", 1080)
-                    val fps = json.optInt("fps", 60)
+                    val fps = json.optInt("fps", 30)
                     cameraController.setResolution(w, h, fps)
-                    onResolutionUpdatedFromPc?.invoke(w, h, fps)
+                    onResolutionUpdatedFromPc?.invoke(
+                        cameraController.streamWidth,
+                        cameraController.streamHeight,
+                        cameraController.streamFps
+                    )
                 }
 
                 "SetRotation" -> {
@@ -441,9 +494,9 @@ class ControlServer(
                 }
 
                 "SetISO" -> {
-                    val isAuto = json.optBoolean("auto", true)
-                    val iso = json.optInt("iso", 100)
-                    if (isAuto) {
+                    val isAuto = json.optBoolean("auto", false)
+                    val iso = json.optInt("iso", 0)
+                    if (isAuto || iso <= 0) {
                         cameraController.updateManualIso(0)
                     } else {
                         cameraController.updateManualIso(iso)
@@ -451,9 +504,9 @@ class ControlServer(
                 }
 
                 "SetShutter" -> {
-                    val isAuto = json.optBoolean("auto", true)
-                    val expNs = json.optLong("exposure_ns", 20_000_000L)
-                    if (isAuto) {
+                    val isAuto = json.optBoolean("auto", false)
+                    val expNs = json.optLong("exposure_ns", 0L)
+                    if (isAuto || expNs <= 0L) {
                         cameraController.updateManualExposure(0L)
                     } else {
                         cameraController.updateManualExposure(expNs)
@@ -461,31 +514,31 @@ class ControlServer(
                 }
 
                 "SetFocus" -> {
-                    val mode = json.optString("mode", "AUTO")
+                    val isAuto = json.optBoolean("auto", false)
+                    val mode = json.optString("mode", "MANUAL")
                     val diopters = json.optDouble("distance_diopters", 0.0).toFloat()
-                    if (mode == "MANUAL") {
-                        cameraController.updateManualFocus(diopters)
-                    } else {
+                    if (isAuto || mode.equals("AUTO", ignoreCase = true) || diopters <= 0f) {
                         cameraController.updateManualFocus(0.0f)
+                    } else {
+                        cameraController.updateManualFocus(diopters)
                     }
                 }
 
                 "SetWhiteBalance" -> {
-                    val mode = json.optString("mode", "AUTO")
-                    val kelvin = json.optInt("kelvin", 5500)
-                    if (mode == "MANUAL_KELVIN") {
-                        cameraController.updateManualWhiteBalance(kelvin)
-                    } else {
+                    val isAuto = json.optBoolean("auto", false)
+                    val mode = json.optString("mode", "MANUAL_KELVIN")
+                    val kelvin = json.optInt("kelvin", 0)
+                    if (isAuto || mode.equals("AUTO", ignoreCase = true) || kelvin <= 0) {
                         cameraController.updateManualWhiteBalance(0)
+                    } else {
+                        cameraController.updateManualWhiteBalance(kelvin)
                     }
                 }
 
                 "set_mode" -> {
                     val modeStr = json.optString("mode", "auto")
-                    if (modeStr == "pro") {
-                        cameraController.setMode(CameraMode.Manual())
-                    } else {
-                        cameraController.setMode(CameraMode.Auto)
+                    if (modeStr.equals("auto", ignoreCase = true)) {
+                        cameraController.resetAllToAuto()
                     }
                 }
 
@@ -523,26 +576,12 @@ class ControlServer(
     }
 
     fun sendTelemetryState() {
-        val modelName = "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL}"
-        val presetsArr = JSONArray()
-        cameraController.supportedZoomPresets.forEach { presetsArr.put(it.toDouble()) }
-
         val battery = batteryLevelProvider?.invoke() ?: 100f
         val tempC = thermalTempProvider?.invoke() ?: 34.0f
 
         val stateObj = JSONObject().apply {
             put("type", "device_state")
-            put("device_name", modelName)
-            put("min_zoom", cameraController.minZoomRatio.toDouble())
-            put("max_zoom", cameraController.maxZoomRatio.toDouble())
-            put("current_zoom", cameraController.currentZoomRatio.toDouble())
-            put("supports_4k", cameraController.supports4K)
-            put("zoom_presets", presetsArr)
-            put("stream_width", cameraController.streamWidth)
-            put("stream_height", cameraController.streamHeight)
-            put("stream_fps", cameraController.streamFps)
-            put("is_front", cameraController.isFrontCameraActive)
-            put("rotation_deg", cameraController.manualStreamRotationOffsetDeg)
+            populateCapabilitiesFields(this)
             put("state", JSONObject().apply {
                 put("battery_level", battery.toDouble())
                 put("thermal_temp_c", tempC.toDouble())

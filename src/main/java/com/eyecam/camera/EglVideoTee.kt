@@ -14,27 +14,36 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
 import android.view.Surface
+import java.io.BufferedReader
+import java.io.InputStream
+import java.io.InputStreamReader
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
+import java.util.StringTokenizer
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import kotlin.math.floor
 import kotlin.math.hypot
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 /**
- * Zero-copy OpenGL ES 2.0 video tee.
+ * Zero-copy OpenGL ES 2.0 video tee with hardware-accelerated 3D LUT (.cube) shader grading.
  *
  * Receives camera frames from a single CameraX [Preview] SurfaceRequest via an OES
  * [SurfaceTexture], and renders each frame independently on a dedicated EGL thread to:
  *  1. The hardware H.264 encoder input [Surface] (landscape/auto-rotated stream with monotonic PTS).
  *  2. The optional UI [TextureView] [Surface] (FIT_CENTER letterboxed, zero stretching).
+ *
+ * Supports real-time `.cube` 3D LUT color grading packed into a 1024x32 2D texture (32^3 grid).
  */
 class EglVideoTee {
 
     companion object {
         private const val TAG = "EyeCam-EglTee"
         private const val EGL_RECORDABLE_ANDROID = 0x3142
+        private const val LUT_GRID_SIZE = 32 // 32x32x32 3D LUT -> 1024x32 2D strip
 
         private const val VERTEX_SHADER = """
             attribute vec4 aPosition;
@@ -53,8 +62,32 @@ class EglVideoTee {
             precision mediump float;
             varying vec2 vTexCoord;
             uniform samplerExternalOES sTexture;
+            uniform sampler2D sLutTexture;
+            uniform int uLutEnabled;
+
+            vec3 sampleLut3D(vec3 color) {
+                vec3 c = clamp(color, 0.0, 1.0);
+                float blueCoord = c.b * 31.0;
+                float slice0 = floor(blueCoord);
+                float slice1 = min(31.0, slice0 + 1.0);
+                float fracB = blueCoord - slice0;
+
+                float u0 = (slice0 * 32.0 + c.r * 31.0 + 0.5) / 1024.0;
+                float u1 = (slice1 * 32.0 + c.r * 31.0 + 0.5) / 1024.0;
+                float v  = (c.g * 31.0 + 0.5) / 32.0;
+
+                vec3 col0 = texture2D(sLutTexture, vec2(u0, v)).rgb;
+                vec3 col1 = texture2D(sLutTexture, vec2(u1, v)).rgb;
+                return mix(col0, col1, fracB);
+            }
+
             void main() {
-                gl_FragColor = texture2D(sTexture, vTexCoord);
+                vec4 src = texture2D(sTexture, vTexCoord);
+                if (uLutEnabled != 0) {
+                    gl_FragColor = vec4(sampleLut3D(src.rgb), src.a);
+                } else {
+                    gl_FragColor = src;
+                }
             }
         """
 
@@ -71,6 +104,168 @@ class EglVideoTee {
             0.0f, 1.0f,
             1.0f, 1.0f
         )
+
+        /**
+         * Parses a standard Adobe/Iridas `.cube` 3D (or 1D) LUT stream and bakes it into a
+         * 32x32x32 RGBA ByteBuffer (1024 x 32 pixels) ready for `glTexImage2D`.
+         */
+        fun parseCubeLutToRgba32(inputStream: InputStream): ByteBuffer? {
+            val reader = BufferedReader(InputStreamReader(inputStream, Charsets.UTF_8))
+            var lutSize = 0
+            var is1D = false
+            val domainMin = floatArrayOf(0f, 0f, 0f)
+            val domainMax = floatArrayOf(1f, 1f, 1f)
+            val rawFloats = FloatArray(65 * 65 * 65 * 3)
+            var floatCount = 0
+
+            var line: String?
+            while (reader.readLine().also { line = it } != null) {
+                val trimmed = line!!.trim()
+                if (trimmed.isEmpty() || trimmed.startsWith("#")) continue
+
+                val upper = trimmed.uppercase()
+                if (upper.startsWith("TITLE")) continue
+                if (upper.startsWith("LUT_3D_SIZE")) {
+                    val parts = trimmed.split(Regex("\\s+"))
+                    if (parts.size >= 2) {
+                        lutSize = parts[1].toIntOrNull()?.coerceIn(2, 65) ?: 0
+                        is1D = false
+                    }
+                    continue
+                }
+                if (upper.startsWith("LUT_1D_SIZE")) {
+                    val parts = trimmed.split(Regex("\\s+"))
+                    if (parts.size >= 2) {
+                        lutSize = parts[1].toIntOrNull()?.coerceIn(2, 4096) ?: 0
+                        is1D = true
+                    }
+                    continue
+                }
+                if (upper.startsWith("DOMAIN_MIN")) {
+                    val parts = trimmed.split(Regex("\\s+"))
+                    if (parts.size >= 4) {
+                        domainMin[0] = parts[1].toFloatOrNull() ?: 0f
+                        domainMin[1] = parts[2].toFloatOrNull() ?: 0f
+                        domainMin[2] = parts[3].toFloatOrNull() ?: 0f
+                    }
+                    continue
+                }
+                if (upper.startsWith("DOMAIN_MAX")) {
+                    val parts = trimmed.split(Regex("\\s+"))
+                    if (parts.size >= 4) {
+                        domainMax[0] = parts[1].toFloatOrNull() ?: 1f
+                        domainMax[1] = parts[2].toFloatOrNull() ?: 1f
+                        domainMax[2] = parts[3].toFloatOrNull() ?: 1f
+                    }
+                    continue
+                }
+                val firstCh = trimmed[0]
+                if ((firstCh in '0'..'9') || firstCh == '-' || firstCh == '+' || firstCh == '.') {
+                    val tok = StringTokenizer(trimmed)
+                    if (tok.countTokens() >= 3 && floatCount + 3 <= rawFloats.size) {
+                        val r = tok.nextToken().toFloatOrNull() ?: continue
+                        val g = tok.nextToken().toFloatOrNull() ?: continue
+                        val b = tok.nextToken().toFloatOrNull() ?: continue
+                        rawFloats[floatCount++] = r
+                        rawFloats[floatCount++] = g
+                        rawFloats[floatCount++] = b
+                    }
+                }
+            }
+
+            if (lutSize < 2) return null
+            val expectedTriples = if (is1D) lutSize else (lutSize * lutSize * lutSize)
+            if (floatCount < expectedTriples * 3) return null
+
+            val outBuf = ByteBuffer.allocateDirect(LUT_GRID_SIZE * LUT_GRID_SIZE * LUT_GRID_SIZE * 4)
+                .order(ByteOrder.nativeOrder())
+
+            val spanR = (domainMax[0] - domainMin[0]).takeIf { it > 1e-5f } ?: 1f
+            val spanG = (domainMax[1] - domainMin[1]).takeIf { it > 1e-5f } ?: 1f
+            val spanB = (domainMax[2] - domainMin[2]).takeIf { it > 1e-5f } ?: 1f
+
+            // Texture layout: width = 1024 (32 slices * 32 R), height = 32 (G)
+            // Row y corresponds to G = 0..31; column x corresponds to sliceB * 32 + R
+            for (gIdx in 0 until LUT_GRID_SIZE) {
+                val gNorm = ((gIdx.toFloat() / (LUT_GRID_SIZE - 1).toFloat()) - domainMin[1]) / spanG
+                for (bIdx in 0 until LUT_GRID_SIZE) {
+                    val bNorm = ((bIdx.toFloat() / (LUT_GRID_SIZE - 1).toFloat()) - domainMin[2]) / spanB
+                    for (rIdx in 0 until LUT_GRID_SIZE) {
+                        val rNorm = ((rIdx.toFloat() / (LUT_GRID_SIZE - 1).toFloat()) - domainMin[0]) / spanR
+
+                        val (outR, outG, outB) = if (is1D) {
+                            sample1D(rawFloats, lutSize, rNorm, gNorm, bNorm)
+                        } else {
+                            sample3DTrilinear(rawFloats, lutSize, rNorm, gNorm, bNorm)
+                        }
+
+                        outBuf.put((outR * 255f).roundToInt().coerceIn(0, 255).toByte())
+                        outBuf.put((outG * 255f).roundToInt().coerceIn(0, 255).toByte())
+                        outBuf.put((outB * 255f).roundToInt().coerceIn(0, 255).toByte())
+                        outBuf.put(255.toByte())
+                    }
+                }
+            }
+            outBuf.position(0)
+            return outBuf
+        }
+
+        private fun sample1D(data: FloatArray, n: Int, r: Float, g: Float, b: Float): Triple<Float, Float, Float> {
+            fun interp(v: Float, ch: Int): Float {
+                val pos = v.coerceIn(0f, 1f) * (n - 1)
+                val i0 = floor(pos).toInt().coerceIn(0, n - 1)
+                val i1 = (i0 + 1).coerceAtMost(n - 1)
+                val f = pos - i0
+                return data[i0 * 3 + ch] * (1f - f) + data[i1 * 3 + ch] * f
+            }
+            return Triple(interp(r, 0), interp(g, 1), interp(b, 2))
+        }
+
+        private fun sample3DTrilinear(
+            data: FloatArray,
+            n: Int,
+            r: Float,
+            g: Float,
+            b: Float
+        ): Triple<Float, Float, Float> {
+            val rf = r.coerceIn(0f, 1f) * (n - 1)
+            val gf = g.coerceIn(0f, 1f) * (n - 1)
+            val bf = b.coerceIn(0f, 1f) * (n - 1)
+
+            val r0 = floor(rf).toInt().coerceIn(0, n - 1)
+            val g0 = floor(gf).toInt().coerceIn(0, n - 1)
+            val b0 = floor(bf).toInt().coerceIn(0, n - 1)
+            val r1 = (r0 + 1).coerceAtMost(n - 1)
+            val g1 = (g0 + 1).coerceAtMost(n - 1)
+            val b1 = (b0 + 1).coerceAtMost(n - 1)
+
+            val dr = rf - r0
+            val dg = gf - g0
+            val db = bf - b0
+
+            fun idx(ir: Int, ig: Int, ib: Int): Int = ((ib * n + ig) * n + ir) * 3
+
+            val i000 = idx(r0, g0, b0)
+            val i100 = idx(r1, g0, b0)
+            val i010 = idx(r0, g1, b0)
+            val i110 = idx(r1, g1, b0)
+            val i001 = idx(r0, g0, b1)
+            val i101 = idx(r1, g0, b1)
+            val i011 = idx(r0, g1, b1)
+            val i111 = idx(r1, g1, b1)
+
+            fun ch(c: Int): Float {
+                val c00 = data[i000 + c] * (1f - dr) + data[i100 + c] * dr
+                val c10 = data[i010 + c] * (1f - dr) + data[i110 + c] * dr
+                val c01 = data[i001 + c] * (1f - dr) + data[i101 + c] * dr
+                val c11 = data[i011 + c] * (1f - dr) + data[i111 + c] * dr
+                val c0 = c00 * (1f - dg) + c10 * dg
+                val c1 = c01 * (1f - dg) + c11 * dg
+                return (c0 * (1f - db) + c1 * db).coerceIn(0f, 1f)
+            }
+
+            return Triple(ch(0), ch(1), ch(2))
+        }
     }
 
     private data class InputSession(
@@ -99,6 +294,11 @@ class EglVideoTee {
     private var uMvpMatrixLoc = -1
     private var uStMatrixLoc = -1
     private var sTextureLoc = -1
+    private var sLutTextureLoc = -1
+    private var uLutEnabledLoc = -1
+
+    private var lutTexId = 0
+    private var lutEnabled = false
 
     private val posBuffer: FloatBuffer = createFloatBuffer(QUAD_POSITIONS)
     private val texBuffer: FloatBuffer = createFloatBuffer(QUAD_TEX_COORDS)
@@ -109,6 +309,10 @@ class EglVideoTee {
     private var activeSession: InputSession? = null
     private val retiredSessions = mutableListOf<InputSession>()
     private var lastPtsNs = 0L
+    private var frameParity = 0
+
+    @Volatile
+    var lowEndPreviewThrottle: Boolean = false
 
     // Encoder output target (exclusively touched on glThread)
     private var encoderSurfaceRef: Surface? = null
@@ -145,6 +349,45 @@ class EglVideoTee {
 
     fun setOnFrameRenderedListener(listener: ((Long) -> Unit)?) {
         onFrameRendered = listener
+    }
+
+    /**
+     * Uploads or clears a 32x32x32 RGBA 3D LUT texture (1024x32) on the EGL thread.
+     */
+    fun setLutRgba32(rgbaBuffer: ByteBuffer?) {
+        if (released) return
+        glHandler.post {
+            if (released || eglDisplay == EGL14.EGL_NO_DISPLAY) return@post
+            makePbufferCurrent()
+            if (rgbaBuffer == null) {
+                lutEnabled = false
+                return@post
+            }
+            if (lutTexId == 0) {
+                val ids = IntArray(1)
+                GLES20.glGenTextures(1, ids, 0)
+                lutTexId = ids[0]
+            }
+            rgbaBuffer.position(0)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, lutTexId)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexImage2D(
+                GLES20.GL_TEXTURE_2D,
+                0,
+                GLES20.GL_RGBA,
+                LUT_GRID_SIZE * LUT_GRID_SIZE,
+                LUT_GRID_SIZE,
+                0,
+                GLES20.GL_RGBA,
+                GLES20.GL_UNSIGNED_BYTE,
+                rgbaBuffer
+            )
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+            lutEnabled = true
+        }
     }
 
     /**
@@ -185,9 +428,6 @@ class EglVideoTee {
         }
     }
 
-    /**
-     * Releases a previously acquired input [Surface] after CameraX completes the SurfaceRequest.
-     */
     fun releaseInputSurface(surface: Surface) {
         if (released) return
         glHandler.post {
@@ -209,10 +449,6 @@ class EglVideoTee {
         }
     }
 
-    /**
-     * Attaches or detaches the MediaCodec encoder input [Surface].
-     * When [await] is true, blocks briefly until any pending draw to the old surface finishes.
-     */
     fun setEncoderSurface(surface: Surface?, width: Int, height: Int, await: Boolean = false) {
         if (released && surface != null) return
         val latch = if (await) CountDownLatch(1) else null
@@ -243,10 +479,6 @@ class EglVideoTee {
         latch?.await(500, TimeUnit.MILLISECONDS)
     }
 
-    /**
-     * Attaches, resizes, or detaches the UI [TextureView] preview [Surface].
-     * When [await] is true (e.g., during SurfaceTexture destruction), blocks until destroyed.
-     */
     fun setPreviewSurface(surface: Surface?, width: Int, height: Int, await: Boolean = false) {
         if (released && surface != null) return
         val latch = if (await) CountDownLatch(1) else null
@@ -310,6 +542,10 @@ class EglVideoTee {
                 retiredSessions.forEach { destroyInputSession(it) }
                 retiredSessions.clear()
 
+                if (lutTexId != 0) {
+                    GLES20.glDeleteTextures(1, intArrayOf(lutTexId), 0)
+                    lutTexId = 0
+                }
                 if (encoderEglSurface != EGL14.EGL_NO_SURFACE) {
                     EGL14.eglDestroySurface(eglDisplay, encoderEglSurface)
                     encoderEglSurface = EGL14.EGL_NO_SURFACE
@@ -360,9 +596,10 @@ class EglVideoTee {
         val candidateNs = if (rawPtsNs > 0L) rawPtsNs else nowNs
         val ptsNs = if (candidateNs > lastPtsNs) candidateNs else lastPtsNs + 1_000_000L
         lastPtsNs = ptsNs
+        frameParity = (frameParity + 1) and 0x7FFF
 
         val encSurf = encoderSurfaceRef
-        if (encSurf != null && encSurf.isValid && encoderEglSurface != EGL14.EGL_NO_SURFACE) {
+        val encoderRendered = if (encSurf != null && encSurf.isValid && encoderEglSurface != EGL14.EGL_NO_SURFACE) {
             drawToSurface(
                 eglSurface = encoderEglSurface,
                 texId = session.texId,
@@ -374,11 +611,16 @@ class EglVideoTee {
                 desiredMirrorX = encoderMirrorX,
                 ptsNs = ptsNs
             )
+            true
+        } else {
+            false
         }
 
+        // On budget/legacy devices when encoder stream is active, render local UI preview every 2nd frame
+        val skipUiPreview = lowEndPreviewThrottle && encoderRendered && (frameParity and 1) == 1
         val prevSurf = previewSurfaceRef
-        if (prevSurf != null && prevSurf.isValid && previewEglSurface != EGL14.EGL_NO_SURFACE &&
-            previewWidth > 0 && previewHeight > 0
+        if (!skipUiPreview && prevSurf != null && prevSurf.isValid &&
+            previewEglSurface != EGL14.EGL_NO_SURFACE && previewWidth > 0 && previewHeight > 0
         ) {
             drawToSurface(
                 eglSurface = previewEglSurface,
@@ -411,12 +653,8 @@ class EglVideoTee {
             return
         }
 
-        // Query live EGL surface size so orientation switches never briefly stretch on stale view dimensions
-        val surfDim = IntArray(2)
-        EGL14.eglQuerySurface(eglDisplay, eglSurface, EGL14.EGL_WIDTH, surfDim, 0)
-        EGL14.eglQuerySurface(eglDisplay, eglSurface, EGL14.EGL_HEIGHT, surfDim, 1)
-        val actualDstW = if (surfDim[0] > 0) surfDim[0] else dstW
-        val actualDstH = if (surfDim[1] > 0) surfDim[1] else dstH
+        val actualDstW = dstW
+        val actualDstH = dstH
         if (actualDstW <= 0 || actualDstH <= 0) return
 
         GLES20.glDisable(GLES20.GL_CULL_FACE)
@@ -424,8 +662,6 @@ class EglVideoTee {
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
 
-        // SurfaceTexture#getTransformMatrix already embeds HAL sensor->natural rotation and front-cam H-flip.
-        // Measure the true post-stMatrix aspect dimensions and reflection parity directly from stMatrix.
         val rawSpanW = hypot(stMatrix[0] * bufW.toFloat(), stMatrix[1] * bufH.toFloat())
         val rawSpanH = hypot(stMatrix[4] * bufW.toFloat(), stMatrix[5] * bufH.toFloat())
         val srcW = if (rawSpanW > 1f) rawSpanW else bufW.toFloat().coerceAtLeast(1f)
@@ -455,6 +691,15 @@ class EglVideoTee {
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, texId)
         GLES20.glUniform1i(sTextureLoc, 0)
+
+        if (lutEnabled && lutTexId != 0) {
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, lutTexId)
+            GLES20.glUniform1i(sLutTextureLoc, 1)
+            GLES20.glUniform1i(uLutEnabledLoc, 1)
+        } else {
+            GLES20.glUniform1i(uLutEnabledLoc, 0)
+        }
 
         posBuffer.position(0)
         GLES20.glEnableVertexAttribArray(aPositionLoc)
@@ -501,6 +746,8 @@ class EglVideoTee {
         uMvpMatrixLoc = GLES20.glGetUniformLocation(program, "uMvpMatrix")
         uStMatrixLoc = GLES20.glGetUniformLocation(program, "uStMatrix")
         sTextureLoc = GLES20.glGetUniformLocation(program, "sTexture")
+        sLutTextureLoc = GLES20.glGetUniformLocation(program, "sLutTexture")
+        uLutEnabledLoc = GLES20.glGetUniformLocation(program, "uLutEnabled")
     }
 
     private fun chooseEglConfig(recordable: Boolean): EGLConfig? {

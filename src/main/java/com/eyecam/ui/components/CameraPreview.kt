@@ -55,7 +55,7 @@ import kotlinx.coroutines.delay
  * Професійний в'юпорт попереднього перегляду камери на базі TextureView + OpenGL ES Tee:
  * - Нульове розтягування в портретному та ландшафтному режимах незалежно від автоповороту.
  * - Миттєва реакція на зміну кута дисплея (0/90/180/270), включно зі швидким переворотом на 180°.
- * - Безпечне від'єднання лише UI-поверхні при блокуванні екрана — стрім у сервісі не переривається.
+ * - Візуальне кільце автофокусу як при тапі по екрану, так і при натисканні кнопки автофокусу.
  */
 @Composable
 fun CameraPreview(
@@ -64,6 +64,7 @@ fun CameraPreview(
     isDisplayProtectionActive: Boolean = false,
     streamWidth: Int = 1920,
     streamHeight: Int = 1080,
+    afTriggerPulseSeq: Long = 0L,
     onSurfaceChanged: (surface: Surface?, width: Int, height: Int, displayRotation: Int) -> Unit = { _, _, _, _ -> },
     onFocusPointTapped: ((Float, Float) -> Unit)? = null,
     onRequestPermissions: () -> Unit = {},
@@ -71,17 +72,25 @@ fun CameraPreview(
 ) {
     val context = LocalContext.current
     var tapFocusPoint by remember { mutableStateOf<Offset?>(null) }
+    var showCenterAfPulse by remember { mutableStateOf(false) }
     var activeTextureView by remember { mutableStateOf<TextureView?>(null) }
     var activeSurface by remember { mutableStateOf<Surface?>(null) }
 
     LaunchedEffect(tapFocusPoint) {
         if (tapFocusPoint != null) {
-            delay(1200L)
+            delay(1000L)
             tapFocusPoint = null
         }
     }
 
-    // Track 180-degree display flips where View width/height remain identical
+    LaunchedEffect(afTriggerPulseSeq) {
+        if (afTriggerPulseSeq > 0L) {
+            showCenterAfPulse = true
+            delay(950L)
+            showCenterAfPulse = false
+        }
+    }
+
     DisposableEffect(context) {
         val dm = context.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
         val listener = object : DisplayManager.DisplayListener {
@@ -199,12 +208,14 @@ fun CameraPreview(
                         )
                     }
 
-                    tapFocusPoint?.let { pt ->
+                    val pt = tapFocusPoint
+                    if (pt != null) {
                         Box(
                             modifier = Modifier
-                                .offset { IntOffset((pt.x - 24.dp.toPx()).toInt(), (pt.y - 24.dp.toPx()).toInt()) }
-                                .size(48.dp)
+                                .offset { IntOffset((pt.x - 26.dp.toPx()).toInt(), (pt.y - 26.dp.toPx()).toInt()) }
+                                .size(52.dp)
                                 .clip(CircleShape)
+                                .background(StatusCyan.copy(alpha = 0.14f))
                                 .border(2.dp, StatusCyan, CircleShape),
                             contentAlignment = Alignment.Center
                         ) {
@@ -212,7 +223,24 @@ fun CameraPreview(
                                 imageVector = Icons.Default.CenterFocusStrong,
                                 contentDescription = "Focusing",
                                 tint = StatusCyan,
-                                modifier = Modifier.size(20.dp)
+                                modifier = Modifier.size(22.dp)
+                            )
+                        }
+                    } else if (showCenterAfPulse) {
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.Center)
+                                .size(64.dp)
+                                .clip(CircleShape)
+                                .background(StatusEmerald.copy(alpha = 0.18f))
+                                .border(2.dp, StatusEmerald, CircleShape),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.CenterFocusStrong,
+                                contentDescription = "AF Triggered",
+                                tint = StatusEmerald,
+                                modifier = Modifier.size(28.dp)
                             )
                         }
                     }

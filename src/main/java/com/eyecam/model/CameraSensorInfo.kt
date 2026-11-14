@@ -4,6 +4,24 @@ enum class SensorType {
     WIDE, ULTRA_WIDE, TELEPHOTO, MACRO, FRONT, UNKNOWN
 }
 
+/**
+ * Опис окремого фізичного або логічного модуля камери для прямого вибору
+ * без автоматичного перестрибування між об'єктивами під час зумування.
+ */
+data class CameraModuleInfo(
+    val key: String,                 // "uw", "main", "tele", "tele5x", "macro", "front"
+    val label: String,               // "0.5x UW", "1x Main", "2x Tele", "3x Tele", "5x Tele", "Front"
+    val shortLabel: String,          // "0.5x", "1x", "2x", "3x", "5x", "SELF"
+    val logicalCameraId: String,
+    val physicalCameraId: String? = null,
+    val sensorType: SensorType = SensorType.WIDE,
+    val isFront: Boolean = false,
+    val baseOpticalZoom: Float = 1.0f,
+    val maxIntraZoom: Float = 6.0f,
+    val logicalBandMin: Float = 1.0f,
+    val logicalBandMax: Float = 1.95f
+)
+
 data class CameraSensorInfo(
     val id: String,
     val isLogical: Boolean,

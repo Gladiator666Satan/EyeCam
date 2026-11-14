@@ -103,6 +103,8 @@ if (WIN32)
         advapi32.lib
         user32.lib
         gdi32.lib
+        winhttp.lib
+        comdlg32.lib
     )
 
     # Тестовий додаток стрімінгу для Windows
