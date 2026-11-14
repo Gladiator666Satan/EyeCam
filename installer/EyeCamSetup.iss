@@ -5,7 +5,7 @@
 ; ==============================================================================
 
 #define MyAppName "EyeCam Studio"
-#define MyAppVersion "1.4.0"
+#define MyAppVersion "1.4.1"
 #define MyAppPublisher "EyeCam Open-Source Project"
 #define MyAppURL "https://github.com/Gladiator666Satan/EyeCam"
 #define MyAppExeName "EyeCamStudio.exe"
@@ -35,6 +35,8 @@ SolidCompression=yes
 WizardStyle=modern
 DisableWelcomePage=no
 CloseApplications=yes
+CloseApplicationsFilter=EyeCamStudio.exe
+RestartApplications=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -46,7 +48,7 @@ Name: "firewall"; Description: "Configure Windows Firewall rules for Wi-Fi & USB
 
 [Files]
 Source: "..\build\bin\Release\EyeCamStudio.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\build\bin\Release\EyeCamFilter.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\build\bin\Release\EyeCamFilter.dll"; DestDir: "{app}"; Flags: ignoreversion restartreplace
 Source: "..\build\bin\Release\windows_test.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\src\windows\gui\eyecam_pc.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\src\windows\gui\eyecam_cyber.ico"; DestDir: "{app}"; Flags: ignoreversion

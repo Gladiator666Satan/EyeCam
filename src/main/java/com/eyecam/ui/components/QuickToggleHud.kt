@@ -576,60 +576,97 @@ private fun ProManualAndLutPanel(
             }
         }
 
-        val isoVal = 100 + (isoSlider * 3100f).roundToInt()
+        val autoIsoSlider = ((uiState.liveIso.coerceIn(50, 3200) - 50f) / 3150f).coerceIn(0f, 1f)
+        val effectiveIsoSlider = if (mode.isIsoManual) isoSlider else autoIsoSlider
+        val isoVal = if (mode.isIsoManual) {
+            50 + (isoSlider * 3150f).roundToInt()
+        } else {
+            uiState.liveIso.coerceIn(50, 3200)
+        }
         LockableParameterSliderRow(
-            title = if (mode.isIsoManual) "ISO: $isoVal" else "ISO: AUTO",
-            value = isoSlider,
+            title = if (mode.isIsoManual) "ISO: $isoVal" else "ISO: AUTO ($isoVal)",
+            value = effectiveIsoSlider,
             isLocked = mode.isIsoManual,
             onValueChange = { v ->
                 isoSlider = v
-                val nextIso = 100 + (v * 3100f).roundToInt()
+                val nextIso = (50 + (v * 3150f).roundToInt()).coerceAtLeast(50)
                 onUpdateManualIso(nextIso)
             },
             onUnlockToAuto = { onUpdateManualIso(0) }
         )
 
-        val shutterDenom = 30 + (shutterSlider * 3970f).roundToInt()
+        val liveShutterDenom = (1_000_000_000L / uiState.liveExposureNs.coerceIn(250_000L, 66_666_666L)).toInt().coerceIn(15, 4000)
+        val autoShutterSlider = ((liveShutterDenom - 15f) / 3985f).coerceIn(0f, 1f)
+        val effectiveShutterSlider = if (mode.isShutterManual) shutterSlider else autoShutterSlider
+        val shutterDenom = if (mode.isShutterManual) {
+            15 + (shutterSlider * 3985f).roundToInt()
+        } else {
+            liveShutterDenom
+        }
         val shutterLabel = if (isUa) "Витримка" else "Shutter"
         LockableParameterSliderRow(
-            title = if (mode.isShutterManual) "$shutterLabel: 1/${shutterDenom}s" else "$shutterLabel: AUTO",
-            value = shutterSlider,
+            title = if (mode.isShutterManual) {
+                "$shutterLabel: 1/${shutterDenom}s"
+            } else {
+                "$shutterLabel: AUTO (1/${shutterDenom}s)"
+            },
+            value = effectiveShutterSlider,
             isLocked = mode.isShutterManual,
             onValueChange = { v ->
                 shutterSlider = v
-                val denom = 30 + (v * 3970f).roundToInt()
-                val expNs = 1_000_000_000L / denom.toLong()
+                val denom = (15 + (v * 3985f).roundToInt()).coerceIn(15, 4000)
+                val expNs = (1_000_000_000L / denom.toLong()).coerceAtLeast(100_000L)
                 onUpdateManualShutter(expNs)
             },
             onUnlockToAuto = { onUpdateManualShutter(0L) }
         )
 
-        val focusDiopters = focusSlider * 10.0f
+        val autoFocusSlider = uiState.liveFocusNorm.coerceIn(0f, 1f)
+        val effectiveFocusSlider = if (mode.isFocusManual) focusSlider else autoFocusSlider
+        val activeModMaxFocus = (uiState.availableModules.find { it.key == uiState.activeModuleKey }?.maxFocusDiopters ?: 4.0f)
+            .coerceAtLeast(0.5f)
+        val focusDiopters = if (mode.isFocusManual) {
+            val curved = (0.35f * focusSlider + 0.65f * focusSlider * focusSlider).coerceIn(0f, 1f)
+            curved * activeModMaxFocus
+        } else {
+            uiState.liveFocusDiopters.coerceAtLeast(0f)
+        }
         val focusLabel = if (isUa) "Фокус" else "Focus"
         LockableParameterSliderRow(
             title = if (mode.isFocusManual) {
-                String.format(Locale.US, "$focusLabel: %.1f dpt", focusDiopters)
+                if (focusDiopters <= 0.03f) {
+                    "$focusLabel: ∞ (0.0 dpt)"
+                } else {
+                    String.format(Locale.US, "$focusLabel: %.1f dpt", focusDiopters)
+                }
             } else {
-                "$focusLabel: AUTO"
+                String.format(Locale.US, "$focusLabel: AUTO (%.1f)", focusDiopters)
             },
-            value = focusSlider,
+            value = effectiveFocusSlider,
             isLocked = mode.isFocusManual,
             onValueChange = { v ->
                 focusSlider = v
-                onUpdateManualFocus((v * 10.0f).coerceAtLeast(0.05f))
+                // 0.0f stays in MANUAL mode (0.0 dpt = infinity ∞); only -1.0f unlocks to AUTO
+                onUpdateManualFocus((v * 10.0f).coerceIn(0f, 10f))
             },
-            onUnlockToAuto = { onUpdateManualFocus(0f) }
+            onUnlockToAuto = { onUpdateManualFocus(-1.0f) }
         )
 
-        val wbKelvin = 2800 + (wbSlider * 5700f).roundToInt()
+        val autoWbSlider = ((uiState.liveWbKelvin.coerceIn(2800, 8500) - 2800f) / 5700f).coerceIn(0f, 1f)
+        val effectiveWbSlider = if (mode.isWbManual) wbSlider else autoWbSlider
+        val wbKelvin = if (mode.isWbManual) {
+            2800 + (wbSlider * 5700f).roundToInt()
+        } else {
+            uiState.liveWbKelvin.coerceIn(2800, 8500)
+        }
         val wbLabel = if (isUa) "ББ" else "WB"
         LockableParameterSliderRow(
-            title = if (mode.isWbManual) "$wbLabel: ${wbKelvin}K" else "$wbLabel: AUTO",
-            value = wbSlider,
+            title = if (mode.isWbManual) "$wbLabel: ${wbKelvin}K" else "$wbLabel: AUTO (${wbKelvin}K)",
+            value = effectiveWbSlider,
             isLocked = mode.isWbManual,
             onValueChange = { v ->
                 wbSlider = v
-                val k = 2800 + (v * 5700f).roundToInt()
+                val k = (2800 + (v * 5700f).roundToInt()).coerceIn(2800, 8500)
                 onUpdateManualWb(k)
             },
             onUnlockToAuto = { onUpdateManualWb(0) }
@@ -703,12 +740,13 @@ private fun LockableParameterSliderRow(
     ) {
         Text(
             text = title,
-            fontSize = 10.sp,
+            fontSize = 9.5.sp,
             fontWeight = FontWeight.SemiBold,
             color = if (isLocked) StatusCyan else TextSecondary,
             fontFamily = FontFamily.Monospace,
             maxLines = 1,
-            modifier = Modifier.width(114.dp)
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.width(128.dp)
         )
 
         Slider(

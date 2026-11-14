@@ -175,9 +175,34 @@ private:
 // EyeCamOutputPin Реалізація
 // ----------------------------------------------------------------------------
 
+static bool QueryActiveSharedMemoryFormat(uint32_t& outW, uint32_t& outH, uint32_t& outFps) {
+    HANDLE hMap = OpenFileMappingW(FILE_MAP_READ, FALSE, SHM_NAME_GLOBAL);
+    if (!hMap) {
+        hMap = OpenFileMappingW(FILE_MAP_READ, FALSE, SHM_NAME_LOCAL);
+    }
+    if (!hMap) return false;
+
+    bool found = false;
+    void* pBuf = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, sizeof(SharedMemoryHeader));
+    if (pBuf) {
+        auto* hdr = reinterpret_cast<const SharedMemoryHeader*>(pBuf);
+        if (hdr->magic == EYECAM_MAGIC && hdr->width >= 320 && hdr->height >= 240) {
+            outW = hdr->width;
+            outH = hdr->height;
+            outFps = (hdr->fps >= 15 && hdr->fps <= 60) ? hdr->fps : 30;
+            found = true;
+        }
+        UnmapViewOfFile(pBuf);
+    }
+    CloseHandle(hMap);
+    return found;
+}
+
 EyeCamOutputPin::EyeCamOutputPin(EyeCamCaptureFilter* pFilter)
     : m_pFilter(pFilter) {
-    CreateDefaultMediaType(&m_mediaType, 1920, 1080, PixelFormat::YUY2, 60);
+    uint32_t w = 1920, h = 1080, fps = 30;
+    QueryActiveSharedMemoryFormat(w, h, fps);
+    CreateDefaultMediaType(&m_mediaType, w, h, PixelFormat::YUY2, fps);
     m_hasMediaType = true;
 }
 

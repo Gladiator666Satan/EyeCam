@@ -19,7 +19,8 @@ data class CameraModuleInfo(
     val baseOpticalZoom: Float = 1.0f,
     val maxIntraZoom: Float = 6.0f,
     val logicalBandMin: Float = 1.0f,
-    val logicalBandMax: Float = 1.95f
+    val logicalBandMax: Float = 1.95f,
+    val maxFocusDiopters: Float = 5.0f
 )
 
 data class CameraSensorInfo(

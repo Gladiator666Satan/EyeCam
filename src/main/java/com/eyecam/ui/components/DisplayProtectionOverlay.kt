@@ -69,14 +69,16 @@ fun DisplayProtectionOverlay(
     var pixelShiftX by remember { mutableIntStateOf(0) }
     var pixelShiftY by remember { mutableIntStateOf(0) }
 
-    LaunchedEffect(Unit) {
+    LaunchedEffect(uiState.isDisplayProtectionActive) {
+        if (!uiState.isDisplayProtectionActive) return@LaunchedEffect
         while (true) {
             currentTimeString = timeFormatter.format(Date())
             delay(1000L)
         }
     }
 
-    LaunchedEffect(Unit) {
+    LaunchedEffect(uiState.isDisplayProtectionActive) {
+        if (!uiState.isDisplayProtectionActive) return@LaunchedEffect
         while (true) {
             delay(30_000L) // Зсув пікселів кожні 30 секунд
             pixelShiftX = Random.nextInt(-20, 21)

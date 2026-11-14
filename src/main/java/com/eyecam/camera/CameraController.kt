@@ -80,10 +80,10 @@ class CameraController(private val context: Context) {
 
         fun defaultBitrateForResolution(width: Int, fps: Int, isLowEnd: Boolean = false): Int {
             val base = when {
-                width >= 3840 -> 28_000_000
-                width >= 2560 -> 18_000_000
-                width >= 1920 -> if (isLowEnd) 7_000_000 else 12_000_000
-                else -> if (isLowEnd) 4_000_000 else 6_000_000
+                width >= 3840 -> 18_000_000
+                width >= 2560 -> 11_000_000
+                width >= 1920 -> if (isLowEnd) 5_500_000 else 7_500_000
+                else -> if (isLowEnd) 3_500_000 else 4_500_000
             }
             return if (fps >= 60) (base * 1.25f).toInt() else base
         }
@@ -188,13 +188,23 @@ class CameraController(private val context: Context) {
     val afTriggerPulseSeq: Long get() = afPulseSeqGen.get()
     val autoModePulseSeq: Long get() = autoModePulseSeqGen.get()
 
-    // Pro / Manual parameters + live captured AWB calibration per lens
+    // Pro / Manual parameters + live captured ISP telemetry for AUTO sliders
     @Volatile var currentMode: CameraMode = CameraMode.Auto
         private set
     @Volatile private var lastNeutralGains: RggbChannelVector? = null
     @Volatile private var lastColorTransform: ColorSpaceTransform? = null
     @Volatile private var lastMeasuredIso: Int? = null
     @Volatile private var lastMeasuredExposureNs: Long? = null
+    @Volatile var liveIso: Int = 200
+        private set
+    @Volatile var liveExposureNs: Long = 16_666_666L
+        private set
+    @Volatile var liveFocusDiopters: Float = 0.5f
+        private set
+    @Volatile var liveFocusNorm: Float = 0.15f
+        private set
+    @Volatile var liveWbKelvin: Int = 5200
+        private set
     @Volatile private var activeFpsRange: Range<Int> = Range(15, 30)
     private val captureSampleCounter = AtomicInteger(0)
 
@@ -229,6 +239,7 @@ class CameraController(private val context: Context) {
             measuredFps = fps
             measuredBitrateKbps = ((bytes * 8L) / 1000L).toInt()
             onTelemetryMeasured?.invoke(measuredFps, measuredBitrateKbps)
+            onStateChanged?.invoke()
             mainHandler.postDelayed(this, 1000L)
         }
     }
@@ -495,9 +506,10 @@ class CameraController(private val context: Context) {
         if (isLowEndDevice && streamFps > 30) {
             streamFps = 30
             streamBitrate = defaultBitrateForResolution(streamWidth, streamFps, isLowEnd = true)
-        } else if (!isLowEndDevice && supports60Fps && streamFps == 30 && !cameraOpenRequested) {
-            streamFps = 60
-            streamBitrate = defaultBitrateForResolution(streamWidth, streamFps, isLowEnd = false)
+        } else if (!cameraOpenRequested) {
+            // Default to 30 FPS on startup to prevent overheating on flagship multi-cam devices (e.g. S26 Ultra)
+            streamFps = 30
+            streamBitrate = defaultBitrateForResolution(streamWidth, streamFps, isLowEnd = isLowEndDevice)
         }
 
         // Build structured CameraModuleInfo list
@@ -593,6 +605,7 @@ class CameraController(private val context: Context) {
             } else {
                 uwSensor.id
             }
+            val uwMaxFocus = (uwSensor?.minFocusDistance ?: 6.0f).takeIf { it > 0.5f }?.coerceIn(2.0f, 8.0f) ?: 6.0f
             modules.add(
                 CameraModuleInfo(
                     key = "uw",
@@ -604,8 +617,9 @@ class CameraController(private val context: Context) {
                     isFront = false,
                     baseOpticalZoom = 0.5f,
                     maxIntraZoom = 2.5f,
-                    logicalBandMin = rearLogicalMinZ.coerceIn(0.5f, 0.65f),
-                    logicalBandMax = 0.95f
+                    logicalBandMin = rearLogicalMinZ.coerceIn(0.55f, 0.65f),
+                    logicalBandMax = 0.85f,
+                    maxFocusDiopters = uwMaxFocus
                 )
             )
         }
@@ -623,9 +637,16 @@ class CameraController(private val context: Context) {
             val parentLog = mainSensor?.let { physicalSubCameras[it.id] }
             val logId = parentLog ?: rearLogicalCameraId
             val maxBandForMain = if (hasTeleModule) {
-                (firstTeleDisplayRatio.toFloat() - 0.08f).coerceAtLeast(1.92f)
+                (firstTeleDisplayRatio.toFloat() - 0.15f).coerceAtLeast(1.85f)
             } else {
                 rearLogicalMaxZ.coerceIn(2.0f, 8.0f)
+            }
+            val rawMainMinFocus = (mainSensor?.minFocusDistance ?: 5.0f).takeIf { it > 0.5f } ?: 5.0f
+            // Cap below logical macro-crossover threshold on multi-camera flagships so focus never jumps to UW
+            val mainMaxFocus = if (hasUwModule) {
+                (rawMainMinFocus * 0.72f).coerceIn(2.0f, 3.8f)
+            } else {
+                rawMainMinFocus.coerceIn(2.0f, 10.0f)
             }
             modules.add(
                 CameraModuleInfo(
@@ -639,7 +660,8 @@ class CameraController(private val context: Context) {
                     baseOpticalZoom = 1.0f,
                     maxIntraZoom = if (isLowEndDevice) 4.0f else 6.0f,
                     logicalBandMin = 1.0f,
-                    logicalBandMax = maxBandForMain
+                    logicalBandMax = maxBandForMain,
+                    maxFocusDiopters = mainMaxFocus
                 )
             )
         }
@@ -648,6 +670,8 @@ class CameraController(private val context: Context) {
         if (hasTeleModule) {
             val parentLog = firstTele?.let { physicalSubCameras[it.id] }
             val logId = if (parentLog != null || firstTele == null) rearLogicalCameraId else firstTele.id
+            val rawTeleFocus = (firstTele?.minFocusDistance ?: 2.0f).takeIf { it > 0.3f } ?: 2.0f
+            val teleMaxFocus = (rawTeleFocus * 0.80f).coerceIn(1.0f, 2.2f)
             modules.add(
                 CameraModuleInfo(
                     key = "tele",
@@ -659,8 +683,9 @@ class CameraController(private val context: Context) {
                     isFront = false,
                     baseOpticalZoom = firstTeleDisplayRatio.toFloat(),
                     maxIntraZoom = 6.0f,
-                    logicalBandMin = firstTeleDisplayRatio.toFloat(),
-                    logicalBandMax = if (hasSecondTeleModule) 4.92f else rearLogicalMaxZ.coerceIn(6.0f, 12.0f)
+                    logicalBandMin = firstTeleDisplayRatio.toFloat() + 0.05f,
+                    logicalBandMax = if (hasSecondTeleModule) 4.80f else rearLogicalMaxZ.coerceIn(6.0f, 12.0f),
+                    maxFocusDiopters = teleMaxFocus
                 )
             )
         }
@@ -670,6 +695,8 @@ class CameraController(private val context: Context) {
         if (hasSecondTeleModule) {
             val parentLog = secondTele?.let { physicalSubCameras[it.id] }
             val logId = if (parentLog != null || secondTele == null) rearLogicalCameraId else secondTele.id
+            val rawTele5Focus = (secondTele?.minFocusDistance ?: 1.4f).takeIf { it > 0.3f } ?: 1.4f
+            val tele5MaxFocus = (rawTele5Focus * 0.80f).coerceIn(0.8f, 1.6f)
             modules.add(
                 CameraModuleInfo(
                     key = "tele5x",
@@ -681,8 +708,9 @@ class CameraController(private val context: Context) {
                     isFront = false,
                     baseOpticalZoom = 5.0f,
                     maxIntraZoom = 8.0f,
-                    logicalBandMin = 5.0f,
-                    logicalBandMax = rearLogicalMaxZ.coerceIn(10.0f, 20.0f)
+                    logicalBandMin = 5.05f,
+                    logicalBandMax = rearLogicalMaxZ.coerceIn(10.0f, 20.0f),
+                    maxFocusDiopters = tele5MaxFocus
                 )
             )
         }
@@ -701,7 +729,8 @@ class CameraController(private val context: Context) {
                     baseOpticalZoom = 1.0f,
                     maxIntraZoom = 3.0f,
                     logicalBandMin = 1.0f,
-                    logicalBandMax = 3.0f
+                    logicalBandMax = 3.0f,
+                    maxFocusDiopters = 3.0f
                 )
             )
         }
@@ -871,12 +900,18 @@ class CameraController(private val context: Context) {
         maxIntraModuleZoom = matched.maxIntraZoom
         lastNeutralGains = null
         lastColorTransform = null
+        eglTee.setUserZoom(1.0f)
 
         runOnMain {
             if (cameraOpenRequested) {
                 if (needRebind) {
                     bindOrRebindCamera()
                 } else {
+                    try {
+                        boundCamera?.let { cam ->
+                            Camera2CameraControl.from(cam.cameraControl).clearCaptureRequestOptions()
+                        }
+                    } catch (_: Exception) {}
                     applyIntraModuleZoomInternal(1.0f)
                     applyCurrentCameraControls()
                 }
@@ -915,25 +950,21 @@ class CameraController(private val context: Context) {
         intraModuleZoom = clampedIntra
         currentZoomRatio = clampedIntra
 
-        if (isPhysicalCameraPinned || selectedPhysicalCameraId == null && mod?.baseOpticalZoom == 1.0f && availableModules.count { !it.isFront } <= 1) {
-            // Single physical sensor bound: apply crop/zoom directly on this sensor
-            val zoomState = cam.cameraInfo.zoomState.value
-            val minZ = zoomState?.minZoomRatio ?: 1.0f
-            val maxZ = zoomState?.maxZoomRatio ?: maxIntraModuleZoom
-            cam.cameraControl.setZoomRatio(clampedIntra.coerceIn(minZ.coerceAtLeast(1.0f), maxZ))
-            applyCurrentCameraControls()
-        } else if (mod != null && !mod.isFront) {
-            // Bound to logical multi-camera: stay strictly within this module's optical band so HAL never switches lenses
-            val bandMin = mod.logicalBandMin
-            val bandMax = mod.logicalBandMax
-            val norm = ((clampedIntra - 1.0f) / (mod.maxIntraZoom - 1.0f).coerceAtLeast(0.1f)).coerceIn(0f, 1f)
-            val targetLogicalZoom = (bandMin + norm * (bandMax - bandMin)).coerceIn(bandMin, bandMax)
-            cam.cameraControl.setZoomRatio(targetLogicalZoom)
+        // Perform intra-module zoom in the OpenGL ES shader (EglVideoTee) while keeping hardware
+        // CONTROL_ZOOM_RATIO pinned strictly at the module's base optical ratio (logicalBandMin).
+        // This guarantees 100% that Samsung/OEM logical camera HALs never switch physical modules
+        // when zooming deeply or changing focus distance.
+        eglTee.setUserZoom(clampedIntra)
+
+        val zoomState = cam.cameraInfo.zoomState.value
+        val hwMin = zoomState?.minZoomRatio ?: 1.0f
+        val hwMax = zoomState?.maxZoomRatio ?: 10.0f
+        val pinnedHwZoom = if (mod != null && !mod.isFront && !isPhysicalCameraPinned) {
+            mod.logicalBandMin.coerceIn(hwMin, hwMax)
         } else {
-            val zoomState = cam.cameraInfo.zoomState.value
-            val maxZ = zoomState?.maxZoomRatio ?: 3.0f
-            cam.cameraControl.setZoomRatio(clampedIntra.coerceIn(1.0f, maxZ))
+            1.0f.coerceIn(hwMin, hwMax)
         }
+        cam.cameraControl.setZoomRatio(pinnedHwZoom)
     }
 
     /**
@@ -947,6 +978,7 @@ class CameraController(private val context: Context) {
                 try {
                     boundCamera?.cameraControl?.enableTorch(false)
                 } catch (_: Exception) {}
+                applyCurrentCameraControls()
                 onStateChanged?.invoke()
             }
             return
@@ -958,12 +990,17 @@ class CameraController(private val context: Context) {
             } catch (e: Exception) {
                 Log.w(TAG, "enableTorch($enabled) failed: ${e.message}")
             }
+            applyCurrentCameraControls()
             onStateChanged?.invoke()
         }
     }
 
     fun toggleTorch() {
         setTorchEnabled(!isTorchOn)
+    }
+
+    fun setDisplayProtectionActive(active: Boolean) {
+        eglTee.skipLocalPreview = active
     }
 
     /**
@@ -1026,7 +1063,10 @@ class CameraController(private val context: Context) {
         streamBitrate = defaultBitrateForResolution(w, f, isLowEndDevice).coerceAtMost(sanitized.bitrate)
 
         if (!changed) {
-            runOnMain { onStateChanged?.invoke() }
+            runOnMain {
+                requestKeyFrame()
+                onStateChanged?.invoke()
+            }
             return
         }
         runOnMain {
@@ -1036,6 +1076,8 @@ class CameraController(private val context: Context) {
             if (cameraOpenRequested) {
                 bindOrRebindCamera()
             }
+            mainHandler.postDelayed({ requestKeyFrame() }, 150L)
+            mainHandler.postDelayed({ requestKeyFrame() }, 450L)
             onStateChanged?.invoke()
         }
     }
@@ -1054,7 +1096,19 @@ class CameraController(private val context: Context) {
 
     fun updateManualFocus(focusDistanceDiopters: Float) {
         val base = currentMode as? CameraMode.Manual ?: CameraMode.Manual()
-        setMode(base.copy(focusDistance = focusDistanceDiopters.coerceAtLeast(0f)).normalized())
+        val nextFocus = if (focusDistanceDiopters < 0f) {
+            -1.0f
+        } else {
+            focusDistanceDiopters.coerceIn(0f, 10f)
+        }
+        if (nextFocus >= 0f) {
+            runOnMain {
+                try {
+                    boundCamera?.cameraControl?.cancelFocusAndMetering()
+                } catch (_: Exception) {}
+            }
+        }
+        setMode(base.copy(focusDistance = nextFocus).normalized())
     }
 
     fun updateManualWhiteBalance(kelvin: Int) {
@@ -1088,8 +1142,8 @@ class CameraController(private val context: Context) {
         afPulseSeqGen.incrementAndGet()
         // If focus was manually locked, unlock focus so autofocus actually engages
         val mode = currentMode
-        if (mode is CameraMode.Manual && mode.focusDistance > 0f) {
-            currentMode = mode.copy(focusDistance = 0f).normalized()
+        if (mode is CameraMode.Manual && mode.focusDistance >= 0f) {
+            currentMode = mode.copy(focusDistance = -1.0f).normalized()
         }
         runOnMain {
             applyCurrentCameraControls()
@@ -1111,8 +1165,8 @@ class CameraController(private val context: Context) {
         val y = normY.coerceIn(0f, 1f)
         afPulseSeqGen.incrementAndGet()
         val mode = currentMode
-        if (mode is CameraMode.Manual && mode.focusDistance > 0f) {
-            currentMode = mode.copy(focusDistance = 0f).normalized()
+        if (mode is CameraMode.Manual && mode.focusDistance >= 0f) {
+            currentMode = mode.copy(focusDistance = -1.0f).normalized()
         }
         runOnMain {
             applyCurrentCameraControls()
@@ -1202,18 +1256,56 @@ class CameraController(private val context: Context) {
                         request: CaptureRequest,
                         result: TotalCaptureResult
                     ) {
-                        // Sample once every 16 frames to avoid UI thread overhead on budget devices
-                        if ((captureSampleCounter.incrementAndGet() and 0x0F) != 0) return
+                        // Sample once every 6 frames (~5 Hz at 30fps) so AUTO sliders move smoothly without overhead
+                        if ((captureSampleCounter.incrementAndGet() % 6) != 0) return
                         val mode = currentMode
+                        var telemetryUpdated = false
+
+                        result.get(CaptureResult.SENSOR_SENSITIVITY)?.let { iso ->
+                            if (!mode.isIsoManual) lastMeasuredIso = iso
+                            val clamped = iso.coerceIn(50, 3200)
+                            if (abs(clamped - liveIso) >= 12) {
+                                liveIso = clamped
+                                telemetryUpdated = true
+                            }
+                        }
+                        result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { expNs ->
+                            if (!mode.isShutterManual) lastMeasuredExposureNs = expNs
+                            val clamped = expNs.coerceIn(100_000L, 100_000_000L)
+                            if (abs(clamped - liveExposureNs) >= 500_000L) {
+                                liveExposureNs = clamped
+                                telemetryUpdated = true
+                            }
+                        }
+                        result.get(CaptureResult.LENS_FOCUS_DISTANCE)?.let { fDist ->
+                            val modMax = (availableModules.find { it.key == activeModuleKey }?.maxFocusDiopters ?: 4.0f)
+                                .coerceAtLeast(0.5f)
+                            val dpt = fDist.coerceIn(0f, modMax)
+                            val norm = (dpt / modMax).coerceIn(0f, 1f)
+                            if (abs(dpt - liveFocusDiopters) >= 0.04f) {
+                                liveFocusDiopters = dpt
+                                liveFocusNorm = norm
+                                telemetryUpdated = true
+                            }
+                        }
+                        result.get(CaptureResult.COLOR_CORRECTION_GAINS)?.let { gains ->
+                            if (!mode.isWbManual) {
+                                lastNeutralGains = gains
+                                val estK = CameraUtils.rggbGainsToKelvin(gains)
+                                // Smooth EMA so the WB slider doesn't jitter
+                                val smoothedK = ((liveWbKelvin * 3 + estK) / 4 / 50) * 50
+                                if (abs(smoothedK - liveWbKelvin) >= 100) {
+                                    liveWbKelvin = smoothedK.coerceIn(2800, 8500)
+                                    telemetryUpdated = true
+                                }
+                            }
+                        }
                         if (!mode.isWbManual) {
-                            result.get(CaptureResult.COLOR_CORRECTION_GAINS)?.let { lastNeutralGains = it }
                             result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { lastColorTransform = it }
                         }
-                        if (!mode.isIsoManual) {
-                            result.get(CaptureResult.SENSOR_SENSITIVITY)?.let { lastMeasuredIso = it }
-                        }
-                        if (!mode.isShutterManual) {
-                            result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { lastMeasuredExposureNs = it }
+
+                        if (telemetryUpdated && !isLowEndDevice) {
+                            runOnMain { onStateChanged?.invoke() }
                         }
                     }
                 })
@@ -1395,19 +1487,22 @@ class CameraController(private val context: Context) {
         val builder = CaptureRequestOptions.Builder()
             .setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
 
-        // If a physical sub-camera is pinned and intraModuleZoom > 1.0f, also apply SCALER_CROP_REGION
-        if (isPhysicalCameraPinned && intraModuleZoom > 1.01f) {
-            val activeRect = chars?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-            if (activeRect != null && activeRect.width() > 0 && activeRect.height() > 0) {
-                val cropW = (activeRect.width() / intraModuleZoom).roundToInt().coerceAtLeast(64)
-                val cropH = (activeRect.height() / intraModuleZoom).roundToInt().coerceAtLeast(64)
-                val left = activeRect.left + (activeRect.width() - cropW) / 2
-                val top = activeRect.top + (activeRect.height() - cropH) / 2
+        // Prevent OEM logical camera HAL (Samsung One UI Focus Enhancer / Auto-Macro) from switching physical modules
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
                 builder.setCaptureRequestOption(
-                    CaptureRequest.SCALER_CROP_REGION,
-                    Rect(left, top, left + cropW, top + cropH)
+                    CaptureRequest.CONTROL_EXTENDED_SCENE_MODE,
+                    CaptureRequest.CONTROL_EXTENDED_SCENE_MODE_DISABLED
                 )
-            }
+            } catch (_: Exception) {}
+        }
+
+        // Explicitly include FLASH_MODE inside CaptureRequestOptions so LEGACY/LIMITED HALs (e.g. Xiaomi Redmi 8A)
+        // keep the rear LED torch on instead of resetting FLASH_MODE to OFF when options are applied.
+        if (isTorchOn && !isFrontCameraActive && hasRearFlashUnit) {
+            builder.setCaptureRequestOption(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
+        } else {
+            builder.setCaptureRequestOption(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
         }
 
         val mode = currentMode
@@ -1460,15 +1555,24 @@ class CameraController(private val context: Context) {
         }
 
         // 2. Focus (Manual vs Continuous Video AF)
-        val manualFocus = man?.focusDistance ?: 0f
-        if (manualFocus > 0f) {
-            val minFocusDist = chars?.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 10f
-            if (minFocusDist > 0f) {
+        // Note: manualFocus >= 0.0f means Manual Focus is active (0.0f = infinity ∞).
+        // Only manualFocus < 0.0f means Auto Focus.
+        val manualFocus = man?.focusDistance ?: -1.0f
+        if (manualFocus >= 0f) {
+            val activeMod = availableModules.find { it.key == activeModuleKey }
+            val modMaxFocus = (activeMod?.maxFocusDiopters
+                ?: chars?.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)
+                ?: 4.0f).coerceIn(0f, 10f)
+            if (modMaxFocus > 0.05f) {
+                // Smooth perceptual curve across [0 .. modMaxFocus] so the first 70% of slider travel
+                // gives fine control over normal working distances (∞ to 25cm) and avoids sudden macro blur
+                val norm = (manualFocus / 10.0f).coerceIn(0f, 1f)
+                val curvedNorm = (0.35f * norm + 0.65f * norm * norm).coerceIn(0f, 1f)
+                val targetDiopters = (curvedNorm * modMaxFocus).coerceIn(0f, modMaxFocus)
+                liveFocusDiopters = targetDiopters
+                liveFocusNorm = norm
                 builder.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
-                builder.setCaptureRequestOption(
-                    CaptureRequest.LENS_FOCUS_DISTANCE,
-                    CameraUtils.clampFocusDistance(manualFocus, minFocusDist)
-                )
+                builder.setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, targetDiopters)
             } else {
                 builder.setCaptureRequestOption(
                     CaptureRequest.CONTROL_AF_MODE,
@@ -1483,27 +1587,22 @@ class CameraController(private val context: Context) {
         }
 
         // 3. White Balance (Manual Kelvin vs Auto AWB)
+        // Use clean, non-compounding Planckian gains with COLOR_CORRECTION_MODE_FAST so switching
+        // camera modules never stacks or compounds white balance tint across sensors.
         val manualWb = man?.whiteBalanceKelvin ?: 0
         if (manualWb > 0) {
+            liveWbKelvin = manualWb.coerceIn(2000, 10000)
             builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
-            builder.setCaptureRequestOption(
-                CaptureRequest.COLOR_CORRECTION_MODE,
-                CaptureRequest.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX
-            )
-            builder.setCaptureRequestOption(
-                CaptureRequest.COLOR_CORRECTION_TRANSFORM,
-                lastColorTransform ?: CameraUtils.defaultColorCorrectionTransform()
-            )
-            builder.setCaptureRequestOption(
-                CaptureRequest.COLOR_CORRECTION_GAINS,
-                CameraUtils.kelvinToRggbChannelVector(manualWb, lastNeutralGains)
-            )
-        } else {
-            builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
             builder.setCaptureRequestOption(
                 CaptureRequest.COLOR_CORRECTION_MODE,
                 CaptureRequest.COLOR_CORRECTION_MODE_FAST
             )
+            builder.setCaptureRequestOption(
+                CaptureRequest.COLOR_CORRECTION_GAINS,
+                CameraUtils.kelvinToRggbChannelVector(manualWb)
+            )
+        } else {
+            builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
         }
 
         try {

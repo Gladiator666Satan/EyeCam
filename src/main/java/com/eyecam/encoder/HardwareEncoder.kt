@@ -256,17 +256,26 @@ class HardwareEncoder(
         val vbr = MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
 
         // Primary attempts at requested sanitized config
-        attempts.add(cfg to createFormat(cfg, lowLatency = true, includeProfile = true, bitrateMode = cfg.bitrateMode))
+        val useBaseline = cfg.width <= 1920 && cfg.height <= 1088
+        attempts.add(cfg to createFormat(cfg, lowLatency = true, includeProfile = useBaseline, bitrateMode = cfg.bitrateMode))
         attempts.add(cfg to createFormat(cfg, lowLatency = true, includeProfile = false, bitrateMode = vbr))
         attempts.add(cfg to createFormat(cfg, lowLatency = false, includeProfile = false, bitrateMode = vbr))
 
-        // If 60 FPS failed on this hardware, fall back to 30 FPS automatically
+        // If 60 FPS failed on this hardware, fall back to 30 FPS at the SAME resolution
         if (cfg.frameRate > 30) {
             val cfg30 = cfg.copy(frameRate = 30, bitrate = (cfg.bitrate * 0.75f).toInt().coerceAtLeast(2_000_000))
             attempts.add(cfg30 to createFormat(cfg30, lowLatency = false, includeProfile = false, bitrateMode = vbr))
         }
 
-        // If > 720p failed on legacy hardware (e.g. budget chipsets), fall back to 1280x720@30
+        // Progressive resolution fallbacks (4K -> 2K -> 1080p -> 720p)
+        if (cfg.width > 2560 || cfg.height > 1440) {
+            val cfg2k = cfg.copy(width = 2560, height = 1440, frameRate = 30, bitrate = 12_000_000)
+            attempts.add(cfg2k to createFormat(cfg2k, lowLatency = false, includeProfile = false, bitrateMode = vbr))
+        }
+        if (cfg.width > 1920 || cfg.height > 1080) {
+            val cfg1080 = cfg.copy(width = 1920, height = 1080, frameRate = 30, bitrate = 7_500_000)
+            attempts.add(cfg1080 to createFormat(cfg1080, lowLatency = false, includeProfile = false, bitrateMode = vbr))
+        }
         if (cfg.width > 1280 || cfg.height > 720) {
             val cfg720 = cfg.copy(width = 1280, height = 720, frameRate = 30, bitrate = 4_500_000)
             attempts.add(cfg720 to createFormat(cfg720, lowLatency = false, includeProfile = false, bitrateMode = vbr))
@@ -331,8 +340,10 @@ class HardwareEncoder(
                 }
                 setInteger("low-latency", 1)
                 setInteger("vendor.qcom-ext-enc-low-latency.enable", 1)
-                setInteger(MediaFormat.KEY_PRIORITY, cfg.priority)
-                setInteger(MediaFormat.KEY_OPERATING_RATE, cfg.frameRate.coerceAtLeast(30))
+                if (cfg.frameRate >= 60) {
+                    setInteger(MediaFormat.KEY_PRIORITY, cfg.priority)
+                    setInteger(MediaFormat.KEY_OPERATING_RATE, cfg.frameRate)
+                }
             }
 
             if (includeProfile) {

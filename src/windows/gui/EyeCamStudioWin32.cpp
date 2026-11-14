@@ -84,8 +84,8 @@
 
 namespace {
 
-static constexpr const char* kEyeCamVersionStr = "1.4.0";
-static constexpr const wchar_t* kEyeCamVersionWide = L"1.4.0";
+static constexpr const char* kEyeCamVersionStr = "1.4.1";
+static constexpr const wchar_t* kEyeCamVersionWide = L"1.4.1";
 
 // ============================================================================
 // Кольорова палітра Windows 11 Dark Studio (Fluent / OLED Dark)
@@ -389,22 +389,29 @@ struct StudioState {
     int phoneMeasuredFps = 0;
     int phoneMeasuredBitrateKbps = 0;
 
-    // Параметри відеопотоку
+    // Параметри відеопотоку (за замовчуванням 30 FPS для холодної роботи смартфона)
     int resPresetIdx = 2; // 0: 4K UHD (3840x2160), 1: 2K QHD (2560x1440), 2: 1080p, 3: 720p
     uint32_t width = 1920;
     uint32_t height = 1080;
-    uint32_t fps = 60;
+    uint32_t fps = 30;
+    bool prefer60Fps = false;
 
     bool mirrorHorizontal = false;
     bool showGrid = false;
 
     // Кожен повзунок за замовчуванням АВТОМАТИЧНИЙ, поки користувач не почне крутити його вручну.
     // Тоді з'являється замочок 🔒, натискання на який повертає конкретний повзунок у режим AUTO.
+    // У режимі AUTO повзунки плавно рухаються самі відповідно до реальних значень ISP смартфона.
     bool sliderManual[4] = {false, false, false, false}; // 0:ISO, 1:Shutter, 2:Focus, 3:WB
-    float isoNorm = 0.20f;     // 100 .. 3200
-    float shutterNorm = 0.35f; // 1/30 .. 1/4000
+    float isoNorm = 0.05f;     // 50 .. 3200
+    float shutterNorm = 0.01f; // 1/15 .. 1/4000
     float focusNorm = 0.0f;    // 0.0 .. 1.0 (0 .. 10 dpt)
-    float wbNorm = 0.48f;      // 2800K .. 8500K
+    float wbNorm = 0.42f;      // 2800K .. 8500K
+    int liveIso = 200;
+    long long liveExposureNs = 16666666LL;
+    float liveFocusDiopters = 0.0f;
+    float liveFocusNorm = 0.0f;
+    int liveWbKelvin = 5200;
 
     // Візуальний відгук кнопок Автофокусу та Авторежиму
     uint32_t afPulseUntilTick = 0;
@@ -415,13 +422,17 @@ struct StudioState {
     // Кольоровий профіль .cube 3D LUT
     std::wstring activeLutName = L"";
 
-    // Модальні вікна (Підтримка автора та GitHub / Перевірка оновлень)
+    // Модальні вікна та автоматичне сповіщення про оновлення (Встановити зараз / Нагадати пізніше / Пропустити версію)
     ModalOverlay activeModal = ModalOverlay::NONE;
     std::atomic<bool> updateCheckInProgress{false};
     std::atomic<bool> updateAvailable{false};
-    std::wstring latestGithubTag = L"1.4.0";
+    std::atomic<bool> showUpdateBanner{false};
+    std::atomic<bool> updateDownloadInProgress{false};
+    std::atomic<int> updateDownloadPct{0};
+    std::wstring latestGithubTag = L"1.4.1";
     std::wstring updateStatusText = L"Натисніть «Перевірити оновлення» для запиту до GitHub Releases";
     std::wstring releaseHtmlUrl = L"https://github.com/Gladiator666Satan/EyeCam/releases/latest";
+    std::wstring setupExeDownloadUrl = L"";
 
     // Телеметрія реального часу
     std::atomic<uint64_t> rxFrames{0};
@@ -707,6 +718,17 @@ bool ExtractJsonInt(const std::string& json, const char* key, int& outVal) {
     return true;
 }
 
+bool ExtractJsonLongLong(const std::string& json, const char* key, long long& outVal) {
+    std::string pattern = std::string("\"") + key + "\":";
+    size_t p = json.find(pattern);
+    if (p == std::string::npos) return false;
+    size_t start = p + pattern.size();
+    while (start < json.size() && (json[start] == ' ' || json[start] == '\t')) ++start;
+    if (start >= json.size()) return false;
+    outVal = std::atoll(json.c_str() + start);
+    return true;
+}
+
 bool ExtractJsonBool(const std::string& json, const char* key, bool& outVal) {
     std::string pattern = std::string("\"") + key + "\":";
     size_t p = json.find(pattern);
@@ -718,10 +740,10 @@ bool ExtractJsonBool(const std::string& json, const char* key, bool& outVal) {
     return false;
 }
 
-// Запит до GitHub API (WinHTTP) для перевірки наявності нової версії у релізах
-bool QueryGithubLatestRelease(std::string& outTagName, std::string& outHtmlUrl) {
+// Запит до GitHub API (WinHTTP) для перевірки наявності нової версії у релізах та посилання на інсталятор
+bool QueryGithubLatestRelease(std::string& outTagName, std::string& outHtmlUrl, std::string& outSetupExeUrl) {
     HINTERNET hSession = WinHttpOpen(
-        L"EyeCamStudio-Updater/1.4",
+        L"EyeCamStudio-Updater/1.4.1",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
@@ -752,7 +774,7 @@ bool QueryGithubLatestRelease(std::string& outTagName, std::string& outHtmlUrl) 
         return false;
     }
 
-    const wchar_t* headers = L"Accept: application/vnd.github+json\r\nUser-Agent: EyeCamStudio/1.4.0\r\n";
+    const wchar_t* headers = L"Accept: application/vnd.github+json\r\nUser-Agent: EyeCamStudio/1.4.1\r\n";
     BOOL sent = WinHttpSendRequest(
         hRequest,
         headers,
@@ -798,6 +820,177 @@ bool QueryGithubLatestRelease(std::string& outTagName, std::string& outHtmlUrl) 
     if (!ExtractJsonString(body, "html_url", outHtmlUrl) || outHtmlUrl.empty()) {
         outHtmlUrl = "https://github.com/Gladiator666Satan/EyeCam/releases/latest";
     }
+
+    // Пошук прямого посилання browser_download_url на EyeCam-Setup-x64.exe
+    outSetupExeUrl = "https://github.com/Gladiator666Satan/EyeCam/releases/download/" + outTagName + "/EyeCam-Setup-x64.exe";
+    size_t searchPos = 0;
+    while (true) {
+        size_t dlPos = body.find("\"browser_download_url\":\"", searchPos);
+        if (dlPos == std::string::npos) break;
+        size_t start = dlPos + 24;
+        size_t end = body.find('"', start);
+        if (end == std::string::npos) break;
+        std::string urlCandidate = body.substr(start, end - start);
+        if (urlCandidate.find(".exe") != std::string::npos || urlCandidate.find(".EXE") != std::string::npos) {
+            outSetupExeUrl = urlCandidate;
+            break;
+        }
+        searchPos = end + 1;
+    }
+    return true;
+}
+
+// Завантаження файлу оновлення (EyeCam-Setup-x64.exe) через WinHTTP з підтримкою редіректів та прогресу
+bool DownloadFileWinHttp(const std::wstring& urlStr, const std::wstring& destPath, const std::function<void(int)>& onProgress) {
+    URL_COMPONENTS uc{};
+    uc.dwStructSize = sizeof(uc);
+    wchar_t hostBuf[256]{};
+    wchar_t pathBuf[2048]{};
+    uc.lpszHostName = hostBuf;
+    uc.dwHostNameLength = 256;
+    uc.lpszUrlPath = pathBuf;
+    uc.dwUrlPathLength = 2048;
+
+    if (!WinHttpCrackUrl(urlStr.c_str(), static_cast<DWORD>(urlStr.size()), 0, &uc)) {
+        return false;
+    }
+
+    HINTERNET hSession = WinHttpOpen(
+        L"EyeCamStudio-Updater/1.4.1",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS,
+        0
+    );
+    if (!hSession) return false;
+    WinHttpSetTimeouts(hSession, 8000, 8000, 15000, 25000);
+
+    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+    WinHttpSetOption(hSession, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
+
+    HINTERNET hConnect = WinHttpConnect(hSession, hostBuf, uc.nPort, 0);
+    if (!hConnect) {
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    DWORD reqFlags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET hRequest = WinHttpOpenRequest(
+        hConnect,
+        L"GET",
+        pathBuf,
+        nullptr,
+        WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        reqFlags
+    );
+    if (!hRequest) {
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    BOOL ok = WinHttpSendRequest(
+        hRequest,
+        L"User-Agent: EyeCamStudio/1.4.1\r\n",
+        static_cast<DWORD>(-1L),
+        WINHTTP_NO_REQUEST_DATA,
+        0,
+        0,
+        0
+    ) && WinHttpReceiveResponse(hRequest, nullptr);
+
+    if (!ok) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    DWORD statusCode = 0;
+    DWORD statusSize = sizeof(statusCode);
+    WinHttpQueryHeaders(
+        hRequest,
+        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX,
+        &statusCode,
+        &statusSize,
+        WINHTTP_NO_HEADER_INDEX
+    );
+    if (statusCode < 200 || statusCode >= 300) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    wchar_t lenBuf[64]{};
+    DWORD lenBufSize = sizeof(lenBuf);
+    uint64_t totalBytes = 0;
+    if (WinHttpQueryHeaders(
+            hRequest,
+            WINHTTP_QUERY_CONTENT_LENGTH,
+            WINHTTP_HEADER_NAME_BY_INDEX,
+            lenBuf,
+            &lenBufSize,
+            WINHTTP_NO_HEADER_INDEX
+        )) {
+        totalBytes = _wcstoui64(lenBuf, nullptr, 10);
+    }
+
+    HANDLE hFile = CreateFileW(
+        destPath.c_str(),
+        GENERIC_WRITE,
+        0,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+    if (hFile == INVALID_HANDLE_VALUE) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    uint64_t downloaded = 0;
+    int lastPct = -1;
+    std::vector<char> chunk(64 * 1024);
+    DWORD avail = 0;
+    bool writeSuccess = true;
+    while (WinHttpQueryDataAvailable(hRequest, &avail) && avail > 0) {
+        DWORD toRead = (std::min)(avail, static_cast<DWORD>(chunk.size()));
+        DWORD readBytes = 0;
+        if (!WinHttpReadData(hRequest, chunk.data(), toRead, &readBytes) || readBytes == 0) {
+            break;
+        }
+        DWORD written = 0;
+        if (!WriteFile(hFile, chunk.data(), readBytes, &written, nullptr) || written != readBytes) {
+            writeSuccess = false;
+            break;
+        }
+        downloaded += readBytes;
+        if (totalBytes > 0 && onProgress) {
+            int pct = static_cast<int>((downloaded * 100ULL) / totalBytes);
+            pct = std::clamp(pct, 0, 100);
+            if (pct != lastPct) {
+                lastPct = pct;
+                onProgress(pct);
+            }
+        }
+    }
+
+    CloseHandle(hFile);
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+
+    if (!writeSuccess || downloaded < 1024) {
+        DeleteFileW(destPath.c_str());
+        return false;
+    }
+    if (onProgress) onProgress(100);
     return true;
 }
 
@@ -832,6 +1025,8 @@ struct IncomingVideoPacket {
     Kind kind = Kind::H264;
     bool isKeyFrame = false;
     std::vector<uint8_t> data;
+    uint32_t hintW = 0;
+    uint32_t hintH = 0;
 };
 
 // ============================================================================
@@ -1198,7 +1393,7 @@ public:
         m_hwnd = CreateWindowExW(
             0,
             wc.lpszClassName,
-            L"EyeCam Studio v1.4.0 — Ultra-Low Latency 4K Virtual Webcam",
+            L"EyeCam Studio v1.4.1 — Ultra-Low Latency 4K Virtual Webcam",
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT, CW_USEDEFAULT, 1290, 810,
             nullptr, nullptr, hInstance, this
@@ -1365,6 +1560,29 @@ private:
         }
     }
 
+    static std::wstring LoadSkippedVersion() {
+        HKEY hKey = nullptr;
+        std::wstring res;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\EyeCamStudio", 0, KEY_READ, &hKey) == ERROR_SUCCESS && hKey) {
+            wchar_t val[64]{};
+            DWORD sz = sizeof(val);
+            DWORD type = 0;
+            if (RegQueryValueExW(hKey, L"SkippedVersion", nullptr, &type, reinterpret_cast<LPBYTE>(val), &sz) == ERROR_SUCCESS && type == REG_SZ) {
+                res = val;
+            }
+            RegCloseKey(hKey);
+        }
+        return res;
+    }
+
+    static void SaveSkippedVersion(const std::wstring& ver) {
+        HKEY hKey = nullptr;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\EyeCamStudio", 0, nullptr, 0, KEY_WRITE, nullptr, &hKey, nullptr) == ERROR_SUCCESS && hKey) {
+            RegSetValueExW(hKey, L"SkippedVersion", 0, REG_SZ, reinterpret_cast<const BYTE*>(ver.c_str()), static_cast<DWORD>((ver.size() + 1) * sizeof(wchar_t)));
+            RegCloseKey(hKey);
+        }
+    }
+
     const wchar_t* TR(const wchar_t* en, const wchar_t* ua) const {
         return m_state.isUkrainian ? ua : en;
     }
@@ -1410,15 +1628,15 @@ private:
         }
     }
 
-    void CheckGithubUpdateAsync() {
+    void CheckGithubUpdateAsync(bool manualCheck = false) {
         if (m_state.updateCheckInProgress.exchange(true)) return;
         {
             std::lock_guard<std::mutex> lock(m_frameMutex);
             m_state.updateStatusText = TR(L"Checking GitHub Releases for updates...", L"Перевірка оновлень на GitHub Releases...");
         }
-        std::thread([this]() {
-            std::string tag, htmlUrl;
-            bool ok = QueryGithubLatestRelease(tag, htmlUrl);
+        std::thread([this, manualCheck]() {
+            std::string tag, htmlUrl, setupExeUrl;
+            bool ok = QueryGithubLatestRelease(tag, htmlUrl, setupExeUrl);
             {
                 std::lock_guard<std::mutex> lock(m_frameMutex);
                 if (ok) {
@@ -1428,13 +1646,19 @@ private:
                     }
                     m_state.latestGithubTag = Utf8ToWide(cleanTag);
                     m_state.releaseHtmlUrl = Utf8ToWide(htmlUrl);
+                    m_state.setupExeDownloadUrl = Utf8ToWide(setupExeUrl);
                     bool newer = IsVersionNewer(cleanTag, kEyeCamVersionStr);
                     m_state.updateAvailable = newer;
                     if (newer) {
                         m_state.updateStatusText = m_state.isUkrainian
                             ? (L"🚀 Доступне нове оновлення: v" + m_state.latestGithubTag + L"!")
                             : (L"🚀 New update available: v" + m_state.latestGithubTag + L"!");
+                        std::wstring skipped = LoadSkippedVersion();
+                        if (manualCheck || skipped != m_state.latestGithubTag) {
+                            m_state.showUpdateBanner = true;
+                        }
                     } else {
+                        m_state.showUpdateBanner = false;
                         m_state.updateStatusText = m_state.isUkrainian
                             ? (L"✓ У вас встановлена найновіша версія (v" + std::wstring(kEyeCamVersionWide) + L")")
                             : (L"✓ You are running the latest version (v" + std::wstring(kEyeCamVersionWide) + L")");
@@ -1447,6 +1671,47 @@ private:
             }
             m_state.updateCheckInProgress = false;
             if (m_hwnd) InvalidateRect(m_hwnd, nullptr, FALSE);
+        }).detach();
+    }
+
+    void StartUpdateDownloadAndInstallAsync() {
+        if (m_state.updateDownloadInProgress.exchange(true)) return;
+        m_state.updateDownloadPct = 0;
+
+        std::wstring dlUrl;
+        std::wstring fallbackHtmlUrl;
+        {
+            std::lock_guard<std::mutex> lock(m_frameMutex);
+            dlUrl = m_state.setupExeDownloadUrl;
+            fallbackHtmlUrl = m_state.releaseHtmlUrl;
+        }
+
+        std::thread([this, dlUrl, fallbackHtmlUrl]() {
+            wchar_t tempDir[MAX_PATH]{};
+            DWORD tempLen = GetTempPathW(MAX_PATH, tempDir);
+            std::wstring destFile = (tempLen > 0 ? std::wstring(tempDir) : L".\\") + L"EyeCam-Setup-Update.exe";
+
+            bool ok = false;
+            if (!dlUrl.empty()) {
+                ok = DownloadFileWinHttp(dlUrl, destFile, [this](int pct) {
+                    m_state.updateDownloadPct = pct;
+                    if (m_hwnd) InvalidateRect(m_hwnd, nullptr, FALSE);
+                });
+            }
+
+            m_state.updateDownloadInProgress = false;
+            if (ok) {
+                m_state.showUpdateBanner = false;
+                ShellExecuteW(nullptr, L"open", destFile.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                if (m_hwnd) {
+                    PostMessageW(m_hwnd, WM_CLOSE, 0, 0);
+                }
+            } else {
+                if (!fallbackHtmlUrl.empty()) {
+                    ShellExecuteW(m_hwnd, L"open", fallbackHtmlUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                }
+                if (m_hwnd) InvalidateRect(m_hwnd, nullptr, FALSE);
+            }
         }).detach();
     }
 
@@ -1600,11 +1865,11 @@ private:
         return true;
     }
 
-    void EnqueueFlushDecoder() {
+    void EnqueueFlushDecoder(uint32_t hintW = 0, uint32_t hintH = 0) {
         {
             std::lock_guard<std::mutex> lock(m_decodeMutex);
             m_decodeQueue.clear();
-            m_decodeQueue.push_back(IncomingVideoPacket{IncomingVideoPacket::Kind::FLUSH, true, {}});
+            m_decodeQueue.push_back(IncomingVideoPacket{IncomingVideoPacket::Kind::FLUSH, true, {}, hintW, hintH});
         }
         m_decodeCv.notify_one();
     }
@@ -1794,7 +2059,11 @@ private:
             }
 
             if (pkt.kind == IncomingVideoPacket::Kind::FLUSH) {
-                h264Decoder.Flush();
+                if (pkt.hintW > 0 && pkt.hintH > 0) {
+                    h264Decoder.Initialize(pkt.hintW, pkt.hintH);
+                } else {
+                    h264Decoder.Flush();
+                }
                 needIdrAfterFlush = true;
                 decodedWindow = 0;
                 lastFpsTime = std::chrono::steady_clock::now();
@@ -1926,6 +2195,41 @@ private:
             if (ExtractJsonBool(json, "wb_manual", bVal)) m_state.sliderManual[3] = bVal;
         }
 
+        // Реальна телеметрія ISP від камери: у режимі AUTO повзунки плавно рухаються самі
+        int liveIsoVal = 0;
+        if (ExtractJsonInt(json, "live_iso", liveIsoVal) && liveIsoVal > 0) {
+            m_state.liveIso = liveIsoVal;
+            if (!m_state.sliderManual[0] && m_activeSliderDrag.load() != 0) {
+                m_state.isoNorm = std::clamp((static_cast<float>(liveIsoVal) - 100.0f) / 3100.0f, 0.0f, 1.0f);
+            }
+        }
+        long long liveExpNs = 0;
+        if (ExtractJsonLongLong(json, "live_exposure_ns", liveExpNs) && liveExpNs > 0) {
+            m_state.liveExposureNs = liveExpNs;
+            if (!m_state.sliderManual[1] && m_activeSliderDrag.load() != 1) {
+                float denom = static_cast<float>(1000000000LL / (std::max)(100000LL, liveExpNs));
+                m_state.shutterNorm = std::clamp((denom - 30.0f) / 3970.0f, 0.0f, 1.0f);
+            }
+        }
+        float liveFocDpt = 0.0f;
+        if (ExtractJsonFloat(json, "live_focus_diopters", liveFocDpt) && liveFocDpt >= 0.0f) {
+            m_state.liveFocusDiopters = liveFocDpt;
+        }
+        float liveFocNorm = 0.0f;
+        if (ExtractJsonFloat(json, "live_focus_norm", liveFocNorm) && liveFocNorm >= 0.0f) {
+            m_state.liveFocusNorm = std::clamp(liveFocNorm, 0.0f, 1.0f);
+            if (!m_state.sliderManual[2] && m_activeSliderDrag.load() != 2) {
+                m_state.focusNorm = m_state.liveFocusNorm;
+            }
+        }
+        int liveWbK = 0;
+        if (ExtractJsonInt(json, "live_wb_kelvin", liveWbK) && liveWbK >= 2000) {
+            m_state.liveWbKelvin = liveWbK;
+            if (!m_state.sliderManual[3] && m_activeSliderDrag.load() != 3) {
+                m_state.wbNorm = std::clamp((static_cast<float>(liveWbK) - 2800.0f) / 5700.0f, 0.0f, 1.0f);
+            }
+        }
+
         int rotDeg = -1;
         if (ExtractJsonInt(json, "rotation_deg", rotDeg)) {
             if (rotDeg == -1 || rotDeg == 0 || rotDeg == 90 || rotDeg == 180 || rotDeg == 270) {
@@ -1939,18 +2243,26 @@ private:
             uint32_t newW = static_cast<uint32_t>(sw);
             uint32_t newH = static_cast<uint32_t>(sh);
             uint32_t newFps = (sfps > 0) ? static_cast<uint32_t>(sfps) : m_state.fps;
-            std::lock_guard<std::mutex> lock(m_sinkMutex);
-            if (m_state.width != newW || m_state.height != newH || m_state.fps != newFps) {
-                m_state.width = newW;
-                m_state.height = newH;
-                m_state.fps = newFps;
-                if (newW >= 3840) m_state.resPresetIdx = 0;
-                else if (newW >= 2560) m_state.resPresetIdx = 1;
-                else if (newW >= 1920) m_state.resPresetIdx = 2;
-                else m_state.resPresetIdx = 3;
-                if (m_sink.IsOpen()) {
-                    m_sink.SetFormat(m_state.width, m_state.height, EyeCam::PixelFormat::YUY2, m_state.fps);
+            bool resChanged = false;
+            {
+                std::lock_guard<std::mutex> lock(m_sinkMutex);
+                if (m_state.width != newW || m_state.height != newH || m_state.fps != newFps) {
+                    resChanged = (m_state.width != newW || m_state.height != newH);
+                    m_state.width = newW;
+                    m_state.height = newH;
+                    m_state.fps = newFps;
+                    uint32_t maxDim = (std::max)(newW, newH);
+                    if (maxDim >= 3840) m_state.resPresetIdx = 0;
+                    else if (maxDim >= 2560) m_state.resPresetIdx = 1;
+                    else if (maxDim >= 1920) m_state.resPresetIdx = 2;
+                    else m_state.resPresetIdx = 3;
+                    if (m_sink.IsOpen()) {
+                        m_sink.SetFormat(m_state.width, m_state.height, EyeCam::PixelFormat::YUY2, m_state.fps);
+                    }
                 }
+            }
+            if (resChanged) {
+                EnqueueFlushDecoder(newW, newH);
             }
         }
 
@@ -1972,7 +2284,7 @@ private:
         }
     }
 
-    // Високошвидкісна конвертація NV12 -> DirectShow YUY2 та 640x360 BGRA прев'ю (з підтримкою .cube 3D LUT)
+    // Високошвидкісна конвертація NV12 -> DirectShow YUY2 та FullHD BGRA прев'ю (з підтримкою .cube 3D LUT)
     void PushNv12ToDirectShowAndPreview(
         const uint8_t* pScan0,
         LONG stride,
@@ -1986,10 +2298,24 @@ private:
         (void)codedW;
         if (!pScan0 || visW < 2 || visH < 2) return;
 
+        uint32_t actualW = (visW & ~1u);
+        uint32_t actualH = (visH & ~1u);
         uint32_t outW = 1920;
         uint32_t outH = 1080;
         {
             std::lock_guard<std::mutex> lock(m_sinkMutex);
+            if (actualW >= 320 && actualH >= 240 && (m_state.width != actualW || m_state.height != actualH)) {
+                m_state.width = actualW;
+                m_state.height = actualH;
+                uint32_t maxDim = (std::max)(actualW, actualH);
+                if (maxDim >= 3840) m_state.resPresetIdx = 0;
+                else if (maxDim >= 2560) m_state.resPresetIdx = 1;
+                else if (maxDim >= 1920) m_state.resPresetIdx = 2;
+                else m_state.resPresetIdx = 3;
+                if (m_sink.IsOpen()) {
+                    m_sink.SetFormat(m_state.width, m_state.height, EyeCam::PixelFormat::YUY2, m_state.fps);
+                }
+            }
             outW = m_state.width;
             outH = m_state.height;
         }
@@ -2093,8 +2419,18 @@ private:
             }
         }
 
-        const uint32_t pw = 640;
-        const uint32_t ph = 360;
+        // Формуємо прев'ю-буфер із реальною роздільною здатністю потоку (до 1920p, щоб зміна 720p/1080p/2K/4K була помітна візуально)
+        uint32_t pw = outW;
+        uint32_t ph = outH;
+        if (pw > 1920u || ph > 1920u) {
+            if (pw >= ph) {
+                ph = (std::max)(2u, (ph * 1920u) / pw) & ~1u;
+                pw = 1920u;
+            } else {
+                pw = (std::max)(2u, (pw * 1920u) / ph) & ~1u;
+                ph = 1920u;
+            }
+        }
         const size_t previewSize = static_cast<size_t>(pw) * ph * 4;
         if (m_cachedPreviewBuffer.size() != previewSize) {
             m_cachedPreviewBuffer.resize(previewSize);
@@ -2138,6 +2474,8 @@ private:
         {
             std::lock_guard<std::mutex> lock(m_frameMutex);
             m_previewPixels = m_cachedPreviewBuffer;
+            m_previewW = pw;
+            m_previewH = ph;
             m_hasLiveFrame = true;
         }
         if (m_hwnd) {
@@ -2221,8 +2559,17 @@ private:
                                 }
                                 PushFrameToDirectShow(m_fullBgraBuffer.data(), imgW, imgH);
 
-                                const uint32_t pw = 640;
-                                const uint32_t ph = 360;
+                                uint32_t pw = imgW;
+                                uint32_t ph = imgH;
+                                if (pw > 1920u || ph > 1920u) {
+                                    if (pw >= ph) {
+                                        ph = (std::max)(2u, (ph * 1920u) / pw) & ~1u;
+                                        pw = 1920u;
+                                    } else {
+                                        pw = (std::max)(2u, (pw * 1920u) / ph) & ~1u;
+                                        ph = 1920u;
+                                    }
+                                }
                                 size_t previewSize = static_cast<size_t>(pw) * ph * 4;
                                 if (m_cachedPreviewBuffer.size() != previewSize) {
                                     m_cachedPreviewBuffer.resize(previewSize);
@@ -2244,6 +2591,8 @@ private:
                                 {
                                     std::lock_guard<std::mutex> lock(m_frameMutex);
                                     m_previewPixels = m_cachedPreviewBuffer;
+                                    m_previewW = pw;
+                                    m_previewH = ph;
                                     m_hasLiveFrame = true;
                                 }
                                 if (m_hwnd) {
@@ -2367,7 +2716,9 @@ private:
                 D2D1_BITMAP_PROPERTIES bmpProps = D2D1::BitmapProperties(
                     D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE)
                 );
-                m_pRenderTarget->CreateBitmap(D2D1::SizeU(640, 360), nullptr, 0, bmpProps, &m_pPreviewBitmap);
+                m_previewBitmapW = 1280;
+                m_previewBitmapH = 720;
+                m_pRenderTarget->CreateBitmap(D2D1::SizeU(m_previewBitmapW, m_previewBitmapH), nullptr, 0, bmpProps, &m_pPreviewBitmap);
             }
         }
     }
@@ -2501,7 +2852,7 @@ private:
 
         DrawCyberEyeLogo(pad + 14.0f, pad + 9.0f, 38.0f);
         DrawTextStr(L"EYECAM STUDIO", {pad + 62, pad, pad + 245, pad + topBarH}, m_pFontTitle, COL_TEXT_PRIMARY);
-        DrawTextStr(L"v1.4.0 • 4K DirectShow & Pro ISP", {pad + 225, pad + 2, pad + 470, pad + topBarH}, m_pFontBody, COL_TEXT_SECOND);
+        DrawTextStr(L"v1.4.1 • 4K DirectShow & Pro ISP", {pad + 225, pad + 2, pad + 470, pad + topBarH}, m_pFontBody, COL_TEXT_SECOND);
 
         // Індикатор статусу драйвера DirectShow праворуч у шапці
         UiRect drvBadge{W - pad - 246, pad + 11, W - pad - 14, pad + topBarH - 11};
@@ -2683,32 +3034,122 @@ private:
         }
 
         // ====================================================================
-        // 3. ЦЕНТРАЛЬНИЙ В'ЮПОРТ (16:9 Live Video + Точковий Фокус + Телеметрія)
+        // 3. ЦЕНТРАЛЬНИЙ В'ЮПОРТ (Live Video + Сповіщення про оновлення + Телеметрія)
         // ====================================================================
         UiRect centerPanel{leftPanel.right + pad, contentTop, W - pad - rightW - pad, contentBottom};
         DrawRoundedCard(centerPanel, COL_BG_PANEL, COL_BORDER, 12.0f);
 
         float vpMargin = 16.0f;
+        float topBannerOffset = 0.0f;
+
+        // Автоматичне компактне сповіщення з пропозицією оновитись (Встановити зараз / Нагадати пізніше / Пропустити цю версію)
+        if (m_state.showUpdateBanner.load() && m_state.updateAvailable.load()) {
+            topBannerOffset = 50.0f;
+            UiRect bannerRect{centerPanel.left + vpMargin, centerPanel.top + 12.0f, centerPanel.right - vpMargin, centerPanel.top + 54.0f};
+            DrawRoundedCard(bannerRect, HexColor(0x0B241E), COL_EMERALD, 9.0f);
+
+            std::wstring latestTagCopy;
+            {
+                std::lock_guard<std::mutex> lock(m_frameMutex);
+                latestTagCopy = m_state.latestGithubTag;
+            }
+
+            if (m_state.updateDownloadInProgress.load()) {
+                m_rcBannerInstallBtn = {0, 0, 0, 0};
+                m_rcBannerLaterBtn = {0, 0, 0, 0};
+                m_rcBannerSkipBtn = {0, 0, 0, 0};
+
+                int pct = std::clamp(m_state.updateDownloadPct.load(), 0, 100);
+                wchar_t dlBuf[160]{};
+                swprintf_s(
+                    dlBuf,
+                    m_state.isUkrainian
+                        ? L"⬇ Завантаження та встановлення оновлення v%ls... %d%%"
+                        : L"⬇ Downloading & installing update v%ls... %d%%",
+                    latestTagCopy.c_str(), pct
+                );
+                DrawTextStr(dlBuf, {bannerRect.left + 12.0f, bannerRect.top + 2.0f, bannerRect.right - 12.0f, bannerRect.bottom - 10.0f},
+                            m_pFontSection, COL_EMERALD);
+
+                UiRect progTrack{bannerRect.left + 12.0f, bannerRect.bottom - 9.0f, bannerRect.right - 12.0f, bannerRect.bottom - 4.0f};
+                DrawRoundedCard(progTrack, HexColor(0x071410), COL_BORDER, 2.5f);
+                float fillW = progTrack.Width() * (static_cast<float>(pct) / 100.0f);
+                if (fillW > 2.0f) {
+                    DrawRoundedCard({progTrack.left, progTrack.top, progTrack.left + fillW, progTrack.bottom}, COL_EMERALD, COL_EMERALD, 2.5f);
+                }
+            } else {
+                float btnH = 28.0f;
+                float btnY = bannerRect.top + (bannerRect.Height() - btnH) * 0.5f;
+                float skipW = m_state.isUkrainian ? 116.0f : 98.0f;
+                float laterW = m_state.isUkrainian ? 128.0f : 108.0f;
+                float instW = m_state.isUkrainian ? 132.0f : 106.0f;
+
+                m_rcBannerSkipBtn = {bannerRect.right - 8.0f - skipW, btnY, bannerRect.right - 8.0f, btnY + btnH};
+                m_rcBannerLaterBtn = {m_rcBannerSkipBtn.left - 6.0f - laterW, btnY, m_rcBannerSkipBtn.left - 6.0f, btnY + btnH};
+                m_rcBannerInstallBtn = {m_rcBannerLaterBtn.left - 6.0f - instW, btnY, m_rcBannerLaterBtn.left - 6.0f, btnY + btnH};
+
+                std::wstring msg = m_state.isUkrainian
+                    ? (L"🚀 Доступне оновлення v" + latestTagCopy + L"!")
+                    : (L"🚀 New update v" + latestTagCopy + L" available!");
+                DrawTextStr(msg, {bannerRect.left + 12.0f, bannerRect.top, m_rcBannerInstallBtn.left - 8.0f, bannerRect.bottom},
+                            m_pFontSection, COL_EMERALD);
+
+                DrawRoundedCard(m_rcBannerInstallBtn, COL_EMERALD, COL_EMERALD, 7.0f);
+                DrawTextStr(TR(L"⬇ Install Now", L"⬇ Встановити зараз"), m_rcBannerInstallBtn, m_pFontBody, HexColor(0x04100A), DWRITE_TEXT_ALIGNMENT_CENTER);
+
+                DrawRoundedCard(m_rcBannerLaterBtn, COL_BG_CARD, COL_CYAN, 7.0f);
+                DrawTextStr(TR(L"Remind Later", L"Нагадати пізніше"), m_rcBannerLaterBtn, m_pFontBody, COL_CYAN, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+                DrawRoundedCard(m_rcBannerSkipBtn, HexColor(0x141A24), COL_BORDER, 7.0f);
+                DrawTextStr(TR(L"Skip Version", L"Пропустити цю"), m_rcBannerSkipBtn, m_pFontBody, COL_TEXT_SECOND, DWRITE_TEXT_ALIGNMENT_CENTER);
+            }
+        } else {
+            m_rcBannerInstallBtn = {0, 0, 0, 0};
+            m_rcBannerLaterBtn = {0, 0, 0, 0};
+            m_rcBannerSkipBtn = {0, 0, 0, 0};
+        }
+
         float availW = centerPanel.Width() - vpMargin * 2;
-        float availH = centerPanel.Height() - vpMargin * 2 - 58.0f;
+        float availH = centerPanel.Height() - vpMargin * 2 - 58.0f - topBannerOffset;
+        float aspect = (m_state.width > 0 && m_state.height > 0)
+            ? (static_cast<float>(m_state.width) / static_cast<float>(m_state.height))
+            : (16.0f / 9.0f);
+        aspect = std::clamp(aspect, 0.45f, 2.40f);
         float videoW = availW;
-        float videoH = videoW * (9.0f / 16.0f);
+        float videoH = videoW / aspect;
         if (videoH > availH) {
             videoH = availH;
-            videoW = videoH * (16.0f / 9.0f);
+            videoW = videoH * aspect;
         }
         float vx = centerPanel.left + (centerPanel.Width() - videoW) * 0.5f;
-        float vy = centerPanel.top + vpMargin + (availH - videoH) * 0.5f;
+        float vy = centerPanel.top + vpMargin + topBannerOffset + (availH - videoH) * 0.5f;
         m_rcVideoViewport = {vx, vy, vx + videoW, vy + videoH};
         const UiRect& videoRect = m_rcVideoViewport;
 
         bool hasFrame = false;
         {
             std::lock_guard<std::mutex> lock(m_frameMutex);
-            hasFrame = m_hasLiveFrame && !m_previewPixels.empty();
-            if (hasFrame && m_pPreviewBitmap) {
-                D2D1_RECT_U copyRect = D2D1::RectU(0, 0, 640, 360);
-                m_pPreviewBitmap->CopyFromMemory(&copyRect, m_previewPixels.data(), 640 * 4);
+            hasFrame = m_hasLiveFrame && !m_previewPixels.empty() && m_previewW > 0 && m_previewH > 0 &&
+                       m_previewPixels.size() == static_cast<size_t>(m_previewW) * m_previewH * 4;
+            if (hasFrame && m_pRenderTarget) {
+                if (!m_pPreviewBitmap || m_previewBitmapW != m_previewW || m_previewBitmapH != m_previewH) {
+                    if (m_pPreviewBitmap) {
+                        m_pPreviewBitmap->Release();
+                        m_pPreviewBitmap = nullptr;
+                    }
+                    D2D1_BITMAP_PROPERTIES bmpProps = D2D1::BitmapProperties(
+                        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE)
+                    );
+                    if (SUCCEEDED(m_pRenderTarget->CreateBitmap(
+                            D2D1::SizeU(m_previewW, m_previewH), nullptr, 0, bmpProps, &m_pPreviewBitmap))) {
+                        m_previewBitmapW = m_previewW;
+                        m_previewBitmapH = m_previewH;
+                    }
+                }
+                if (m_pPreviewBitmap) {
+                    D2D1_RECT_U copyRect = D2D1::RectU(0, 0, m_previewW, m_previewH);
+                    m_pPreviewBitmap->CopyFromMemory(&copyRect, m_previewPixels.data(), m_previewW * 4);
+                }
             }
         }
 
@@ -2885,11 +3326,20 @@ private:
         m_activeRT->FillEllipse(D2D1::Ellipse(D2D1::Point2F(rlx + zFillW, rcy + 8.0f), 6.5f, 6.5f), m_pBrush);
         rcy += 22;
 
-        // 4. Формат віртуальної камери (адаптується до можливостей смартфона, напр. Redmi 8A -> 30 FPS)
-        DrawTextStr(TR(L"4. VIDEO RESOLUTION", L"4. РОЗДІЛЬНА ЗДАТНІСТЬ ВІДЕО"), {rlx, rcy, rrx, rcy + 20}, m_pFontSection, COL_TEXT_PRIMARY);
+        // 4. Формат віртуальної камери (30 FPS за замовчуванням для захисту від нагріву + перемикач 30/60 FPS)
+        DrawTextStr(TR(L"4. VIDEO RESOLUTION", L"4. РОЗДІЛЬНА ЗДАТНІСТЬ ВІДЕО"), {rlx, rcy, rrx - 78.0f, rcy + 20}, m_pFontSection, COL_TEXT_PRIMARY);
+        if (m_state.phoneSupports60Fps) {
+            m_rcBtnFpsToggle = {rrx - 74.0f, rcy - 1.0f, rrx, rcy + 20.0f};
+            bool is60 = m_state.prefer60Fps && (m_state.resPresetIdx >= 1);
+            DrawRoundedCard(m_rcBtnFpsToggle, is60 ? HexColor(0x362709) : HexColor(0x0B261C), is60 ? COL_AMBER : COL_EMERALD, 6.0f);
+            DrawTextStr(is60 ? L"⚡ 60 FPS" : L"🌿 30 FPS", m_rcBtnFpsToggle, m_pFontBody, is60 ? COL_AMBER : COL_EMERALD, DWRITE_TEXT_ALIGNMENT_CENTER);
+        } else {
+            m_rcBtnFpsToggle = {0, 0, 0, 0};
+        }
         rcy += 23;
 
-        const wchar_t* resLabels60[4] = {L"4K UHD", L"2K QHD", L"1080p 60", L"720p 60"};
+        bool use60Labels = m_state.phoneSupports60Fps && m_state.prefer60Fps;
+        const wchar_t* resLabels60[4] = {L"4K UHD", L"2K 60", L"1080p 60", L"720p 60"};
         const wchar_t* resLabels30[4] = {L"4K UHD", L"2K QHD", L"1080p 30", L"720p 30"};
         float resW = (rrx - rlx - 18.0f) / 4.0f;
         for (int i = 0; i < 4; ++i) {
@@ -2903,7 +3353,7 @@ private:
             D2D1_COLOR_F txtCol  = !resSupported ? COL_TEXT_DIM : (sel ? HexColor(0x05080D) : COL_TEXT_PRIMARY);
             DrawRoundedCard(m_rcResBtns[i], fillCol, brdCol, 8.0f);
             DrawTextStr(
-                m_state.phoneSupports60Fps ? resLabels60[i] : resLabels30[i],
+                use60Labels ? resLabels60[i] : resLabels30[i],
                 m_rcResBtns[i], m_pFontBody, txtCol, DWRITE_TEXT_ALIGNMENT_CENTER
             );
         }
@@ -2985,23 +3435,41 @@ private:
         );
         rcy += 36;
 
-        // 4 Повзунки ISP (кожен АВТО за замовчуванням; при ручному прокручуванні з'являється замочок 🔒)
+        // 4 Повзунки ISP (у режимі AUTO самі рухаються і показують поточне значення авто-режиму;
+        // при ручному прокручуванні з'являється замочок 🔒; мінімум 0.0 залишається у MANUAL!)
         int isoVal = 100 + static_cast<int>(m_state.isoNorm * 3100.0f);
         int shutterDenom = 30 + static_cast<int>(m_state.shutterNorm * 3970.0f);
+        int autoShutterDenom = static_cast<int>((std::max)(1LL, 1000000000LL / (std::max)(100000LL, m_state.liveExposureNs)));
         int wbKelvin = 2800 + static_cast<int>(m_state.wbNorm * 5700.0f);
 
-        wchar_t sBuf0[80], sBuf1[80], sBuf2[80], sBuf3[80];
-        if (m_state.sliderManual[0]) swprintf_s(sBuf0, m_state.isUkrainian ? L"ISO Чутливість: %d (РУЧНИЙ)" : L"ISO Sensitivity: %d (MANUAL)", isoVal);
-        else                         swprintf_s(sBuf0, m_state.isUkrainian ? L"ISO Чутливість: АВТО" : L"ISO Sensitivity: AUTO");
+        wchar_t sBuf0[96], sBuf1[96], sBuf2[96], sBuf3[96];
+        if (m_state.sliderManual[0]) {
+            swprintf_s(sBuf0, m_state.isUkrainian ? L"ISO Чутливість: %d (РУЧНИЙ)" : L"ISO Sensitivity: %d (MANUAL)", isoVal);
+        } else {
+            swprintf_s(sBuf0, m_state.isUkrainian ? L"ISO Чутливість: АВТО (%d)" : L"ISO Sensitivity: AUTO (%d)", m_state.liveIso);
+        }
 
-        if (m_state.sliderManual[1]) swprintf_s(sBuf1, m_state.isUkrainian ? L"Витримка (Shutter): 1/%d s (РУЧНИЙ)" : L"Shutter Speed: 1/%d s (MANUAL)", shutterDenom);
-        else                         swprintf_s(sBuf1, m_state.isUkrainian ? L"Витримка (Shutter): АВТО" : L"Shutter Speed: AUTO");
+        if (m_state.sliderManual[1]) {
+            swprintf_s(sBuf1, m_state.isUkrainian ? L"Витримка (Shutter): 1/%d s (РУЧНИЙ)" : L"Shutter Speed: 1/%d s (MANUAL)", shutterDenom);
+        } else {
+            swprintf_s(sBuf1, m_state.isUkrainian ? L"Витримка (Shutter): АВТО (1/%d s)" : L"Shutter Speed: AUTO (1/%d s)", autoShutterDenom);
+        }
 
-        if (m_state.sliderManual[2]) swprintf_s(sBuf2, m_state.isUkrainian ? L"Фокусна відстань: %.2f dpt (РУЧНИЙ)" : L"Focus Distance: %.2f dpt (MANUAL)", m_state.focusNorm * 10.0f);
-        else                         swprintf_s(sBuf2, m_state.isUkrainian ? L"Фокусна відстань: АВТО" : L"Focus Distance: AUTO");
+        if (m_state.sliderManual[2]) {
+            if (m_state.focusNorm <= 0.005f) {
+                swprintf_s(sBuf2, m_state.isUkrainian ? L"Фокусна відстань: ∞ (0.00 dpt • РУЧНИЙ)" : L"Focus Distance: ∞ (0.00 dpt • MANUAL)");
+            } else {
+                swprintf_s(sBuf2, m_state.isUkrainian ? L"Фокусна відстань: %.2f (РУЧНИЙ)" : L"Focus Distance: %.2f (MANUAL)", m_state.focusNorm * 4.0f);
+            }
+        } else {
+            swprintf_s(sBuf2, m_state.isUkrainian ? L"Фокусна відстань: АВТО (%.2f dpt)" : L"Focus Distance: AUTO (%.2f dpt)", m_state.liveFocusDiopters);
+        }
 
-        if (m_state.sliderManual[3]) swprintf_s(sBuf3, m_state.isUkrainian ? L"Баланс білого: %d K (РУЧНИЙ)" : L"White Balance: %d K (MANUAL)", wbKelvin);
-        else                         swprintf_s(sBuf3, m_state.isUkrainian ? L"Баланс білого: АВТО" : L"White Balance: AUTO");
+        if (m_state.sliderManual[3]) {
+            swprintf_s(sBuf3, m_state.isUkrainian ? L"Баланс білого: %d K (РУЧНИЙ)" : L"White Balance: %d K (MANUAL)", wbKelvin);
+        } else {
+            swprintf_s(sBuf3, m_state.isUkrainian ? L"Баланс білого: АВТО (%d K)" : L"White Balance: AUTO (%d K)", m_state.liveWbKelvin);
+        }
 
         const wchar_t* sliderTitles[4] = {sBuf0, sBuf1, sBuf2, sBuf3};
         float sliderVals[4] = {m_state.isoNorm, m_state.shutterNorm, m_state.focusNorm, m_state.wbNorm};
@@ -3018,12 +3486,12 @@ private:
             UiRect track{rlx, rcy + 5, sliderRight, rcy + 11};
             DrawRoundedCard(track, COL_BG_CARD, COL_BORDER, 3.0f);
 
-            float fillW = track.Width() * sliderVals[i];
+            float fillW = track.Width() * std::clamp(sliderVals[i], 0.0f, 1.0f);
             UiRect fillRect{rlx, rcy + 5, rlx + fillW, rcy + 11};
-            DrawRoundedCard(fillRect, isMan ? COL_CYAN : COL_TEXT_DIM,
-                            isMan ? COL_CYAN : COL_TEXT_DIM, 3.0f);
+            DrawRoundedCard(fillRect, isMan ? COL_CYAN : HexColor(0x00E676, 0.55f),
+                            isMan ? COL_CYAN : COL_EMERALD, 3.0f);
 
-            m_pBrush->SetColor(isMan ? COL_TEXT_PRIMARY : COL_TEXT_SECOND);
+            m_pBrush->SetColor(isMan ? COL_TEXT_PRIMARY : COL_EMERALD);
             m_activeRT->FillEllipse(D2D1::Ellipse(D2D1::Point2F(rlx + fillW, rcy + 8.0f), 6.0f, 6.0f), m_pBrush);
 
             if (isMan) {
@@ -3158,6 +3626,7 @@ private:
                 latestCopy = m_state.latestGithubTag;
             }
             bool hasUpd = m_state.updateAvailable.load();
+            bool dlActive = m_state.updateDownloadInProgress.load();
 
             UiRect infoBox{cx + 24.0f, cy + 64.0f, cx + cardW - 24.0f, cy + 146.0f};
             DrawRoundedCard(infoBox, COL_BG_CARD, hasUpd ? COL_EMERALD : COL_BORDER, 10.0f);
@@ -3178,7 +3647,7 @@ private:
                 DWRITE_TEXT_ALIGNMENT_CENTER
             );
 
-            // Кнопка 2: Перевірити оновлення або завантажити новий реліз
+            // Кнопка 2: Встановити оновлення автоматично або перевірити оновлення
             m_rcModalSecondaryBtn = {cx + 24.0f, cy + 220.0f, cx + cardW - 24.0f, cy + 266.0f};
             DrawRoundedCard(
                 m_rcModalSecondaryBtn,
@@ -3186,10 +3655,18 @@ private:
                 hasUpd ? COL_EMERALD : COL_BORDER,
                 10.0f
             );
+            wchar_t secBtnBuf[140]{};
+            if (dlActive) {
+                swprintf_s(secBtnBuf, m_state.isUkrainian ? L"⬇  Завантаження інсталятора... %d%%" : L"⬇  Downloading installer... %d%%",
+                           m_state.updateDownloadPct.load());
+            } else if (hasUpd) {
+                swprintf_s(secBtnBuf, m_state.isUkrainian ? L"⬇  Встановити оновлення зараз (v%ls)" : L"⬇  Install Update Now (v%ls)",
+                           latestCopy.c_str());
+            } else {
+                swprintf_s(secBtnBuf, m_state.isUkrainian ? L"🔄  Перевірити наявність оновлень зараз" : L"🔄  Check for Updates Now");
+            }
             DrawTextStr(
-                hasUpd
-                    ? TR(L"⬇  Download Latest Release from GitHub", L"⬇  Завантажити нову версію з GitHub Releases")
-                    : TR(L"🔄  Check for Updates Now", L"🔄  Перевірити наявність оновлень зараз"),
+                secBtnBuf,
                 m_rcModalSecondaryBtn, m_pFontSection,
                 hasUpd ? HexColor(0x05100A) : COL_TEXT_PRIMARY,
                 DWRITE_TEXT_ALIGNMENT_CENTER
@@ -3300,6 +3777,8 @@ private:
         if (hr == D2DERR_RECREATE_TARGET) {
             ReleaseOffscreenBlurTargets();
             if (m_pPreviewBitmap) { m_pPreviewBitmap->Release(); m_pPreviewBitmap = nullptr; }
+            m_previewBitmapW = 0;
+            m_previewBitmapH = 0;
             if (m_pBrush) { m_pBrush->Release(); m_pBrush = nullptr; }
             if (m_pRenderTarget) { m_pRenderTarget->Release(); m_pRenderTarget = nullptr; }
         }
@@ -3313,7 +3792,7 @@ private:
         } else if (idx == 1) {
             SendControlJson("{\"action\":\"SetShutter\",\"auto\":true}", "SetShutter");
         } else if (idx == 2) {
-            SendControlJson("{\"action\":\"SetFocus\",\"mode\":\"AUTO\"}", "SetFocus");
+            SendControlJson("{\"action\":\"SetFocus\",\"mode\":\"AUTO\",\"distance_diopters\":-1.0}", "SetFocus");
         } else if (idx == 3) {
             SendControlJson("{\"action\":\"SetWhiteBalance\",\"mode\":\"AUTO\"}", "SetWhiteBalance");
         }
@@ -3342,19 +3821,38 @@ private:
                 }
                 if (m_rcModalSecondaryBtn.Contains(x, y)) {
                     if (m_state.updateAvailable.load()) {
-                        std::wstring url;
-                        {
-                            std::lock_guard<std::mutex> lock(m_frameMutex);
-                            url = m_state.releaseHtmlUrl;
-                        }
-                        ShellExecuteW(m_hwnd, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                        StartUpdateDownloadAndInstallAsync();
                     } else {
-                        CheckGithubUpdateAsync();
+                        CheckGithubUpdateAsync(true);
                     }
                     return;
                 }
             }
             return;
+        }
+
+        // Кнопки банера автоматичного оновлення (Встановити зараз / Нагадати пізніше / Пропустити цю версію)
+        if (m_state.showUpdateBanner.load() && m_state.updateAvailable.load() && !m_state.updateDownloadInProgress.load()) {
+            if (m_rcBannerInstallBtn.Contains(x, y)) {
+                StartUpdateDownloadAndInstallAsync();
+                return;
+            }
+            if (m_rcBannerLaterBtn.Contains(x, y)) {
+                m_state.showUpdateBanner = false;
+                return;
+            }
+            if (m_rcBannerSkipBtn.Contains(x, y)) {
+                std::wstring tagToSkip;
+                {
+                    std::lock_guard<std::mutex> lock(m_frameMutex);
+                    tagToSkip = m_state.latestGithubTag;
+                }
+                if (!tagToSkip.empty()) {
+                    SaveSkippedVersion(tagToSkip);
+                }
+                m_state.showUpdateBanner = false;
+                return;
+            }
         }
 
         // Кнопки у шапці: Перемикання мови (EN/UA), Підтримати автора та GitHub / Оновлення
@@ -3369,7 +3867,7 @@ private:
         }
         if (m_rcBtnHeaderGithub.Contains(x, y)) {
             m_state.activeModal = ModalOverlay::GITHUB_UPDATE;
-            CheckGithubUpdateAsync();
+            CheckGithubUpdateAsync(true);
             return;
         }
 
@@ -3483,17 +3981,37 @@ private:
             return;
         }
 
-        // 4. Вибір роздільної здатності (з урахуванням можливостей смартфона, напр. Redmi 8A -> 30 FPS)
+        // 4. Перемикач 30 FPS / 60 FPS (за замовчуванням 30 FPS для холодної роботи S26 Ultra)
+        if (m_state.phoneSupports60Fps && m_rcBtnFpsToggle.Contains(x, y)) {
+            m_state.prefer60Fps = !m_state.prefer60Fps;
+            uint32_t targetFps = (m_state.resPresetIdx == 0) ? 30u : (m_state.prefer60Fps ? 60u : 30u);
+            uint32_t targetW = m_state.width;
+            uint32_t targetH = m_state.height;
+            {
+                std::lock_guard<std::mutex> lock(m_sinkMutex);
+                m_state.fps = targetFps;
+                if (m_sink.IsOpen()) {
+                    m_sink.SetFormat(m_state.width, m_state.height, EyeCam::PixelFormat::YUY2, m_state.fps);
+                }
+            }
+            char json[160]{};
+            std::snprintf(json, sizeof(json), "{\"action\":\"SetResolution\",\"width\":%u,\"height\":%u,\"fps\":%u}",
+                          targetW, targetH, targetFps);
+            SendControlJson(json);
+            return;
+        }
+
+        // 4. Вибір роздільної здатності (з миттєвим переналаштуванням декодера H.264 та виходу DirectShow)
         for (int i = 0; i < 4; ++i) {
             if (m_rcResBtns[i].Contains(x, y)) {
                 if (i == 0 && !m_state.phoneSupports4K) return;
                 if (i == 1 && !m_state.phoneSupports2K) return;
 
-                uint32_t maxSupportedFps = m_state.phoneSupports60Fps ? 60u : 30u;
-                uint32_t targetW = 1280, targetH = 720, targetFps = maxSupportedFps;
+                uint32_t prefFps = (m_state.phoneSupports60Fps && m_state.prefer60Fps) ? 60u : 30u;
+                uint32_t targetW = 1280, targetH = 720, targetFps = prefFps;
                 if (i == 0)      { targetW = 3840; targetH = 2160; targetFps = 30; }
-                else if (i == 1) { targetW = 2560; targetH = 1440; targetFps = maxSupportedFps; }
-                else if (i == 2) { targetW = 1920; targetH = 1080; targetFps = maxSupportedFps; }
+                else if (i == 1) { targetW = 2560; targetH = 1440; targetFps = prefFps; }
+                else if (i == 2) { targetW = 1920; targetH = 1080; targetFps = prefFps; }
 
                 {
                     std::lock_guard<std::mutex> lock(m_sinkMutex);
@@ -3505,6 +4023,8 @@ private:
                         m_sink.SetFormat(m_state.width, m_state.height, EyeCam::PixelFormat::YUY2, m_state.fps);
                     }
                 }
+
+                EnqueueFlushDecoder(targetW, targetH);
 
                 char json[160]{};
                 std::snprintf(json, sizeof(json), "{\"action\":\"SetResolution\",\"width\":%u,\"height\":%u,\"fps\":%u}",
@@ -3640,13 +4160,14 @@ private:
             std::snprintf(json, sizeof(json), "{\"action\":\"SetShutter\",\"auto\":false,\"exposure_ns\":%lld}", expNs);
             coalesceKey = "SetShutter";
         } else if (idx == 2) {
+            // 0.0f залишається в режимі MANUAL (нескінченність ∞); в AUTO повертає лише клік по замочку 🔒
             m_state.focusNorm = norm;
-            std::snprintf(json, sizeof(json), "{\"action\":\"SetFocus\",\"mode\":\"MANUAL\",\"distance_diopters\":%.2f}", norm * 10.0f);
+            std::snprintf(json, sizeof(json), "{\"action\":\"SetFocus\",\"auto\":false,\"mode\":\"MANUAL\",\"distance_diopters\":%.2f}", norm * 10.0f);
             coalesceKey = "SetFocus";
         } else if (idx == 3) {
             m_state.wbNorm = norm;
             int kelvin = 2800 + static_cast<int>(norm * 5700.0f);
-            std::snprintf(json, sizeof(json), "{\"action\":\"SetWhiteBalance\",\"mode\":\"MANUAL_KELVIN\",\"kelvin\":%d}", kelvin);
+            std::snprintf(json, sizeof(json), "{\"action\":\"SetWhiteBalance\",\"auto\":false,\"mode\":\"MANUAL_KELVIN\",\"kelvin\":%d}", kelvin);
             coalesceKey = "SetWhiteBalance";
         }
         SendControlJson(json, coalesceKey);
@@ -3768,6 +4289,10 @@ private:
     UINT32 m_blurTargetH = 0;
     ID2D1SolidColorBrush* m_pBrush = nullptr;
     ID2D1Bitmap* m_pPreviewBitmap = nullptr;
+    UINT32 m_previewW = 1280;
+    UINT32 m_previewH = 720;
+    UINT32 m_previewBitmapW = 0;
+    UINT32 m_previewBitmapH = 0;
 
     IDWriteTextFormat* m_pFontTitle = nullptr;
     IDWriteTextFormat* m_pFontSection = nullptr;
@@ -3808,6 +4333,9 @@ private:
     UiRect m_rcBtnHeaderLang{};
     UiRect m_rcBtnHeaderSupport{};
     UiRect m_rcBtnHeaderGithub{};
+    UiRect m_rcBannerInstallBtn{};
+    UiRect m_rcBannerLaterBtn{};
+    UiRect m_rcBannerSkipBtn{};
     UiRect m_rcTransportTabs[2]{};
     UiRect m_rcIpInput{};
     UiRect m_rcUsbDropdown{};
@@ -3818,6 +4346,7 @@ private:
     UiRect m_rcVideoViewport{};
     UiRect m_rcModuleBtns[5]{};
     UiRect m_rcZoomSlider{};
+    UiRect m_rcBtnFpsToggle{};
     UiRect m_rcResBtns[4]{};
     UiRect m_rcBtnModeToggle{};
     UiRect m_rcBtnRefocus{};

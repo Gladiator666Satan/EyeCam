@@ -41,45 +41,39 @@ object CameraUtils {
         return SensorType.WIDE
     }
 
-    fun kelvinToRggbChannelVector(kelvin: Int): RggbChannelVector {
+    /**
+     * Computes clean, non-compounding Planckian RGGB channel gains for a given [kelvin]
+     * temperature (`2000K..10000K`), preventing white balance overlap when switching camera modules.
+     */
+    fun kelvinToRggbChannelVector(kelvin: Int, @Suppress("UNUSED_PARAMETER") baseGains: RggbChannelVector? = null): RggbChannelVector {
         val k = kelvin.coerceIn(2000, 10000).toFloat()
-        // Природний баланс білого без зеленого спотворення для сенсорів Bayer:
-        // Нейтральне денне світло (5500K): R ≈ 2.0f, G = 1.0f, B ≈ 1.9f
-        // Тепліше світло (2000K, лампа розжарювання): R ≈ 1.25f, B ≈ 3.2f
-        // Холодніше світло (10000K, тінь): R ≈ 2.85f, B ≈ 1.2f
         val rGain = if (k <= 5500f) {
-            1.25f + (k - 2000f) / 3500f * 0.75f
+            1.35f + (k - 2000f) / 3500f * 0.65f
         } else {
-            2.0f + (k - 5500f) / 4500f * 0.85f
+            2.00f + (k - 5500f) / 4500f * 0.75f
         }
         val bGain = if (k <= 5500f) {
-            3.2f - (k - 2000f) / 3500f * 1.3f
+            2.95f - (k - 2000f) / 3500f * 1.05f
         } else {
-            1.9f - (k - 5500f) / 4500f * 0.7f
+            1.90f - (k - 5500f) / 4500f * 0.65f
         }
-
-        return RggbChannelVector(rGain.coerceIn(1.0f, 4.0f), 1.0f, 1.0f, bGain.coerceIn(1.0f, 4.0f))
+        return RggbChannelVector(rGain.coerceIn(1.0f, 3.8f), 1.0f, 1.0f, bGain.coerceIn(1.0f, 3.8f))
     }
 
     /**
-     * Scales a captured neutral Bayer [baseGains] (from live AWB) by the requested [kelvin]
-     * temperature relative to daylight (5500K), avoiding the strong green cast that occurs when
-     * raw hardcoded gains override sensor-specific G channel calibration.
+     * Estimates the live correlated color temperature in Kelvin (`2800..8500`) from the ISP's
+     * auto white balance [RggbChannelVector] so the WB slider can track live AWB in AUTO mode.
      */
-    fun kelvinToRggbChannelVector(kelvin: Int, baseGains: RggbChannelVector?): RggbChannelVector {
-        if (baseGains == null) return kelvinToRggbChannelVector(kelvin)
-        val ref = kelvinToRggbChannelVector(5500)
-        val target = kelvinToRggbChannelVector(kelvin)
-        val rScale = target.red / ref.red
-        val bScale = target.blue / ref.blue
-        val gEven = baseGains.greenEven.coerceAtLeast(0.5f)
-        val gOdd = baseGains.greenOdd.coerceAtLeast(0.5f)
-        return RggbChannelVector(
-            (baseGains.red * rScale).coerceIn(0.8f, 6.0f),
-            gEven,
-            gOdd,
-            (baseGains.blue * bScale).coerceIn(0.8f, 6.0f)
-        )
+    fun rggbGainsToKelvin(gains: RggbChannelVector): Int {
+        val r = gains.red.coerceAtLeast(0.1f)
+        val b = gains.blue.coerceAtLeast(0.1f)
+        val rbRatio = (r / b).coerceIn(0.45f, 2.25f)
+        val est = if (rbRatio <= 1.05f) {
+            2800f + ((rbRatio - 0.45f) / 0.60f) * 2700f
+        } else {
+            5500f + ((rbRatio - 1.05f) / 1.20f) * 3000f
+        }
+        return est.toInt().coerceIn(2800, 8500)
     }
 
     /**

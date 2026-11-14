@@ -297,6 +297,11 @@ class ControlServer(
             put("shutter_manual", mode.isShutterManual)
             put("focus_manual", mode.isFocusManual)
             put("wb_manual", mode.isWbManual)
+            put("live_iso", cameraController.liveIso)
+            put("live_exposure_ns", cameraController.liveExposureNs)
+            put("live_focus_diopters", cameraController.liveFocusDiopters.toDouble())
+            put("live_focus_norm", cameraController.liveFocusNorm.toDouble())
+            put("live_wb_kelvin", cameraController.liveWbKelvin)
             put("rotation_deg", cameraController.manualStreamRotationOffsetDeg)
         }
     }
@@ -476,6 +481,7 @@ class ControlServer(
                         cameraController.streamHeight,
                         cameraController.streamFps
                     )
+                    sendDeviceCapabilities()
                 }
 
                 "SetRotation" -> {
@@ -517,8 +523,8 @@ class ControlServer(
                     val isAuto = json.optBoolean("auto", false)
                     val mode = json.optString("mode", "MANUAL")
                     val diopters = json.optDouble("distance_diopters", 0.0).toFloat()
-                    if (isAuto || mode.equals("AUTO", ignoreCase = true) || diopters <= 0f) {
-                        cameraController.updateManualFocus(0.0f)
+                    if (isAuto || mode.equals("AUTO", ignoreCase = true) || diopters < 0f) {
+                        cameraController.updateManualFocus(-1.0f)
                     } else {
                         cameraController.updateManualFocus(diopters)
                     }

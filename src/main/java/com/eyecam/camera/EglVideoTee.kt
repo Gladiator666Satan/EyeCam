@@ -314,6 +314,7 @@ class EglVideoTee {
     private val posBuffer: FloatBuffer = createFloatBuffer(QUAD_POSITIONS)
     private val texBuffer: FloatBuffer = createFloatBuffer(QUAD_TEX_COORDS)
     private val stMatrix = FloatArray(16)
+    private val zoomedStMatrix = FloatArray(16)
     private val mvpMatrix = FloatArray(16)
 
     // Camera input sessions
@@ -324,6 +325,16 @@ class EglVideoTee {
 
     @Volatile
     var lowEndPreviewThrottle: Boolean = false
+
+    @Volatile
+    var skipLocalPreview: Boolean = false
+
+    @Volatile
+    private var userZoomFactor: Float = 1.0f
+
+    fun setUserZoom(zoom: Float) {
+        userZoomFactor = zoom.coerceIn(1.0f, 12.0f)
+    }
 
     // Encoder output target (exclusively touched on glThread)
     private var encoderSurfaceRef: Surface? = null
@@ -631,8 +642,9 @@ class EglVideoTee {
             false
         }
 
-        // On budget/legacy devices when encoder stream is active, render local UI preview every 2nd frame
-        val skipUiPreview = lowEndPreviewThrottle && encoderRendered && (frameParity and 1) == 1
+        // Throttle local phone UI preview when streaming to PC or when OLED Blackout is active to prevent overheating
+        val skipUiPreview = skipLocalPreview ||
+            (encoderRendered && (lowEndPreviewThrottle || encoderWidth >= 1920) && (frameParity and 1) == 1)
         val prevSurf = previewSurfaceRef
         if (!skipUiPreview && prevSurf != null && prevSurf.isValid &&
             previewEglSurface != EGL14.EGL_NO_SURFACE && previewWidth > 0 && previewHeight > 0
@@ -707,9 +719,20 @@ class EglVideoTee {
         val stLoc = if (useLut) uStMatrixLocLut else uStMatrixLocPass
         val oesSamplerLoc = if (useLut) sTextureLocLut else sTextureLocPass
 
+        val z = userZoomFactor.coerceIn(1.0f, 12.0f)
+        val effectiveStMatrix = if (z > 1.001f) {
+            val invZ = 1.0f / z
+            System.arraycopy(stMatrix, 0, zoomedStMatrix, 0, 16)
+            Matrix.translateM(zoomedStMatrix, 0, 0.5f - 0.5f * invZ, 0.5f - 0.5f * invZ, 0f)
+            Matrix.scaleM(zoomedStMatrix, 0, invZ, invZ, 1f)
+            zoomedStMatrix
+        } else {
+            stMatrix
+        }
+
         GLES20.glUseProgram(activeProg)
         GLES20.glUniformMatrix4fv(mvpLoc, 1, false, mvpMatrix, 0)
-        GLES20.glUniformMatrix4fv(stLoc, 1, false, stMatrix, 0)
+        GLES20.glUniformMatrix4fv(stLoc, 1, false, effectiveStMatrix, 0)
 
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, texId)

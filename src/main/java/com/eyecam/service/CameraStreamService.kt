@@ -209,6 +209,11 @@ class CameraStreamService : LifecycleService() {
                 isTorchAvailable = cameraController.isTorchAvailable,
                 isAeLocked = cameraController.isAeLocked,
                 cameraMode = cameraController.currentMode,
+                liveIso = cameraController.liveIso,
+                liveExposureNs = cameraController.liveExposureNs,
+                liveFocusDiopters = cameraController.liveFocusDiopters,
+                liveFocusNorm = cameraController.liveFocusNorm,
+                liveWbKelvin = cameraController.liveWbKelvin,
                 availableModules = cameraController.availableModules.toList(),
                 activeModuleKey = cameraController.activeModuleKey,
                 intraModuleZoom = cameraController.intraModuleZoom,
@@ -561,6 +566,7 @@ class CameraStreamService : LifecycleService() {
         stoppedManuallyByUser = true
 
         cameraController.isNetworkStreamActive = false
+        cameraController.setDisplayProtectionActive(false)
         val inBackground = currentPreviewSurface == null
         if (fromNotification || inBackground) {
             cameraController.closeCamera()
@@ -634,6 +640,7 @@ class CameraStreamService : LifecycleService() {
     }
 
     fun setDisplayProtection(active: Boolean) {
+        cameraController.setDisplayProtectionActive(active)
         _uiState.update { it.copy(isDisplayProtectionActive = active) }
     }
 
@@ -643,6 +650,18 @@ class CameraStreamService : LifecycleService() {
                 val policy = thermalManager.getPolicyForState(thermalState)
                 val maxDeviceFps = if (cameraController.isLowEndDevice) 30 else 60
 
+                // Proactively step down from 60 FPS to 30 FPS when device warms up (MODERATE or battery >= 40C)
+                if ((thermalState.ordinal >= ThermalState.MODERATE.ordinal || cachedBatteryTempC >= 40.0f) &&
+                    cameraController.streamFps > 30
+                ) {
+                    cameraController.setResolution(cameraController.streamWidth, cameraController.streamHeight, 30)
+                }
+
+                val enforceBlackout = policy.shouldEnforceDisplayProtection
+                if (enforceBlackout) {
+                    cameraController.setDisplayProtectionActive(true)
+                }
+
                 _uiState.update { current ->
                     current.copy(
                         telemetry = current.telemetry.copy(
@@ -650,7 +669,7 @@ class CameraStreamService : LifecycleService() {
                             targetFps = policy.recommendedFps.coerceAtMost(maxDeviceFps),
                             targetBitrateKbps = (ThermalManager.BASELINE_BITRATE_KBPS * policy.bitrateReductionRatio).toInt()
                         ),
-                        isDisplayProtectionActive = if (policy.shouldEnforceDisplayProtection) {
+                        isDisplayProtectionActive = if (enforceBlackout) {
                             true
                         } else {
                             current.isDisplayProtectionActive
